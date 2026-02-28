@@ -41,7 +41,6 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
         .ok_or_else(|| anyhow!("parser returned None"))?;
 
     let query_src = language.query_source();
-    // Trim comments to check if effectively empty
     let effective_src = query_src
         .lines()
         .filter(|l| !l.trim_start().starts_with(';') && !l.trim().is_empty())
@@ -59,18 +58,41 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
     Ok(ParseResult { symbols, edges })
 }
 
+// Maps tree-sitter node kind strings to our kind vocabulary.
+// Called on the definition node (the @definition.* capture), not the name node.
 fn kind_from_node(node: &Node) -> &'static str {
     match node.kind() {
+        // Rust
         "function_item" => "fn",
-        "function_declaration" => "fn",
         "struct_item" => "struct",
         "enum_item" => "enum",
+        "union_item" => "union",
         "trait_item" => "trait",
-        "type_item" | "type_alias_declaration" => "type",
+        "type_item" => "type",
         "impl_item" => "impl",
-        "interface_declaration" => "interface",
+        "mod_item" => "mod",
+        "macro_definition" => "macro",
+        // JS / TS shared
+        "function_declaration" => "fn",
+        "function_expression" => "fn",
+        "function_signature" => "fn",
+        "generator_function" => "fn",
+        "generator_function_declaration" => "fn",
+        "arrow_function" => "fn",
+        "method_definition" => "fn",
+        "method_signature" => "fn",
+        "abstract_method_signature" => "fn",
+        "assignment_expression" => "fn",
+        "pair" => "fn",
+        "variable_declarator" => "fn", // only reached via definition.function (arrow/fn value)
         "class_declaration" | "class" => "class",
-        "lexical_declaration" => "const",
+        "abstract_class_declaration" => "class",
+        // TS-specific
+        "interface_declaration" => "interface",
+        "type_alias_declaration" => "type",
+        "module" => "module",
+        // export wrappers - look at the value kind instead
+        "lexical_declaration" | "variable_declaration" => "const",
         "export_statement" => "fn",
         _ => "unknown",
     }
@@ -79,7 +101,6 @@ fn kind_from_node(node: &Node) -> &'static str {
 fn extract_signature(symbol_node: &Node, source: &str) -> Option<String> {
     let source_bytes = source.as_bytes();
 
-    // Find the body child (block, statement_block, declaration_block, etc.)
     let body_kinds = ["block", "statement_block", "declaration_block", "class_body"];
     let mut body_start: Option<usize> = None;
 
@@ -113,14 +134,24 @@ fn extract_symbols(
     let query = Query::new(ts_lang, query_src)?;
     let mut cursor = QueryCursor::new();
 
-    let symbol_idx = query.capture_index_for_name("symbol");
-    let name_idx = query.capture_index_for_name("name");
+    // Collect indices of all definition.* captures (definition.function,
+    // definition.method, definition.class, definition.impl, etc.)
+    let def_indices: Vec<u32> = query
+        .capture_names()
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.starts_with("definition."))
+        .map(|(i, _)| i as u32)
+        .collect();
 
-    if symbol_idx.is_none() || name_idx.is_none() {
+    let name_idx = match query.capture_index_for_name("name") {
+        Some(i) => i,
+        None => return Ok(vec![]),
+    };
+
+    if def_indices.is_empty() {
         return Ok(vec![]);
     }
-    let symbol_idx = symbol_idx.unwrap();
-    let name_idx = name_idx.unwrap();
 
     let matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
 
@@ -129,11 +160,11 @@ fn extract_symbols(
     let mut symbols = Vec::new();
 
     for m in matches {
-        let symbol_capture = m.captures.iter().find(|c| c.index == symbol_idx);
+        let def_capture = m.captures.iter().find(|c| def_indices.contains(&c.index));
         let name_capture = m.captures.iter().find(|c| c.index == name_idx);
 
-        if let (Some(sym_cap), Some(name_cap)) = (symbol_capture, name_capture) {
-            let symbol_node = sym_cap.node;
+        if let (Some(def_cap), Some(name_cap)) = (def_capture, name_capture) {
+            let symbol_node = def_cap.node;
             let name_node = name_cap.node;
 
             let name = name_node
@@ -152,8 +183,8 @@ fn extract_symbols(
                 file: file_str.clone(),
                 language: lang_str.clone(),
                 kind,
-                range_start: symbol_node.start_byte() as u32,
-                range_end: symbol_node.end_byte() as u32,
+                range_start: (symbol_node.start_position().row + 1) as u32,
+                range_end: (symbol_node.end_position().row + 1) as u32,
                 signature,
             });
         }
@@ -166,22 +197,26 @@ fn enclosing_function_name<'a>(node: Node<'a>, source: &'a str) -> Option<String
     let fn_kinds = [
         "function_item",
         "function_declaration",
+        "function_expression",
         "arrow_function",
         "method_definition",
+        "generator_function",
+        "generator_function_declaration",
     ];
     let mut current = node.parent();
     while let Some(n) = current {
         if fn_kinds.contains(&n.kind()) {
-            // Try to find the name child
             let mut cursor = n.walk();
             for child in n.children(&mut cursor) {
-                if child.kind() == "identifier" || child.kind() == "type_identifier" {
+                if child.kind() == "identifier"
+                    || child.kind() == "property_identifier"
+                    || child.kind() == "type_identifier"
+                {
                     if let Ok(text) = child.utf8_text(source.as_bytes()) {
                         return Some(text.to_string());
                     }
                 }
             }
-            // If we found a function but couldn't get its name, stop here
             return None;
         }
         current = n.parent();
@@ -199,19 +234,39 @@ fn extract_edges(
     let query = Query::new(ts_lang, query_src)?;
     let mut cursor = QueryCursor::new();
 
-    let call_idx = query.capture_index_for_name("call.target");
-    if call_idx.is_none() {
+    // Only CALLS edges. reference.class and reference.implementation are skipped.
+    let ref_call_indices: Vec<u32> = query
+        .capture_names()
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| **name == "reference.call")
+        .map(|(i, _)| i as u32)
+        .collect();
+
+    let name_idx = match query.capture_index_for_name("name") {
+        Some(i) => i,
+        None => return Ok(vec![]),
+    };
+
+    if ref_call_indices.is_empty() {
         return Ok(vec![]);
     }
-    let call_idx = call_idx.unwrap();
 
     let matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
     let file_str = path.to_string_lossy().to_string();
     let mut edges = Vec::new();
 
     for m in matches {
-        for cap in m.captures.iter().filter(|c| c.index == call_idx) {
-            let callee_text = cap
+        let has_ref_call = m
+            .captures
+            .iter()
+            .any(|c| ref_call_indices.contains(&c.index));
+        if !has_ref_call {
+            continue;
+        }
+
+        if let Some(name_cap) = m.captures.iter().find(|c| c.index == name_idx) {
+            let callee_text = name_cap
                 .node
                 .utf8_text(source.as_bytes())
                 .unwrap_or("")
@@ -220,7 +275,7 @@ fn extract_edges(
                 continue;
             }
 
-            let caller = enclosing_function_name(cap.node, source)
+            let caller = enclosing_function_name(name_cap.node, source)
                 .unwrap_or_else(|| "<module>".to_string());
 
             edges.push(RawEdge {
