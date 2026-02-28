@@ -1,0 +1,12 @@
+; Symbol captures
+(function_declaration name: (identifier) @name) @symbol
+(class_declaration name: (type_identifier) @name) @symbol
+(method_definition name: (property_identifier) @name) @symbol
+(interface_declaration name: (type_identifier) @name) @symbol
+(type_alias_declaration name: (type_identifier) @name) @symbol
+(export_statement declaration: (function_declaration name: (identifier) @name)) @symbol
+(lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function))) @symbol
+
+; Call edges
+(call_expression function: (identifier) @call.target)
+(call_expression function: (member_expression property: (property_identifier) @call.target))
