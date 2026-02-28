@@ -194,6 +194,11 @@ impl LspClient {
                             "dynamicRegistration": false
                         }
                     },
+                    "workspace": {
+                        "workspaceEdit": {
+                            "documentChanges": true
+                        }
+                    },
                     "experimental": {
                         "serverStatusNotification": true
                     }
@@ -290,6 +295,35 @@ impl LspClient {
         Ok(targets)
     }
 
+    pub fn rename_symbol(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Value> {
+        let prep = self.call(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        )?;
+        if prep.is_null() {
+            return Err(anyhow!(
+                "rust-analyzer: symbol is not renameable at this position"
+            ));
+        }
+        self.call(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "newName": new_name
+            }),
+        )
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         let _ = self.call("shutdown", json!(null));
         let _ = self.send_notification("exit", json!(null));
@@ -302,7 +336,7 @@ fn is_quiescent(msg: &Value) -> bool {
         && msg["params"]["quiescent"].as_bool() == Some(true)
 }
 
-fn which_rust_analyzer() -> Option<String> {
+pub(crate) fn which_rust_analyzer() -> Option<String> {
     Command::new("which")
         .arg("rust-analyzer")
         .output()
@@ -313,7 +347,7 @@ fn which_rust_analyzer() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn uri_to_path(uri: &str) -> String {
+pub(crate) fn uri_to_path(uri: &str) -> String {
     uri.strip_prefix("file://").unwrap_or(uri).to_string()
 }
 
@@ -321,7 +355,7 @@ fn uri_to_path(uri: &str) -> String {
 // Used to point prepareCallHierarchy at the function name rather than the
 // `fn` keyword; rust-analyzer uses the returned selectionRange to re-identify
 // the function in callHierarchy/outgoingCalls.
-fn fn_name_char_offset(file: &str, range_start: i64, name: &str) -> u32 {
+pub(crate) fn fn_name_char_offset(file: &str, range_start: i64, name: &str) -> u32 {
     let line_idx = (range_start - 1).max(0) as usize;
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,

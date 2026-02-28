@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 
-fn open_db() -> Result<Connection> {
+pub(crate) fn open_db() -> Result<Connection> {
     let conn = Connection::open("codegraph.db")
         .map_err(|_| anyhow!("codegraph.db not found - run `graphlite discover` first"))?;
     Ok(conn)
@@ -16,7 +16,7 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn resolve_symbol_id(conn: &Connection, arg: &str) -> Result<i64> {
+pub(crate) fn resolve_symbol_id(conn: &Connection, arg: &str) -> Result<i64> {
     if let Ok(id) = arg.parse::<i64>() {
         return Ok(id);
     }
@@ -155,7 +155,45 @@ fn read_snippet(file: &str, line_start: i64, line_end: i64) -> Option<String> {
     Some(lines[start..end].join("\n"))
 }
 
-pub fn graph(symbol: &str, depth: usize, _format: &str, show_trust: bool) -> Result<()> {
+fn read_call_site_snippet(
+    file: &str,
+    range_start: i64,
+    range_end: i64,
+    target_name: &str,
+) -> Option<String> {
+    let content = fs::read_to_string(Path::new(file)).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = ((range_start - 1) as usize).min(lines.len());
+    let end = (range_end as usize).min(lines.len());
+    let body = &lines[start..end];
+
+    let hits: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(target_name))
+        .map(|(i, _)| i)
+        .collect();
+
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut out: Vec<&str> = Vec::new();
+    let mut last_end = 0usize;
+    for i in hits {
+        let ctx_start = i.saturating_sub(1);
+        let ctx_end = (i + 2).min(body.len());
+        if ctx_start > last_end && !out.is_empty() {
+            out.push("...");
+        }
+        let from = ctx_start.max(last_end);
+        out.extend_from_slice(&body[from..ctx_end]);
+        last_end = ctx_end;
+    }
+    Some(out.join("\n"))
+}
+
+pub fn graph(symbol: &str, depth: usize, _format: &str, show_trust: bool, snippets: bool) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
 
@@ -245,13 +283,13 @@ pub fn graph(symbol: &str, depth: usize, _format: &str, show_trust: bool) -> Res
             |r| r.get(0),
         )?;
 
-        print_xml(&focus, &neighbors, edge_count);
+        print_xml(&focus, &neighbors, edge_count, snippets);
     }
 
     Ok(())
 }
 
-fn print_xml(focus: &NodeRow, neighbors: &[NeighborRow], edge_count: i64) {
+fn print_xml(focus: &NodeRow, neighbors: &[NeighborRow], edge_count: i64, snippets: bool) {
     let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end);
 
     let mut body = String::new();
@@ -297,7 +335,17 @@ fn print_xml(focus: &NodeRow, neighbors: &[NeighborRow], edge_count: i64) {
             if let Some(sig) = &n.signature {
                 body.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
             }
-            body.push_str("/>\n");
+            if snippets {
+                if let Some(snip) = read_snippet(&n.file, n.range_start, n.range_end) {
+                    body.push_str(">\n");
+                    body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+                    body.push_str("    </node>\n");
+                } else {
+                    body.push_str("/>\n");
+                }
+            } else {
+                body.push_str("/>\n");
+            }
         }
         body.push_str("  </neighbors>\n");
     }
@@ -390,6 +438,142 @@ fn print_xml_trust_split(focus: &NodeRow, edges: &[EdgeInfo]) {
         tokens,
         trusted.len(),
         syntax.len(),
+    );
+
+    print!("{}{}", header, body);
+}
+
+pub fn blast_radius(symbol: &str, depth: usize, snippets: bool) -> Result<()> {
+    let conn = open_db()?;
+    let root_id = resolve_symbol_id(&conn, symbol)?;
+
+    let depth_limit = if depth == 0 { i64::MAX } else { depth as i64 };
+
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE dependents(id, depth) AS (
+            SELECT ?1, 0
+            UNION ALL
+            SELECT e.from_id, d.depth + 1
+            FROM dependents d JOIN edges e ON e.to_id = d.id
+            WHERE d.depth < ?2
+        )
+        SELECT nd.id, nd.name, nd.kind, nd.file, nd.range_start, nd.range_end,
+               nd.signature, MIN(nh.depth)
+        FROM nodes nd JOIN dependents nh ON nd.id = nh.id
+        WHERE nd.id != ?1
+        GROUP BY nd.id
+        ORDER BY MIN(nh.depth), nd.name",
+    )?;
+
+    let rows: Vec<(NodeRow, i64)> = stmt
+        .query_map(rusqlite::params![root_id, depth_limit], |r| {
+            Ok((
+                NodeRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    file: r.get(3)?,
+                    range_start: r.get(4)?,
+                    range_end: r.get(5)?,
+                    signature: r.get(6)?,
+                },
+                r.get::<_, i64>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let focus: NodeRow = conn
+        .query_row(
+            "SELECT id, name, kind, file, range_start, range_end, signature
+             FROM nodes WHERE id = ?1",
+            rusqlite::params![root_id],
+            |r| {
+                Ok(NodeRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    file: r.get(3)?,
+                    range_start: r.get(4)?,
+                    range_end: r.get(5)?,
+                    signature: r.get(6)?,
+                })
+            },
+        )
+        .map_err(|_| anyhow!("node id {} not found", root_id))?;
+
+    print_blast_radius_xml(&focus, &rows, snippets);
+    Ok(())
+}
+
+fn print_blast_radius_xml(focus: &NodeRow, dependents: &[(NodeRow, i64)], snippets: bool) {
+    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end);
+
+    let mut body = String::new();
+
+    body.push_str("  <focus>\n");
+    body.push_str(&format!(
+        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\">\n",
+        focus.id,
+        xml_escape(&focus.name),
+        xml_escape(&focus.kind),
+        xml_escape(&focus.file),
+        focus.range_start,
+        focus.range_end,
+    ));
+    if let Some(sig) = &focus.signature {
+        body.push_str(&format!(
+            "      <signature>{}</signature>\n",
+            xml_escape(sig)
+        ));
+    }
+    if let Some(snip) = snippet {
+        body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+    }
+    body.push_str("    </node>\n");
+    body.push_str("  </focus>\n");
+
+    let max_depth = dependents.iter().map(|(_, d)| *d).max().unwrap_or(0);
+    for d in 1..=max_depth {
+        body.push_str(&format!("  <dependents depth=\"{}\">\n", d));
+        for (n, _) in dependents.iter().filter(|(_, dep)| *dep == d) {
+            body.push_str(&format!(
+                "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\"",
+                n.id,
+                xml_escape(&n.name),
+                xml_escape(&n.kind),
+                xml_escape(&n.file),
+                n.range_start,
+                n.range_end,
+            ));
+            if let Some(sig) = &n.signature {
+                body.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
+            }
+            if snippets {
+                if let Some(snip) = read_call_site_snippet(
+                    &n.file, n.range_start, n.range_end, &focus.name,
+                ) {
+                    body.push_str(">\n");
+                    body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+                    body.push_str("    </node>\n");
+                } else {
+                    body.push_str("/>\n");
+                }
+            } else {
+                body.push_str("/>\n");
+            }
+        }
+        body.push_str("  </dependents>\n");
+    }
+
+    body.push_str("</blast_radius>\n");
+
+    let tokens = body.len() / 4;
+    let header = format!(
+        "<blast_radius root_id=\"{}\" root_name=\"{}\" tokens=\"{}\" dependent_count=\"{}\">\n",
+        focus.id,
+        xml_escape(&focus.name),
+        tokens,
+        dependents.len(),
     );
 
     print!("{}{}", header, body);
