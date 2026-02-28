@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 use crate::{
     insert::{bulk_insert_edges, bulk_insert_symbols},
     language::detect_language,
+    lsp,
     parser::{parse_file, ParseResult, RawEdge, Symbol},
     schema::init_db,
 };
@@ -46,7 +47,7 @@ fn collect_source_files(root: &str) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-pub fn run(root: &str) -> Result<()> {
+pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
     let files = collect_source_files(root)?;
     eprintln!("Found {} source files", files.len());
 
@@ -80,5 +81,10 @@ pub fn run(root: &str) -> Result<()> {
         symbols.len(),
         edges.len()
     );
+
+    if let Some(lang) = lsp_lang {
+        lsp::enrich(&conn, root, lang)?;
+    }
+
     Ok(())
 }

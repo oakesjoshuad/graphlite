@@ -1,6 +1,7 @@
 mod discover;
 mod insert;
 mod language;
+mod lsp;
 mod parser;
 mod query;
 mod schema;
@@ -22,6 +23,9 @@ enum Commands {
         /// Root directory to index
         #[arg(default_value = ".")]
         root: String,
+        /// LSP language to use for semantic enrichment (e.g. "rust")
+        #[arg(long, value_name = "LANG")]
+        lsp: Option<String>,
     },
     /// Show a symbol and its graph neighborhood as XML
     Graph {
@@ -33,11 +37,17 @@ enum Commands {
         /// Output format (xml)
         #[arg(long, default_value = "xml")]
         format: String,
+        /// Split output by edge trust level (trusted vs syntax)
+        #[arg(long)]
+        show_trust: bool,
     },
     /// Full-text search for symbols
     Symbols {
         /// FTS5 query string (supports *, AND, OR, etc.)
         query: String,
+        /// Filter results by language
+        #[arg(long, value_name = "LANG")]
+        language: Option<String>,
     },
 }
 
@@ -45,13 +55,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Discover { root } => discover::run(&root)?,
+        Commands::Discover { root, lsp } => discover::run(&root, lsp.as_deref())?,
         Commands::Graph {
             symbol,
             depth,
             format,
-        } => query::graph(&symbol, depth, &format)?,
-        Commands::Symbols { query } => query::symbols(&query)?,
+            show_trust,
+        } => query::graph(&symbol, depth, &format, show_trust)?,
+        Commands::Symbols { query, language } => query::symbols(&query, language.as_deref())?,
     }
 
     Ok(())

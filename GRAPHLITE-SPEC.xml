@@ -1,0 +1,152 @@
+<GraphLite version="0.1" purpose="DYNAMIC language discovery via heuristics + parsing">
+  <dynamic_language_discovery zero_assumptions="true">
+    <strategy>Three-tiered detection: extension → shebang → parsing</strategy>
+    
+    <tier1_extension_heuristic>
+      <mapping>
+        .rs → rust
+        .ts → typescript  
+        .js, .mjs, .cjs → javascript
+        .svelte → svelte
+        .jsx, .tsx → typescript
+        .vue → vue (if grammar available)
+        .py → python
+        .go → go
+        .java → java
+        .kt → kotlin
+        .rb → ruby
+        .php → php
+        .cs → csharp
+        .swift → swift
+        .cpp, .cxx, .cc → cpp
+        .h, .hpp → cpp
+      </mapping>
+      <fallback>unknown_language</fallback>
+    </tier1_extension_heuristic>
+    
+    <tier2_shebang_firstline>
+      <patterns>
+        #!/usr/bin/env node → javascript
+        #!/usr/bin/env python → python  
+        #!/usr/bin/env bash → bash
+        #!/usr/bin/env ruby → ruby
+      </patterns>
+    </tier2_shebang_firstline>
+    
+    <tier3_parsing_validation>
+      <process>
+        1. Try grammar parse → success → confirmed
+        2. Parse errors → try next likely grammar from extension family
+        3. All fail → mark "parseable_unknown" + generic queries
+      </process>
+      <grammar_priority>
+        typescript > javascript (for .js files)
+        rust > cpp (for unknown C-like)
+      </grammar_priority>
+    </tier3_parsing_validation>
+  </dynamic_language_discovery>
+
+  <grammar_discovery_process>
+    <available_grammars>Scan ALL tree-sitter crates at runtime</available_grammars>
+    <runtime_detection>
+      <![CDATA[
+fn discover_language(path: &Path) -> LanguageId {
+    // 1. Extension → probable_language
+    let probable = extension_to_language(path.extension())?;
+    
+    // 2. Shebang check
+    let shebang = read_first_line(path)?;
+    if let Some(lang) = shebang_to_language(&shebang) {
+        return lang;
+    }
+    
+    // 3. Try parse with probable grammar
+    if let Ok(tree) = try_parse(probable_grammar(), source) {
+        return probable;
+    }
+    
+    // 4. Fallback: try grammar family
+    for candidate in grammar_family(probable) {
+        if try_parse(candidate, source).is_ok() {
+            return candidate;
+        }
+    }
+    
+    LanguageId::Unknown
+}]]>
+    </runtime_detection>
+  </grammar_discovery_process>
+
+  <cli_dynamic_discovery>
+    <discover enhanced="true">
+      <flags>
+        <languages auto="default"/>
+        <list-grammars>Show ALL discovered grammars + file matches</list-grammars>
+        <dry-run>Show language detection without parsing</dry-run>
+        <grammar-debug>Verbose parsing validation log</grammar-debug>
+      </flags>
+      <output_languages_json>
+        <![CDATA[
+{
+  "discovered_languages": [
+    {"name": "rust", "files": 247, "parse_success": 247, "confidence": 1.0},
+    {"name": "typescript", "files": 89, "parse_success": 87, "confidence": 0.98},
+    {"name": "unknown_parseable", "files": 3, "confidence": 0.6}
+  ]
+}]]>
+      </output_languages_json>
+    </discover>
+  </cli_dynamic_discovery>
+
+  <storage_enhanced>
+    <languages_table_dynamic>
+      CREATE TABLE languages (
+        name TEXT PRIMARY KEY,
+        grammar_crate TEXT,
+        files_count INTEGER,
+        parse_success INTEGER,
+        confidence REAL,
+        discovered_at INTEGER DEFAULT (unixepoch())
+      );
+    </languages_table_dynamic>
+  </storage_enhanced>
+
+  <edge_cases_handled>
+    <multi_extension_languages>
+      .js → javascript|typescript (parse distinguishes)
+      .mjs|.cjs → javascript  
+      .h|.hpp|.hh → cpp
+    </multi_extension_languages>
+    <unknown_grammars>
+      parseable_unknown → generic symbol queries
+      unparseable → file metadata only (size, modtime)
+    </unknown_grammars>
+    <grammar_missing>
+      Skip file → log warning → continue
+      No hard failure on missing grammar crate
+    </grammar_missing>
+  </edge_cases_handled>
+
+  <claude_discovery_protocol>
+    <step1>graphlite discover --root . --list-grammars</step1>
+    <step2>graphlite discover --dry-run  # See detection logic</step2>
+    <step3>graphlite symbols --language typescript  # Dynamic filter</step3>
+    <never_assume_languages>Wait for discover output first</never_assume_languages>
+  </claude_discovery_protocol>
+
+  <Cargo.toml_grammar_dynamic>
+    <![CDATA[
+# Core tree-sitter (grammar loader)
+tree-sitter = "0.22"
+
+# Common grammars (fallback if dynamic load fails)  
+tree-sitter-rust = "0.22"
+tree-sitter-typescript = "0.22"
+tree-sitter-javascript = "0.22" 
+tree-sitter-svelte = "0.22"
+
+# Dynamic grammar loader (runtime discovery)
+# tree-sitter-language-pack or similar
+]]>
+  </Cargo.toml_grammar_dynamic>
+</GraphLite>

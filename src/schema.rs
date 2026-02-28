@@ -22,6 +22,8 @@ CREATE TABLE edges (
     from_id INTEGER NOT NULL,
     to_id INTEGER NOT NULL,
     edge_type TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'tree-sitter',
+    confidence REAL NOT NULL DEFAULT 0.8,
     FOREIGN KEY(from_id) REFERENCES nodes(id),
     FOREIGN KEY(to_id) REFERENCES nodes(id)
 );

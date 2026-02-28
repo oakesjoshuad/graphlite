@@ -21,6 +21,7 @@ pub struct RawEdge {
     pub from_name: String,
     pub to_name: String,
     pub edge_type: String,
+    #[allow(dead_code)]
     pub file: String,
 }
 
@@ -101,7 +102,12 @@ fn kind_from_node(node: &Node) -> &'static str {
 fn extract_signature(symbol_node: &Node, source: &str) -> Option<String> {
     let source_bytes = source.as_bytes();
 
-    let body_kinds = ["block", "statement_block", "declaration_block", "class_body"];
+    let body_kinds = [
+        "block",
+        "statement_block",
+        "declaration_block",
+        "class_body",
+    ];
     let mut body_start: Option<usize> = None;
 
     let mut cursor = symbol_node.walk();

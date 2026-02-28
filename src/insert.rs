@@ -5,10 +5,7 @@ use rusqlite::Connection;
 
 use crate::parser::{RawEdge, Symbol};
 
-pub fn bulk_insert_symbols(
-    conn: &Connection,
-    symbols: &[Symbol],
-) -> Result<HashMap<String, i64>> {
+pub fn bulk_insert_symbols(conn: &Connection, symbols: &[Symbol]) -> Result<HashMap<String, i64>> {
     let mut name_to_id: HashMap<String, i64> = HashMap::new();
 
     let tx = conn.unchecked_transaction()?;
@@ -59,7 +56,8 @@ pub fn bulk_insert_edges(
     let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO edges (from_id, to_id, edge_type) VALUES (?1, ?2, ?3)",
+            "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
+             VALUES (?1, ?2, ?3, 'tree-sitter', 0.8)",
         )?;
 
         for edge in edges {
