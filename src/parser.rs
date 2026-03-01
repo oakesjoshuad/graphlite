@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{anyhow, Result};
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 use crate::language::{detect_language, Language};
@@ -279,13 +280,13 @@ fn extract_symbols(
         return Ok(vec![]);
     }
 
-    let matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
 
     let file_str = path.to_string_lossy().to_string();
     let lang_str = language.as_str().to_string();
     let mut symbols = Vec::new();
 
-    for m in matches {
+    while let Some(m) = matches.next() {
         let def_capture = m.captures.iter().find(|c| def_indices.contains(&c.index));
         let name_capture = m.captures.iter().find(|c| c.index == name_idx);
 
@@ -387,11 +388,11 @@ fn extract_edges(
         return Ok(vec![]);
     }
 
-    let matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
     let file_str = path.to_string_lossy().to_string();
     let mut edges = Vec::new();
 
-    for m in matches {
+    while let Some(m) = matches.next() {
         let has_ref_call = m
             .captures
             .iter()
