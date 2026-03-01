@@ -184,6 +184,12 @@ enum Commands {
         /// Include file-level doc comments (//! for Rust, @component for Svelte, JSDoc header for TS/JS)
         #[arg(long)]
         with_file_docs: bool,
+        /// Rank hotspots by all edges including unverified tree-sitter structural edges.
+        /// By default, hotspots are ranked by LSP-trusted edges only, which prevents common
+        /// method names (new, execute, spawn) from appearing as false hotspots due to
+        /// tree-sitter's inability to resolve call targets across files.
+        #[arg(long)]
+        all_edges: bool,
     },
 }
 
@@ -251,7 +257,8 @@ fn main() -> Result<()> {
             top,
             with_docs,
             with_file_docs,
-        } => query::map(all, top, with_docs, with_file_docs)?,
+            all_edges,
+        } => query::map(all, top, with_docs, with_file_docs, all_edges)?,
     }
 
     Ok(())

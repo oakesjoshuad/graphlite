@@ -930,7 +930,13 @@ fn render_blast_radius_xml(
     format!("{}{}", header, body)
 }
 
-pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: bool) -> Result<()> {
+pub fn map(
+    include_private: bool,
+    top: usize,
+    with_docs: bool,
+    with_file_docs: bool,
+    all_edges: bool,
+) -> Result<()> {
     let conn = open_db()?;
 
     struct Row {
@@ -939,6 +945,7 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
         kind: String,
         visibility: String,
         signature: Option<String>,
+        hotspot_fan_in: i64,
         fan_in: i64,
         fan_out: i64,
         doc: Option<String>,
@@ -946,24 +953,30 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
         role_confidence: f64,
     }
 
-    let sql = if include_private {
-        "SELECT n.file, n.name, n.kind, n.visibility, n.signature,
-                (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
-                (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
-                n.doc, n.role, n.role_confidence
-         FROM nodes n
-         ORDER BY n.file, fan_in DESC"
+    let hotspot_subquery = if all_edges {
+        "SELECT COUNT(*) FROM edges WHERE to_id = n.id"
     } else {
-        "SELECT n.file, n.name, n.kind, n.visibility, n.signature,
-                (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
-                (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
-                n.doc, n.role, n.role_confidence
-         FROM nodes n
-         WHERE n.visibility != 'private'
-         ORDER BY n.file, fan_in DESC"
+        "SELECT COUNT(*) FROM edges WHERE to_id = n.id AND source = 'rust-analyzer'"
     };
 
-    let mut stmt = conn.prepare(sql)?;
+    let visibility_filter = if include_private {
+        ""
+    } else {
+        "WHERE n.visibility != 'private'"
+    };
+
+    let sql = format!(
+        "SELECT n.file, n.name, n.kind, n.visibility, n.signature,
+                ({hotspot_subquery}) AS hotspot_fan_in,
+                (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
+                (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
+                n.doc, n.role, n.role_confidence
+         FROM nodes n
+         {visibility_filter}
+         ORDER BY n.file, hotspot_fan_in DESC"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<Row> = stmt
         .query_map([], |r| {
             Ok(Row {
@@ -972,11 +985,12 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
                 kind: r.get(2)?,
                 visibility: r.get(3)?,
                 signature: r.get(4)?,
-                fan_in: r.get(5)?,
-                fan_out: r.get(6)?,
-                doc: r.get(7)?,
-                role: r.get(8)?,
-                role_confidence: r.get(9)?,
+                hotspot_fan_in: r.get(5)?,
+                fan_in: r.get(6)?,
+                fan_out: r.get(7)?,
+                doc: r.get(8)?,
+                role: r.get(9)?,
+                role_confidence: r.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1000,14 +1014,21 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
         by_file.entry(row.file.clone()).or_default().push(i);
     }
 
-    // Hotspots: top N across all files by fan_in
+    // Hotspots: top N across all files by hotspot_fan_in (trusted by default)
     let mut ranked: Vec<usize> = (0..rows.len()).collect();
-    ranked.sort_by(|&a, &b| rows[b].fan_in.cmp(&rows[a].fan_in));
+    ranked.sort_by(|&a, &b| rows[b].hotspot_fan_in.cmp(&rows[a].hotspot_fan_in));
     ranked.truncate(top);
+    // Drop zero-count entries — no trusted edges means no signal
+    ranked.retain(|&i| rows[i].hotspot_fan_in > 0);
 
     let mut out = String::new();
 
-    out.push_str(&format!("  <hotspots top=\"{}\">\n", ranked.len()));
+    let hotspot_source = if all_edges { "all" } else { "trusted" };
+    out.push_str(&format!(
+        "  <hotspots top=\"{}\" fan_in_source=\"{}\">\n",
+        ranked.len(),
+        hotspot_source,
+    ));
     for &i in &ranked {
         let s = &rows[i];
         out.push_str(&format!(
@@ -1015,7 +1036,7 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
             xml_escape(&s.name),
             xml_escape(&s.kind),
             xml_escape(&s.file),
-            s.fan_in,
+            s.hotspot_fan_in,
             s.fan_out,
         ));
     }

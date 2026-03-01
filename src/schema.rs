@@ -62,6 +62,7 @@ CREATE VIRTUAL TABLE fts_symbols USING fts5(
 
 CREATE INDEX idx_edges_from ON edges(from_id);
 CREATE INDEX idx_edges_to ON edges(to_id);
+CREATE INDEX idx_edges_to_source ON edges(to_id, source);
 CREATE INDEX idx_nodes_file ON nodes(file);
 ";
 
@@ -101,6 +102,10 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
     );
     let _ = conn.execute(
         "ALTER TABLE nodes ADD COLUMN role_confidence REAL NOT NULL DEFAULT 0.0",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_edges_to_source ON edges(to_id, source)",
         [],
     );
     Ok(conn)
