@@ -37,7 +37,7 @@ pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
     let ra =
         lsp::which_rust_analyzer().ok_or_else(|| anyhow!("rust-analyzer not found in PATH"))?;
 
-    let mut client = lsp::LspClient::spawn(&ra, root)?;
+    let mut client = lsp::LspClient::spawn(&ra, &[], root)?;
     client.initialize()?;
     client.wait_for_ready(60)?;
 

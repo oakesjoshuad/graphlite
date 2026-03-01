@@ -66,8 +66,9 @@ fn read_one_message(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
 }
 
 impl LspClient {
-    pub fn spawn(server_cmd: &str, root: &str) -> Result<Self> {
+    pub fn spawn(server_cmd: &str, args: &[&str], root: &str) -> Result<Self> {
         let mut child = Command::new(server_cmd)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -338,8 +339,16 @@ fn is_quiescent(msg: &Value) -> bool {
 }
 
 pub(crate) fn which_rust_analyzer() -> Option<String> {
+    which_server("rust-analyzer")
+}
+
+pub(crate) fn which_typescript_language_server() -> Option<String> {
+    which_server("typescript-language-server")
+}
+
+fn which_server(name: &str) -> Option<String> {
     Command::new("which")
-        .arg("rust-analyzer")
+        .arg(name)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -387,14 +396,17 @@ pub(crate) fn fn_name_char_offset(file: &str, range_start: i64, name: &str) -> u
 }
 
 pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
-    if language != "rust" {
-        warn!(
-            "LSP: only 'rust' is supported in v0.2, skipping enrichment for '{}'",
-            language
-        );
-        return Ok(());
+    match language {
+        "rust" => enrich_rust(conn, root),
+        "typescript" | "javascript" => enrich_typescript(conn, root, language),
+        _ => {
+            warn!("LSP: no enrichment support for '{}', skipping", language);
+            Ok(())
+        }
     }
+}
 
+fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
     let ra = match which_rust_analyzer() {
         Some(path) => path,
         None => {
@@ -403,7 +415,7 @@ pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
         }
     };
 
-    let mut client = LspClient::spawn(&ra, root)?;
+    let mut client = LspClient::spawn(&ra, &[], root)?;
     client.initialize()?;
     client.wait_for_ready(60)?;
 
@@ -497,6 +509,99 @@ pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
     }
     tx.commit()?;
 
-    eprintln!("LSP: inserted {} trusted edges", edge_count);
+    eprintln!("LSP: inserted {} trusted edges (rust-analyzer)", edge_count);
+    Ok(())
+}
+
+fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()> {
+    let ts = match which_typescript_language_server() {
+        Some(path) => path,
+        None => {
+            warn!("LSP: typescript-language-server not found in PATH, skipping enrichment");
+            return Ok(());
+        }
+    };
+
+    let mut client = LspClient::spawn(&ts, &["--stdio"], root)?;
+    client.initialize()?;
+    // typescript-language-server has no quiescent signal; wait up to 30 s then proceed
+    client.wait_for_ready(30)?;
+
+    // Build (canonical_path, range_start) -> node_id index
+    let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, file, range_start FROM nodes")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, file, range_start) = row?;
+            let canonical = std::fs::canonicalize(&file)
+                .map(|p| p.display().to_string())
+                .unwrap_or(file);
+            path_line_to_id.insert((canonical, range_start), id);
+        }
+    }
+
+    // Query fn nodes for the target language(s)
+    let lang_filter = match language {
+        "javascript" => "'javascript'",
+        _ => "'typescript', 'javascript'",
+    };
+    let sql = format!(
+        "SELECT id, file, range_start, name FROM nodes WHERE kind = 'fn' AND language IN ({})",
+        lang_filter
+    );
+    let fn_nodes: Vec<(i64, String, i64, String)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let result = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        result
+    };
+
+    let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
+
+    for (fn_id, file, range_start, name) in &fn_nodes {
+        let abs_path =
+            std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+        let uri = format!("file://{}", abs_path.display());
+        let lsp_line = (*range_start - 1).max(0) as u32;
+        let char_offset = fn_name_char_offset(file, *range_start, name);
+
+        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        for target in targets {
+            let target_path = uri_to_path(&target.uri);
+            let target_range_start = target.line as i64 + 1;
+            if let Some(&to_id) = path_line_to_id.get(&(target_path, target_range_start)) {
+                trusted_edges.push((*fn_id, to_id));
+            }
+        }
+    }
+
+    client.shutdown()?;
+
+    let edge_count = trusted_edges.len();
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
+             VALUES (?1, ?2, 'CALLS_TRUSTED', 'typescript-language-server', 1.0)",
+        )?;
+        for (from_id, to_id) in &trusted_edges {
+            stmt.execute(rusqlite::params![from_id, to_id])?;
+        }
+    }
+    tx.commit()?;
+
+    eprintln!("LSP: inserted {} trusted edges (typescript-language-server)", edge_count);
     Ok(())
 }
