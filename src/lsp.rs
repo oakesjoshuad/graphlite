@@ -140,6 +140,36 @@ impl LspClient {
         self.rx.recv_timeout(dur).ok()
     }
 
+    pub fn did_open(&mut self, uri: &str, language_id: &str, text: &str) -> Result<()> {
+        self.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        )
+    }
+
+    // Drain incoming messages for up to `timeout_secs`, discarding everything.
+    // Used after bulk didOpen to give the server time to process files before
+    // we start querying call hierarchy.
+    pub fn drain(&mut self, timeout_secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            if self.rx.recv_timeout(remaining).is_err() {
+                return;
+            }
+        }
+    }
+
     // Send a request and wait for the matching response.
     // Messages are classified by whether they have a `method` field:
     //   - has `method` + `id`  → server-to-client request; acknowledge with null result
@@ -563,6 +593,24 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
             .collect::<rusqlite::Result<Vec<_>>>()?;
         result
     };
+
+    // Open all unique source files so the language server builds semantic models.
+    // typescript-language-server is lazy: it only analyses files opened via didOpen.
+    let language_id = if language == "javascript" { "javascript" } else { "typescript" };
+    let mut opened: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, file, _, _) in &fn_nodes {
+        let abs_path =
+            std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+        let uri = format!("file://{}", abs_path.display());
+        if opened.insert(uri.clone()) {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                let _ = client.did_open(&uri, language_id, &text);
+            }
+        }
+    }
+    // Give the server time to process all opened files before querying call hierarchy.
+    eprintln!("LSP[ts]: opened {} files, waiting for analysis...", opened.len());
+    client.drain(20);
 
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
 
