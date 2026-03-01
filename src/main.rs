@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "graphlite",
+    version,
     about = "Build and query a SQLite code graph",
     long_about = "Build and query a SQLite code graph.\n\nRecommended workflow: run `map` first to orient across the full symbol set, then use `context` selectively on the 1-2 symbols you cannot understand from signatures and roles alone."
 )]
