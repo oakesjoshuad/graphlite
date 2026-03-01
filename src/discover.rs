@@ -9,6 +9,7 @@ use crate::{
     language::detect_language,
     lsp,
     parser::{parse_file, ParseResult, RawEdge, Symbol},
+    roles,
     schema::open_or_init_db,
 };
 
@@ -217,6 +218,8 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
     for lang in &effective_lsp {
         lsp::enrich(&conn, root, lang)?;
     }
+
+    roles::infer_roles(&conn)?;
 
     Ok(())
 }

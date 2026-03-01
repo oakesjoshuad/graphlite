@@ -122,6 +122,8 @@ struct NodeRow {
     doc: Option<String>,
     fan_in: i64,
     fan_out: i64,
+    role: String,
+    role_confidence: f64,
 }
 
 struct NeighborRow {
@@ -142,6 +144,19 @@ struct NeighborRow {
     doc: Option<String>,
     fan_in: i64,
     fan_out: i64,
+    role: String,
+    role_confidence: f64,
+}
+
+fn role_attrs(role: &str, confidence: f64) -> String {
+    if confidence < 0.6 {
+        format!(
+            " role=\"{}\" role_confidence=\"{:.2}\" role_uncertain=\"true\"",
+            role, confidence
+        )
+    } else {
+        format!(" role=\"{}\" role_confidence=\"{:.2}\"", role, confidence)
+    }
 }
 
 struct AnnotationRow {
@@ -246,7 +261,8 @@ pub fn graph(
             "SELECT n.id, n.name, n.kind, n.file, n.range_start, n.range_end, n.signature,
                     n.visibility, n.doc,
                     (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
-                    (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out
+                    (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
+                    n.role, n.role_confidence
              FROM nodes n WHERE n.id = ?1",
             rusqlite::params![root_id],
             |r| {
@@ -262,6 +278,8 @@ pub fn graph(
                     doc: r.get(8)?,
                     fan_in: r.get(9)?,
                     fan_out: r.get(10)?,
+                    role: r.get(11)?,
+                    role_confidence: r.get(12)?,
                 })
             },
         )
@@ -307,7 +325,8 @@ pub fn graph(
                    (SELECT confidence FROM edges WHERE from_id = ?1 AND to_id = nd.id LIMIT 1),
                    nd.visibility, nd.doc,
                    (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
-                   (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out
+                   (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
+                   nd.role, nd.role_confidence
             FROM nodes nd JOIN neighborhood nh ON nd.id = nh.id
             WHERE nd.id != ?1
             ORDER BY nh.depth, nd.name",
@@ -331,6 +350,8 @@ pub fn graph(
                     doc: r.get(12)?,
                     fan_in: r.get(13)?,
                     fan_out: r.get(14)?,
+                    role: r.get(15)?,
+                    role_confidence: r.get(16)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -363,7 +384,7 @@ fn render_graph_xml(
 
     body.push_str("  <focus>\n");
     body.push_str(&format!(
-        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\">\n",
+        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
         focus.id,
         xml_escape(&focus.name),
         xml_escape(&focus.kind),
@@ -373,6 +394,7 @@ fn render_graph_xml(
         xml_escape(&focus.visibility),
         focus.fan_in,
         focus.fan_out,
+        role_attrs(&focus.role, focus.role_confidence),
     ));
     if let Some(sig) = &focus.signature {
         body.push_str(&format!(
@@ -420,7 +442,7 @@ fn render_graph_xml(
         body.push_str(&format!("  <neighbors depth=\"{}\">\n", d));
         for n in neighbors.iter().filter(|n| n.depth == d) {
             body.push_str(&format!(
-                "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"",
+                "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
                 n.id,
                 xml_escape(&n.name),
                 xml_escape(&n.kind),
@@ -430,6 +452,7 @@ fn render_graph_xml(
                 xml_escape(&n.visibility),
                 n.fan_in,
                 n.fan_out,
+                role_attrs(&n.role, n.role_confidence),
             ));
             if let Some(et) = &n.edge_type {
                 body.push_str(&format!(" edge_type=\"{}\"", xml_escape(et)));
@@ -569,7 +592,8 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool) -> Result<()> {
                nd.signature, MIN(nh.depth),
                nd.visibility, nd.doc,
                (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
-               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out
+               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
+               nd.role, nd.role_confidence
         FROM nodes nd JOIN dependents nh ON nd.id = nh.id
         WHERE nd.id != ?1
         GROUP BY nd.id
@@ -591,6 +615,8 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool) -> Result<()> {
                     doc: r.get(9)?,
                     fan_in: r.get(10)?,
                     fan_out: r.get(11)?,
+                    role: r.get(12)?,
+                    role_confidence: r.get(13)?,
                 },
                 r.get::<_, i64>(7)?,
             ))
@@ -602,7 +628,8 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool) -> Result<()> {
             "SELECT n.id, n.name, n.kind, n.file, n.range_start, n.range_end, n.signature,
                     n.visibility, n.doc,
                     (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
-                    (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out
+                    (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
+                    n.role, n.role_confidence
              FROM nodes n WHERE n.id = ?1",
             rusqlite::params![root_id],
             |r| {
@@ -618,6 +645,8 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool) -> Result<()> {
                     doc: r.get(8)?,
                     fan_in: r.get(9)?,
                     fan_out: r.get(10)?,
+                    role: r.get(11)?,
+                    role_confidence: r.get(12)?,
                 })
             },
         )
@@ -640,7 +669,8 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
             "SELECT n.id, n.name, n.kind, n.file, n.range_start, n.range_end, n.signature,
                     n.visibility, n.doc,
                     (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
-                    (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out
+                    (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
+                    n.role, n.role_confidence
              FROM nodes n WHERE n.id = ?1",
             rusqlite::params![root_id],
             |r| {
@@ -656,6 +686,8 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
                     doc: r.get(8)?,
                     fan_in: r.get(9)?,
                     fan_out: r.get(10)?,
+                    role: r.get(11)?,
+                    role_confidence: r.get(12)?,
                 })
             },
         )
@@ -676,7 +708,8 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
                (SELECT confidence FROM edges WHERE from_id = ?1 AND to_id = nd.id LIMIT 1),
                nd.visibility, nd.doc,
                (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
-               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out
+               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
+               nd.role, nd.role_confidence
         FROM nodes nd JOIN neighborhood nh ON nd.id = nh.id
         WHERE nd.id != ?1
         ORDER BY nh.depth, nd.name",
@@ -699,6 +732,8 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
                 doc: r.get(12)?,
                 fan_in: r.get(13)?,
                 fan_out: r.get(14)?,
+                role: r.get(15)?,
+                role_confidence: r.get(16)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -727,7 +762,8 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
                nd.signature, MIN(nh.depth),
                nd.visibility, nd.doc,
                (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
-               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out
+               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
+               nd.role, nd.role_confidence
         FROM nodes nd JOIN dependents nh ON nd.id = nh.id
         WHERE nd.id != ?1
         GROUP BY nd.id
@@ -748,6 +784,8 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
                     doc: r.get(9)?,
                     fan_in: r.get(10)?,
                     fan_out: r.get(11)?,
+                    role: r.get(12)?,
+                    role_confidence: r.get(13)?,
                 },
                 r.get::<_, i64>(7)?,
             ))
@@ -781,7 +819,7 @@ fn render_blast_radius_xml(
 
     body.push_str("  <focus>\n");
     body.push_str(&format!(
-        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\">\n",
+        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
         focus.id,
         xml_escape(&focus.name),
         xml_escape(&focus.kind),
@@ -791,6 +829,7 @@ fn render_blast_radius_xml(
         xml_escape(&focus.visibility),
         focus.fan_in,
         focus.fan_out,
+        role_attrs(&focus.role, focus.role_confidence),
     ));
     if let Some(sig) = &focus.signature {
         body.push_str(&format!(
@@ -838,7 +877,7 @@ fn render_blast_radius_xml(
         body.push_str(&format!("  <dependents depth=\"{}\">\n", d));
         for (n, _) in dependents.iter().filter(|(_, dep)| *dep == d) {
             body.push_str(&format!(
-                "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"",
+                "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
                 n.id,
                 xml_escape(&n.name),
                 xml_escape(&n.kind),
@@ -848,6 +887,7 @@ fn render_blast_radius_xml(
                 xml_escape(&n.visibility),
                 n.fan_in,
                 n.fan_out,
+                role_attrs(&n.role, n.role_confidence),
             ));
             if let Some(sig) = &n.signature {
                 body.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
@@ -902,20 +942,22 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
         fan_in: i64,
         fan_out: i64,
         doc: Option<String>,
+        role: String,
+        role_confidence: f64,
     }
 
     let sql = if include_private {
         "SELECT n.file, n.name, n.kind, n.visibility, n.signature,
                 (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
                 (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
-                n.doc
+                n.doc, n.role, n.role_confidence
          FROM nodes n
          ORDER BY n.file, fan_in DESC"
     } else {
         "SELECT n.file, n.name, n.kind, n.visibility, n.signature,
                 (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
                 (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
-                n.doc
+                n.doc, n.role, n.role_confidence
          FROM nodes n
          WHERE n.visibility != 'private'
          ORDER BY n.file, fan_in DESC"
@@ -933,6 +975,8 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
                 fan_in: r.get(5)?,
                 fan_out: r.get(6)?,
                 doc: r.get(7)?,
+                role: r.get(8)?,
+                role_confidence: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1000,12 +1044,13 @@ pub fn map(include_private: bool, top: usize, with_docs: bool, with_file_docs: b
         for &i in indices {
             let s = &rows[i];
             out.push_str(&format!(
-                "    <symbol name=\"{}\" kind=\"{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"",
+                "    <symbol name=\"{}\" kind=\"{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
                 xml_escape(&s.name),
                 xml_escape(&s.kind),
                 xml_escape(&s.visibility),
                 s.fan_in,
                 s.fan_out,
+                role_attrs(&s.role, s.role_confidence),
             ));
             if let Some(sig) = &s.signature {
                 out.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));

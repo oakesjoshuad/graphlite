@@ -17,7 +17,9 @@ CREATE TABLE nodes (
     signature TEXT,
     content_hash TEXT NOT NULL DEFAULT '',
     visibility TEXT NOT NULL DEFAULT 'private',
-    doc TEXT
+    doc TEXT,
+    role TEXT NOT NULL DEFAULT 'unknown',
+    role_confidence REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE TABLE edges (
@@ -92,8 +94,15 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
         drop(conn);
         return init_db(path);
     }
-    // Idempotent migration: add doc column to files if absent (pre-v0.4 dbs)
     let _ = conn.execute("ALTER TABLE files ADD COLUMN doc TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE nodes ADD COLUMN role TEXT NOT NULL DEFAULT 'unknown'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE nodes ADD COLUMN role_confidence REAL NOT NULL DEFAULT 0.0",
+        [],
+    );
     Ok(conn)
 }
 

@@ -8,6 +8,7 @@ mod lsp;
 mod parser;
 mod query;
 mod refactor;
+mod roles;
 mod schema;
 
 use anyhow::Result;
