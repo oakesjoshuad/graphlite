@@ -79,19 +79,7 @@ fn detect_lsp_from_files(files: &[PathBuf]) -> Vec<String> {
     // For each present language, check if server is in PATH
     present
         .into_iter()
-        .filter(|lang_str| {
-            // Re-derive server cmd from language string
-            let ext = match lang_str.as_str() {
-                "rust" => "rs",
-                "typescript" => "ts",
-                "javascript" => "js",
-                "svelte" => "svelte",
-                _ => return false,
-            };
-            let cmd = detect_language(std::path::Path::new(&format!("x.{}", ext)))
-                .and_then(|l| l.lsp_server_cmd());
-            cmd.map(|cmd| lsp::which_server(cmd).is_some()).unwrap_or(false)
-        })
+        .filter(|lang_str| lsp::which_server_for_language(lang_str).is_some())
         .collect()
 }
 

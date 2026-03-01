@@ -1,14 +1,77 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
+use std::io::BufReader;
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use crossbeam_channel::RecvTimeoutError;
 use log::{debug, warn};
 use rusqlite::Connection;
 use serde_json::{json, Value};
+
+// ---------------------------------------------------------------------------
+// Language registry
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub struct LspLanguageConfig {
+    pub language: &'static str,
+    pub server_cmd: &'static str,
+    pub server_args: &'static [&'static str],
+    pub language_id: &'static str,
+    pub edge_source: &'static str,
+    pub has_quiescent_signal: bool,
+    pub needs_did_open: bool,
+}
+
+pub const LANGUAGE_CONFIGS: &[LspLanguageConfig] = &[
+    LspLanguageConfig {
+        language: "rust",
+        server_cmd: "rust-analyzer",
+        server_args: &[],
+        language_id: "rust",
+        edge_source: "rust-analyzer",
+        has_quiescent_signal: true,
+        needs_did_open: false,
+    },
+    LspLanguageConfig {
+        language: "typescript",
+        server_cmd: "typescript-language-server",
+        server_args: &["--stdio"],
+        language_id: "typescript",
+        edge_source: "typescript-language-server",
+        has_quiescent_signal: false,
+        needs_did_open: true,
+    },
+    LspLanguageConfig {
+        language: "javascript",
+        server_cmd: "typescript-language-server",
+        server_args: &["--stdio"],
+        language_id: "javascript",
+        edge_source: "typescript-language-server",
+        has_quiescent_signal: false,
+        needs_did_open: true,
+    },
+    LspLanguageConfig {
+        language: "svelte",
+        server_cmd: "svelteserver",
+        server_args: &["--stdio"],
+        language_id: "svelte",
+        edge_source: "svelte-language-server",
+        has_quiescent_signal: false,
+        needs_did_open: true,
+    },
+    // Future — uncomment when tree-sitter grammar + queries/<lang>.scm are added:
+    // LspLanguageConfig { language: "go", server_cmd: "gopls", server_args: &["serve"],
+    //     language_id: "go", edge_source: "gopls", has_quiescent_signal: false, needs_did_open: true },
+    // LspLanguageConfig { language: "python", server_cmd: "pylsp", server_args: &[],
+    //     language_id: "python", edge_source: "pylsp", has_quiescent_signal: false, needs_did_open: true },
+];
+
+// ---------------------------------------------------------------------------
+// LspCallTarget + LspClient
+// ---------------------------------------------------------------------------
 
 pub struct LspCallTarget {
     #[allow(dead_code)]
@@ -19,50 +82,16 @@ pub struct LspCallTarget {
 
 pub struct LspClient {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
-    rx: mpsc::Receiver<Value>,
-    _reader: thread::JoinHandle<()>,
+    connection: lsp_server::Connection,
     next_id: u64,
     root: String,
-    notification_buf: Vec<Value>,
+    notification_buf: Vec<lsp_server::Message>,
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
-}
-
-fn read_one_message(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
-    let mut content_length: Option<usize> = None;
-
-    loop {
-        let mut line = String::new();
-        stdout.read_line(&mut line)?;
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(val) = trimmed.strip_prefix("Content-Length: ") {
-            content_length = Some(val.trim().parse()?);
-        }
-    }
-
-    let len = content_length.ok_or_else(|| anyhow!("no Content-Length header in LSP message"))?;
-    let mut buf = vec![0u8; len];
-    stdout.read_exact(&mut buf)?;
-    let msg: Value =
-        serde_json::from_slice(&buf).map_err(|e| anyhow!("failed to parse LSP JSON: {}", e))?;
-
-    // Debug: show every message received from the server
-    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("-");
-    let id = msg
-        .get("id")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".into());
-    debug!("LSP[recv] method={} id={}", method, id);
-
-    Ok(msg)
 }
 
 impl LspClient {
@@ -75,69 +104,101 @@ impl LspClient {
             .spawn()
             .map_err(|e| anyhow!("failed to spawn {}: {}", server_cmd, e))?;
 
-        let stdin = BufWriter::new(
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| anyhow!("no stdin on child process"))?,
-        );
-        let child_stdout = child
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("no stdin on child process"))?;
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("no stdout on child process"))?;
 
-        let (tx, rx) = mpsc::channel::<Value>();
-        let _reader = thread::spawn(move || {
-            let mut out = BufReader::new(child_stdout);
-            while let Ok(msg) = read_one_message(&mut out) {
-                if tx.send(msg).is_err() {
+        // Outgoing: main thread → writer thread → child stdin
+        let (outgoing_tx, outgoing_rx) =
+            crossbeam_channel::bounded::<lsp_server::Message>(16);
+        // Incoming: reader thread → main thread
+        let (incoming_tx, incoming_rx) =
+            crossbeam_channel::bounded::<lsp_server::Message>(16);
+
+        // Writer thread: drain outgoing channel, write each message to child stdin.
+        // lsp_server::Message::write() handles Content-Length framing.
+        thread::spawn(move || {
+            let mut w = stdin;
+            for msg in outgoing_rx {
+                if msg.write(&mut w).is_err() {
                     break;
                 }
             }
         });
 
+        // Reader thread: read from child stdout, send parsed messages to main thread.
+        // lsp_server::Message::read() handles Content-Length framing.
+        thread::spawn(move || {
+            let mut r = BufReader::new(stdout);
+            while let Ok(Some(msg)) = lsp_server::Message::read(&mut r) {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // lsp_server::Connection fields are pub — construct directly from our channels.
+        let connection = lsp_server::Connection {
+            sender: outgoing_tx,
+            receiver: incoming_rx,
+        };
+
         Ok(LspClient {
             child,
-            stdin,
-            rx,
-            _reader,
+            connection,
             next_id: 1,
             root: root.to_string(),
             notification_buf: Vec::new(),
         })
     }
 
-    fn send_raw(&mut self, msg: &Value) -> Result<()> {
-        let body = serde_json::to_string(msg)?;
-        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
-        self.stdin.flush()?;
-        Ok(())
-    }
-
     fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        self.send_raw(&msg)?;
+        self.connection
+            .sender
+            .send(lsp_server::Message::Request(lsp_server::Request {
+                id: lsp_server::RequestId::from(id as i32),
+                method: method.to_string(),
+                params,
+            }))
+            .map_err(|e| anyhow!("LSP send failed (server crashed?): {}", e))?;
         Ok(id)
     }
 
     fn send_notification(&mut self, method: &str, params: Value) -> Result<()> {
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
-        self.send_raw(&msg)
+        self.connection
+            .sender
+            .send(lsp_server::Message::Notification(lsp_server::Notification {
+                method: method.to_string(),
+                params,
+            }))
+            .map_err(|e| anyhow!("LSP send failed (server crashed?): {}", e))?;
+        Ok(())
     }
 
-    fn read_message_timeout(&mut self, dur: Duration) -> Option<Value> {
-        self.rx.recv_timeout(dur).ok()
+    fn read_message_timeout(&mut self, dur: Duration) -> Option<lsp_server::Message> {
+        match self.connection.receiver.recv_timeout(dur) {
+            Ok(msg) => {
+                let method = match &msg {
+                    lsp_server::Message::Request(r) => r.method.as_str(),
+                    lsp_server::Message::Response(_) => "<response>",
+                    lsp_server::Message::Notification(n) => n.method.as_str(),
+                };
+                debug!("LSP[recv] method={}", method);
+                Some(msg)
+            }
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                debug!("LSP: receiver disconnected (server crashed)");
+                None
+            }
+        }
     }
 
     pub fn did_open(&mut self, uri: &str, language_id: &str, text: &str) -> Result<()> {
@@ -210,16 +271,17 @@ impl LspClient {
         }
     }
 
-    // Send a request and wait for the matching response.
-    // Messages are classified by whether they have a `method` field:
-    //   - has `method` + `id`  → server-to-client request; acknowledge with null result
-    //   - has `method`, no `id` → notification; buffer for wait_for_ready
-    //   - no `method`, matching `id` → our response; return it
+    // Send a request and wait for the matching response within 10 seconds.
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.call_with_timeout(method, params, Duration::from_secs(10))
     }
 
-    fn call_with_timeout(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+    fn call_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = self.send_request(method, params)?;
         let deadline = Instant::now() + timeout;
         loop {
@@ -227,34 +289,37 @@ impl LspClient {
             if remaining.is_zero() {
                 return Err(anyhow!("timeout waiting for response to '{}'", method));
             }
-            let msg = match self.read_message_timeout(remaining) {
-                Some(m) => m,
+            match self.read_message_timeout(remaining) {
                 None => return Err(anyhow!("timeout waiting for response to '{}'", method)),
-            };
-
-            if msg.get("method").is_some() {
-                if let Some(server_req_id) = msg.get("id") {
+                Some(lsp_server::Message::Response(resp)) => {
+                    if resp.id == lsp_server::RequestId::from(id as i32) {
+                        if let Some(err) = resp.error {
+                            return Err(anyhow!(
+                                "LSP error for '{}': {:?}",
+                                method,
+                                err
+                            ));
+                        }
+                        return Ok(resp.result.unwrap_or(Value::Null));
+                    }
+                    // Stale response for a prior request — ignore
+                }
+                Some(lsp_server::Message::Request(req)) => {
                     // Server-to-client request (e.g. window/workDoneProgress/create).
                     // Must acknowledge or the server may stall waiting for our reply.
-                    let reply = json!({
-                        "jsonrpc": "2.0",
-                        "id": server_req_id,
-                        "result": null
-                    });
-                    let _ = self.send_raw(&reply);
-                } else {
-                    // Notification — buffer for wait_for_ready
+                    let reply = lsp_server::Response {
+                        id: req.id,
+                        result: Some(Value::Null),
+                        error: None,
+                    };
+                    let _ = self
+                        .connection
+                        .sender
+                        .send(lsp_server::Message::Response(reply));
+                }
+                Some(msg @ lsp_server::Message::Notification(_)) => {
                     self.notification_buf.push(msg);
                 }
-                continue;
-            }
-
-            // No `method` → it's a response. Match by id.
-            if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                if let Some(err) = msg.get("error") {
-                    return Err(anyhow!("LSP error for '{}': {}", method, err));
-                }
-                return Ok(msg["result"].clone());
             }
         }
     }
@@ -327,8 +392,8 @@ impl LspClient {
                         debug!("LSP: ready (quiescent)");
                         return Ok(());
                     }
-                    // Buffer non-quiescent notifications; ignore responses
-                    if msg.get("id").is_none() {
+                    // Buffer notifications; ignore requests and responses
+                    if let lsp_server::Message::Notification(_) = msg {
                         self.notification_buf.push(msg);
                     }
                 }
@@ -433,6 +498,28 @@ impl LspClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Protocol helpers
+// ---------------------------------------------------------------------------
+
+fn is_quiescent(msg: &lsp_server::Message) -> bool {
+    if let lsp_server::Message::Notification(n) = msg {
+        n.method == "experimental/serverStatus"
+            && n.params["quiescent"].as_bool() == Some(true)
+    } else {
+        false
+    }
+}
+
+fn diagnostics_uri(msg: &lsp_server::Message) -> Option<&str> {
+    if let lsp_server::Message::Notification(n) = msg {
+        if n.method == "textDocument/publishDiagnostics" {
+            return n.params["uri"].as_str();
+        }
+    }
+    None
+}
+
 // Flatten an inlay hint label (string or array of InlayHintLabelPart) to a plain string.
 fn inlay_label_str(label: &Value) -> String {
     match label {
@@ -469,29 +556,27 @@ fn return_type_hint_on_line(hints: &[Value], lsp_line: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn diagnostics_uri(msg: &Value) -> Option<&str> {
-    if msg.get("method").and_then(|v| v.as_str()) == Some("textDocument/publishDiagnostics") {
-        msg["params"]["uri"].as_str()
-    } else {
-        None
-    }
-}
+// ---------------------------------------------------------------------------
+// Server discovery
+// ---------------------------------------------------------------------------
 
-fn is_quiescent(msg: &Value) -> bool {
-    msg.get("method").and_then(|v| v.as_str()) == Some("experimental/serverStatus")
-        && msg["params"]["quiescent"].as_bool() == Some(true)
+pub fn which_server_for_language(language: &str) -> Option<String> {
+    LANGUAGE_CONFIGS
+        .iter()
+        .find(|c| c.language == language)
+        .and_then(|c| which_server(c.server_cmd))
 }
 
 pub(crate) fn which_rust_analyzer() -> Option<String> {
-    which_server("rust-analyzer")
+    which_server_for_language("rust")
 }
 
 pub(crate) fn which_typescript_language_server() -> Option<String> {
-    which_server("typescript-language-server")
+    which_server_for_language("typescript")
 }
 
 pub(crate) fn which_svelteserver() -> Option<String> {
-    which_server("svelteserver")
+    which_server_for_language("svelte")
 }
 
 pub(crate) fn which_server(name: &str) -> Option<String> {
@@ -560,17 +645,61 @@ pub(crate) fn fn_name_char_offset(file: &str, range_start: i64, name: &str) -> u
     3 // fallback: `fn name` positions name at char 3
 }
 
-pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Enrichment — public entry point with crash-restart wrapper
+// ---------------------------------------------------------------------------
+
+fn is_crash_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("LSP send failed") || s.contains("disconnected")
+}
+
+fn do_enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
     match language {
         "rust" => enrich_rust(conn, root),
         "typescript" | "javascript" => enrich_typescript(conn, root, language),
         "svelte" => enrich_svelte(conn, root),
+        _ => Ok(()),
+    }
+}
+
+fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            warn!(
+                "LSP[{}]: crash on attempt {}/{}; restarting in {}s",
+                language, attempt, MAX_ATTEMPTS, attempt
+            );
+            std::thread::sleep(Duration::from_secs(attempt as u64));
+        }
+        match do_enrich(conn, root, language) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_crash_error(&e) => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e), // timeout / protocol error — don't restart
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
+    match language {
+        "rust" | "typescript" | "javascript" | "svelte" => {
+            enrich_with_retry(conn, root, language)
+        }
         _ => {
             warn!("LSP: no enrichment support for '{}', skipping", language);
             Ok(())
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Language-specific enrichment implementations
+// ---------------------------------------------------------------------------
 
 fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
     let ra = match which_rust_analyzer() {
