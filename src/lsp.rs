@@ -154,18 +154,58 @@ impl LspClient {
         )
     }
 
-    // Drain incoming messages for up to `timeout_secs`, discarding everything.
-    // Used after bulk didOpen to give the server time to process files before
-    // we start querying call hierarchy.
-    pub fn drain(&mut self, timeout_secs: u64) {
+    // Wait until textDocument/publishDiagnostics has been received for every URI
+    // in `pending`, then return. If the deadline expires first, logs the stuck
+    // URIs at warn level and returns whatever is still pending — callers use
+    // this to understand which files the server struggled with.
+    //
+    // Drains notification_buf first so diagnostics buffered during initialize()
+    // are not missed.
+    pub fn wait_for_diagnostics(
+        &mut self,
+        mut pending: std::collections::HashSet<String>,
+        timeout_secs: u64,
+    ) -> std::collections::HashSet<String> {
+        // Drain any notifications already buffered during initialize/wait_for_ready
+        let buffered = std::mem::take(&mut self.notification_buf);
+        for msg in buffered {
+            if let Some(uri) = diagnostics_uri(&msg) {
+                pending.remove(uri);
+            }
+        }
+
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         loop {
+            if pending.is_empty() {
+                return pending;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return;
+                warn!(
+                    "LSP: timed out waiting for diagnostics; {} file(s) did not report back:",
+                    pending.len()
+                );
+                for uri in &pending {
+                    warn!("  {}", uri);
+                }
+                return pending;
             }
-            if self.rx.recv_timeout(remaining).is_err() {
-                return;
+            match self.read_message_timeout(remaining) {
+                Some(msg) => {
+                    if let Some(uri) = diagnostics_uri(&msg) {
+                        let uri = uri.to_string();
+                        let was_pending = pending.remove(&uri);
+                        debug!(
+                            "LSP: diagnostics for {} (pending: {})",
+                            uri,
+                            pending.len()
+                        );
+                        if was_pending && pending.is_empty() {
+                            return pending;
+                        }
+                    }
+                }
+                None => return pending,
             }
         }
     }
@@ -363,6 +403,14 @@ impl LspClient {
     }
 }
 
+fn diagnostics_uri(msg: &Value) -> Option<&str> {
+    if msg.get("method").and_then(|v| v.as_str()) == Some("textDocument/publishDiagnostics") {
+        msg["params"]["uri"].as_str()
+    } else {
+        None
+    }
+}
+
 fn is_quiescent(msg: &Value) -> bool {
     msg.get("method").and_then(|v| v.as_str()) == Some("experimental/serverStatus")
         && msg["params"]["quiescent"].as_bool() == Some(true)
@@ -376,8 +424,13 @@ pub(crate) fn which_typescript_language_server() -> Option<String> {
     which_server("typescript-language-server")
 }
 
-fn which_server(name: &str) -> Option<String> {
-    Command::new("which")
+pub(crate) fn which_svelteserver() -> Option<String> {
+    which_server("svelteserver")
+}
+
+pub(crate) fn which_server(name: &str) -> Option<String> {
+    // Standard PATH lookup first
+    if let Some(path) = Command::new("which")
         .arg(name)
         .output()
         .ok()
@@ -385,6 +438,22 @@ fn which_server(name: &str) -> Option<String> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+    {
+        return Some(path);
+    }
+    // Fallback: package manager bin dirs not always on PATH (e.g. bun global installs)
+    let home = std::env::var("HOME").unwrap_or_default();
+    for dir in &[
+        format!("{}/.cache/.bun/bin", home),
+        format!("{}/.bun/bin", home),
+        format!("{}/.local/bin", home),
+    ] {
+        let candidate = format!("{}/{}", dir, name);
+        if std::path::Path::new(&candidate).exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub(crate) fn uri_to_path(uri: &str) -> String {
@@ -429,6 +498,7 @@ pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
     match language {
         "rust" => enrich_rust(conn, root),
         "typescript" | "javascript" => enrich_typescript(conn, root, language),
+        "svelte" => enrich_svelte(conn, root),
         _ => {
             warn!("LSP: no enrichment support for '{}', skipping", language);
             Ok(())
@@ -554,8 +624,8 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
 
     let mut client = LspClient::spawn(&ts, &["--stdio"], root)?;
     client.initialize()?;
-    // typescript-language-server has no quiescent signal; wait up to 30 s then proceed
-    client.wait_for_ready(30)?;
+    // No quiescent signal; 5 s is enough for the server to finish processing initialize
+    client.wait_for_ready(5)?;
 
     // Build (canonical_path, range_start) -> node_id index
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
@@ -597,20 +667,22 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     // Open all unique source files so the language server builds semantic models.
     // typescript-language-server is lazy: it only analyses files opened via didOpen.
     let language_id = if language == "javascript" { "javascript" } else { "typescript" };
-    let mut opened: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, file, _, _) in &fn_nodes {
         let abs_path =
             std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
         let uri = format!("file://{}", abs_path.display());
-        if opened.insert(uri.clone()) {
+        if pending.insert(uri.clone()) {
             if let Ok(text) = std::fs::read_to_string(file) {
                 let _ = client.did_open(&uri, language_id, &text);
             }
         }
     }
-    // Give the server time to process all opened files before querying call hierarchy.
-    eprintln!("LSP[ts]: opened {} files, waiting for analysis...", opened.len());
-    client.drain(20);
+    eprintln!(
+        "LSP[ts]: opened {} file(s), waiting for diagnostics...",
+        pending.len()
+    );
+    client.wait_for_diagnostics(pending, 60);
 
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
 
@@ -651,5 +723,109 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     tx.commit()?;
 
     eprintln!("LSP: inserted {} trusted edges (typescript-language-server)", edge_count);
+    Ok(())
+}
+
+fn enrich_svelte(conn: &Connection, root: &str) -> Result<()> {
+    let sv = match which_svelteserver() {
+        Some(path) => path,
+        None => {
+            warn!("LSP: svelteserver not found in PATH or bun bin, skipping enrichment");
+            return Ok(());
+        }
+    };
+
+    let mut client = LspClient::spawn(&sv, &["--stdio"], root)?;
+    client.initialize()?;
+    // svelteserver has no quiescent signal; 5 s clears post-initialize noise
+    client.wait_for_ready(5)?;
+
+    // Build (canonical_path, range_start) -> node_id index
+    let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, file, range_start FROM nodes")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, file, range_start) = row?;
+            let canonical = std::fs::canonicalize(&file)
+                .map(|p| p.display().to_string())
+                .unwrap_or(file);
+            path_line_to_id.insert((canonical, range_start), id);
+        }
+    }
+
+    let fn_nodes: Vec<(i64, String, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, file, range_start, name FROM nodes WHERE kind = 'fn' AND language = 'svelte'",
+        )?;
+        let result = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        result
+    };
+
+    // Open each .svelte file so svelteserver builds its TypeScript plugin model
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, file, _, _) in &fn_nodes {
+        let abs_path =
+            std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+        let uri = format!("file://{}", abs_path.display());
+        if pending.insert(uri.clone()) {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                let _ = client.did_open(&uri, "svelte", &text);
+            }
+        }
+    }
+    eprintln!(
+        "LSP[svelte]: opened {} file(s), waiting for diagnostics...",
+        pending.len()
+    );
+    client.wait_for_diagnostics(pending, 60);
+
+    let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
+
+    for (fn_id, file, range_start, name) in &fn_nodes {
+        let abs_path =
+            std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+        let uri = format!("file://{}", abs_path.display());
+        let lsp_line = (*range_start - 1).max(0) as u32;
+        let char_offset = fn_name_char_offset(file, *range_start, name);
+
+        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        for target in targets {
+            let target_path = uri_to_path(&target.uri);
+            let target_range_start = target.line as i64 + 1;
+            if let Some(&to_id) = path_line_to_id.get(&(target_path, target_range_start)) {
+                trusted_edges.push((*fn_id, to_id));
+            }
+        }
+    }
+
+    client.shutdown()?;
+
+    let edge_count = trusted_edges.len();
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
+             VALUES (?1, ?2, 'CALLS_TRUSTED', 'svelte-language-server', 1.0)",
+        )?;
+        for (from_id, to_id) in &trusted_edges {
+            stmt.execute(rusqlite::params![from_id, to_id])?;
+        }
+    }
+    tx.commit()?;
+
+    eprintln!("LSP: inserted {} trusted edges (svelte-language-server)", edge_count);
     Ok(())
 }

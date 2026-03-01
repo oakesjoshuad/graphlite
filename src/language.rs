@@ -49,7 +49,7 @@ impl Language {
         match self {
             Language::Rust => Some("rust-analyzer"),
             Language::TypeScript | Language::JavaScript => Some("typescript-language-server"),
-            Language::Svelte => Some("svelte-language-server"),
+            Language::Svelte => Some("svelteserver"),
             Language::Html | Language::Css => None,
         }
     }

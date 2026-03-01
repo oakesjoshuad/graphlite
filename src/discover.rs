@@ -90,16 +90,7 @@ fn detect_lsp_from_files(files: &[PathBuf]) -> Vec<String> {
             };
             let cmd = detect_language(std::path::Path::new(&format!("x.{}", ext)))
                 .and_then(|l| l.lsp_server_cmd());
-            if let Some(cmd) = cmd {
-                std::process::Command::new("which")
-                    .arg(cmd)
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .is_some()
-            } else {
-                false
-            }
+            cmd.map(|cmd| lsp::which_server(cmd).is_some()).unwrap_or(false)
         })
         .collect()
 }
