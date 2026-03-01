@@ -14,11 +14,6 @@
 (type_item
     name: (type_identifier) @name) @definition.class
 
-; method definitions (functions inside impl blocks)
-(declaration_list
-    (function_item
-        name: (identifier) @name) @definition.method)
-
 ; function definitions
 (function_item
     name: (identifier) @name) @definition.function

@@ -179,33 +179,68 @@ struct EdgeInfo {
     confidence: f64,
 }
 
-fn fetch_annotation(conn: &Connection, node_id: i64) -> Option<AnnotationRow> {
-    conn.query_row(
-        "SELECT a.intent, a.behavior, a.tags, a.source, a.confidence,
+fn fetch_annotations(
+    conn: &Connection,
+    ids: &[i64],
+) -> std::collections::HashMap<i64, AnnotationRow> {
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders: String = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT a.node_id, a.intent, a.behavior, a.tags, a.source, a.confidence,
                 a.content_hash_at_annotation != n.content_hash AS stale
          FROM annotations a JOIN nodes n ON n.id = a.node_id
-         WHERE a.node_id = ?1",
-        rusqlite::params![node_id],
-        |r| {
-            Ok(AnnotationRow {
-                intent: r.get(0)?,
-                behavior: r.get(1)?,
-                tags: r.get(2)?,
-                source: r.get(3)?,
-                confidence: r.get(4)?,
-                stale: r.get::<_, bool>(5).unwrap_or(false),
-            })
-        },
-    )
-    .ok()
+         WHERE a.node_id IN ({})",
+        placeholders
+    );
+    let mut map = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        let params = rusqlite::params_from_iter(ids.iter().copied());
+        if let Ok(rows) = stmt.query_map(params, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                AnnotationRow {
+                    intent: r.get(1)?,
+                    behavior: r.get(2)?,
+                    tags: r.get(3)?,
+                    source: r.get(4)?,
+                    confidence: r.get(5)?,
+                    stale: r.get::<_, bool>(6).unwrap_or(false),
+                },
+            ))
+        }) {
+            for row in rows.flatten() {
+                map.insert(row.0, row.1);
+            }
+        }
+    }
+    map
 }
 
-fn read_snippet(file: &str, line_start: i64, line_end: i64) -> Option<String> {
+fn read_snippet(
+    file: &str,
+    line_start: i64,
+    line_end: i64,
+    max_lines: Option<usize>,
+) -> Option<String> {
     let content = fs::read_to_string(Path::new(file)).ok()?;
-    let lines: Vec<&str> = content.lines().collect();
-    let start = ((line_start - 1) as usize).min(lines.len());
-    let end = (line_end as usize).min(lines.len());
-    Some(lines[start..end].join("\n"))
+    let all_lines: Vec<&str> = content.lines().collect();
+    let start = ((line_start - 1) as usize).min(all_lines.len());
+    let end = (line_end as usize).min(all_lines.len());
+    let lines = &all_lines[start..end];
+    if let Some(max) = max_lines {
+        if lines.len() > max {
+            let truncated = lines[..max].join("\n");
+            return Some(format!("{}\n// \u{2026}{} more lines", truncated, lines.len() - max));
+        }
+    }
+    Some(lines.join("\n"))
 }
 
 fn read_call_site_snippet(
@@ -252,6 +287,7 @@ pub fn graph(
     _format: &str,
     show_trust: bool,
     snippets: bool,
+    max_snippet_lines: Option<usize>,
 ) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
@@ -364,7 +400,7 @@ pub fn graph(
 
         print!(
             "{}",
-            render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets)
+            render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, max_snippet_lines)
         );
     }
 
@@ -377,8 +413,13 @@ fn render_graph_xml(
     neighbors: &[NeighborRow],
     edge_count: i64,
     snippets: bool,
+    max_snippet_lines: Option<usize>,
 ) -> String {
-    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end);
+    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines);
+
+    let mut all_ids: Vec<i64> = vec![focus.id];
+    all_ids.extend(neighbors.iter().map(|n| n.id));
+    let annotations = fetch_annotations(conn, &all_ids);
 
     let mut body = String::new();
 
@@ -407,7 +448,7 @@ fn render_graph_xml(
             body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
         }
     }
-    if let Some(ann) = fetch_annotation(conn, focus.id) {
+    if let Some(ann) = annotations.get(&focus.id) {
         body.push_str(&format!(
             "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
             xml_escape(&ann.source),
@@ -461,16 +502,44 @@ fn render_graph_xml(
                 body.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
             }
             let has_doc = n.doc.as_ref().is_some_and(|d| !d.is_empty());
-            let has_snippet =
-                snippets && read_snippet(&n.file, n.range_start, n.range_end).is_some();
-            if has_doc || has_snippet {
+            let neighbor_snippet = if snippets {
+                read_snippet(&n.file, n.range_start, n.range_end, max_snippet_lines)
+            } else {
+                None
+            };
+            let neighbor_annotation = annotations.get(&n.id);
+            if has_doc || neighbor_snippet.is_some() || neighbor_annotation.is_some() {
                 body.push_str(">\n");
                 if let Some(doc) = &n.doc {
                     if !doc.is_empty() {
                         body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
                     }
                 }
-                if let Some(snip) = read_snippet(&n.file, n.range_start, n.range_end) {
+                if let Some(ann) = neighbor_annotation {
+                    body.push_str(&format!(
+                        "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
+                        xml_escape(&ann.source),
+                        ann.confidence,
+                        ann.stale
+                    ));
+                    if let Some(intent) = &ann.intent {
+                        body.push_str(&format!(
+                            "        <intent>{}</intent>\n",
+                            xml_escape(intent)
+                        ));
+                    }
+                    if let Some(behavior) = &ann.behavior {
+                        body.push_str(&format!(
+                            "        <behavior>{}</behavior>\n",
+                            xml_escape(behavior)
+                        ));
+                    }
+                    if let Some(tags) = &ann.tags {
+                        body.push_str(&format!("        <tags>{}</tags>\n", xml_escape(tags)));
+                    }
+                    body.push_str("      </annotation>\n");
+                }
+                if let Some(snip) = neighbor_snippet {
                     body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
                 }
                 body.push_str("    </node>\n");
@@ -496,7 +565,7 @@ fn render_graph_xml(
 }
 
 fn print_xml_trust_split(focus: &NodeRow, edges: &[EdgeInfo]) {
-    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end);
+    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end, None);
 
     let trusted: Vec<&EdgeInfo> = edges
         .iter()
@@ -574,7 +643,7 @@ fn print_xml_trust_split(focus: &NodeRow, edges: &[EdgeInfo]) {
     print!("{}{}", header, body);
 }
 
-pub fn blast_radius(symbol: &str, depth: usize, snippets: bool) -> Result<()> {
+pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_lines: Option<usize>) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
 
@@ -654,12 +723,12 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool) -> Result<()> {
 
     print!(
         "{}",
-        render_blast_radius_xml(&conn, &focus, &rows, snippets)
+        render_blast_radius_xml(&conn, &focus, &rows, snippets, max_snippet_lines)
     );
     Ok(())
 }
 
-pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -> Result<()> {
+pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, max_snippet_lines: Option<usize>) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
 
@@ -742,7 +811,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
         rusqlite::params![root_id],
         |r| r.get(0),
     )?;
-    let graph_xml = render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets);
+    let graph_xml = render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, max_snippet_lines);
 
     // --- blast radius (callers) ---
     let blast_limit = if blast_depth == 0 {
@@ -791,7 +860,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool) -
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let blast_xml = render_blast_radius_xml(&conn, &focus, &dep_rows, snippets);
+    let blast_xml = render_blast_radius_xml(&conn, &focus, &dep_rows, snippets, max_snippet_lines);
 
     // --- unified context document ---
     let total_tokens = (graph_xml.len() + blast_xml.len()) / 4;
@@ -812,8 +881,13 @@ fn render_blast_radius_xml(
     focus: &NodeRow,
     dependents: &[(NodeRow, i64)],
     snippets: bool,
+    max_snippet_lines: Option<usize>,
 ) -> String {
-    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end);
+    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines);
+
+    let mut all_ids: Vec<i64> = vec![focus.id];
+    all_ids.extend(dependents.iter().map(|(n, _)| n.id));
+    let annotations = fetch_annotations(conn, &all_ids);
 
     let mut body = String::new();
 
@@ -842,7 +916,7 @@ fn render_blast_radius_xml(
             body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
         }
     }
-    if let Some(ann) = fetch_annotation(conn, focus.id) {
+    if let Some(ann) = annotations.get(&focus.id) {
         body.push_str(&format!(
             "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
             xml_escape(&ann.source),
@@ -893,19 +967,44 @@ fn render_blast_radius_xml(
                 body.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
             }
             let has_doc = n.doc.as_ref().is_some_and(|d| !d.is_empty());
-            let has_snippet = snippets
-                && read_call_site_snippet(&n.file, n.range_start, n.range_end, &focus.name)
-                    .is_some();
-            if has_doc || has_snippet {
+            let call_snippet = if snippets {
+                read_call_site_snippet(&n.file, n.range_start, n.range_end, &focus.name)
+            } else {
+                None
+            };
+            let dep_annotation = annotations.get(&n.id);
+            if has_doc || call_snippet.is_some() || dep_annotation.is_some() {
                 body.push_str(">\n");
                 if let Some(doc) = &n.doc {
                     if !doc.is_empty() {
                         body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
                     }
                 }
-                if let Some(snip) =
-                    read_call_site_snippet(&n.file, n.range_start, n.range_end, &focus.name)
-                {
+                if let Some(ann) = dep_annotation {
+                    body.push_str(&format!(
+                        "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
+                        xml_escape(&ann.source),
+                        ann.confidence,
+                        ann.stale
+                    ));
+                    if let Some(intent) = &ann.intent {
+                        body.push_str(&format!(
+                            "        <intent>{}</intent>\n",
+                            xml_escape(intent)
+                        ));
+                    }
+                    if let Some(behavior) = &ann.behavior {
+                        body.push_str(&format!(
+                            "        <behavior>{}</behavior>\n",
+                            xml_escape(behavior)
+                        ));
+                    }
+                    if let Some(tags) = &ann.tags {
+                        body.push_str(&format!("        <tags>{}</tags>\n", xml_escape(tags)));
+                    }
+                    body.push_str("      </annotation>\n");
+                }
+                if let Some(snip) = call_snippet {
                     body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
                 }
                 body.push_str("    </node>\n");
@@ -936,6 +1035,7 @@ pub fn map(
     with_docs: bool,
     with_file_docs: bool,
     all_edges: bool,
+    role: Option<&str>,
 ) -> Result<()> {
     let conn = open_db()?;
 
@@ -960,9 +1060,24 @@ pub fn map(
     };
 
     let visibility_filter = if include_private {
-        ""
+        String::new()
     } else {
-        "WHERE n.visibility != 'private'"
+        "WHERE n.visibility != 'private'".to_string()
+    };
+
+    let role_filter = match role {
+        Some(r) => format!(" AND n.role = '{}'", r.replace('\'', "''")),
+        None => String::new(),
+    };
+
+    let where_clause = if visibility_filter.is_empty() {
+        if role_filter.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE 1=1{}", role_filter)
+        }
+    } else {
+        format!("{}{}", visibility_filter, role_filter)
     };
 
     let sql = format!(
@@ -972,7 +1087,7 @@ pub fn map(
                 (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
                 n.doc, n.role, n.role_confidence
          FROM nodes n
-         {visibility_filter}
+         {where_clause}
          ORDER BY n.file, hotspot_fan_in DESC"
     );
 

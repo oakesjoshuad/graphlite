@@ -66,6 +66,9 @@ enum Commands {
         /// Suppress source snippets from output
         #[arg(long)]
         no_snippets: bool,
+        /// Truncate each snippet to at most N lines (appends a comment with remaining count)
+        #[arg(long, value_name = "N")]
+        max_snippet_lines: Option<usize>,
     },
     /// Full-text search for symbols
     Symbols {
@@ -89,6 +92,9 @@ enum Commands {
         /// Suppress source snippets from output
         #[arg(long)]
         no_snippets: bool,
+        /// Truncate each snippet to at most N lines (appends a comment with remaining count)
+        #[arg(long, value_name = "N")]
+        max_snippet_lines: Option<usize>,
     },
     /// Show full context for a symbol: graph neighborhood + blast radius in one document
     ///
@@ -112,6 +118,9 @@ enum Commands {
         /// Suppress source snippets from output
         #[arg(long)]
         no_snippets: bool,
+        /// Truncate each snippet to at most N lines (appends a comment with remaining count)
+        #[arg(long, value_name = "N")]
+        max_snippet_lines: Option<usize>,
     },
     /// Rename a symbol via rust-analyzer and write edits to edits.json
     Rename {
@@ -190,6 +199,9 @@ enum Commands {
         /// tree-sitter's inability to resolve call targets across files.
         #[arg(long)]
         all_edges: bool,
+        /// Filter by inferred role (orchestrator, entrypoint, leaf, infra, domain, model)
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
     },
 }
 
@@ -206,28 +218,31 @@ fn main() -> Result<()> {
             format,
             show_trust,
             no_snippets,
+            max_snippet_lines,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
-            query::graph(&symbol, depth, &format, show_trust, !no_snippets)?
+            query::graph(&symbol, depth, &format, show_trust, !no_snippets, max_snippet_lines)?
         }
         Commands::Symbols { query, language } => query::symbols(&query, language.as_deref())?,
         Commands::BlastRadius {
             symbol,
             depth,
             no_snippets,
+            max_snippet_lines,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
-            query::blast_radius(&symbol, depth, !no_snippets)?
+            query::blast_radius(&symbol, depth, !no_snippets, max_snippet_lines)?
         }
         Commands::Context {
             symbol,
             depth,
             blast_depth,
             no_snippets,
+            max_snippet_lines,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
             let blast_depth = blast_depth.unwrap_or(1);
-            query::context(&symbol, depth, blast_depth, !no_snippets)?
+            query::context(&symbol, depth, blast_depth, !no_snippets, max_snippet_lines)?
         }
         Commands::Rename {
             symbol,
@@ -258,7 +273,8 @@ fn main() -> Result<()> {
             with_docs,
             with_file_docs,
             all_edges,
-        } => query::map(all, top, with_docs, with_file_docs, all_edges)?,
+            role,
+        } => query::map(all, top, with_docs, with_file_docs, all_edges, role.as_deref())?,
     }
 
     Ok(())

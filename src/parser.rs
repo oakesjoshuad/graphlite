@@ -342,6 +342,11 @@ fn extract_symbols(
         }
     }
 
+    // Deduplicate: two query patterns can capture the same AST node.
+    // Two captures of the same node always share (file, range_start).
+    let mut seen = std::collections::HashSet::new();
+    symbols.retain(|s| seen.insert((s.file.clone(), s.range_start)));
+
     Ok(symbols)
 }
 
