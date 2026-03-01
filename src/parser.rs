@@ -114,19 +114,35 @@ fn kind_from_node(node: &Node) -> &'static str {
 fn extract_signature(symbol_node: &Node, source: &str) -> Option<String> {
     let source_bytes = source.as_bytes();
 
-    let body_kinds = [
-        "block",
-        "statement_block",
-        "declaration_block",
-        "class_body",
-    ];
-    let mut body_start: Option<usize> = None;
+    let body_kinds = ["block", "statement_block", "declaration_block", "class_body"];
 
+    // Pass 1: body as a direct child (function_declaration, method_definition, etc.)
+    let mut body_start: Option<usize> = None;
     let mut cursor = symbol_node.walk();
     for child in symbol_node.children(&mut cursor) {
         if body_kinds.contains(&child.kind()) {
             body_start = Some(child.start_byte());
             break;
+        }
+    }
+
+    // Pass 2: body nested one level deeper inside an arrow_function or
+    // function_expression child. This covers variable_declarator, assignment_expression,
+    // and pair nodes where the value is `(...) => { body }` — the statement_block
+    // is a grandchild, invisible to pass 1.
+    if body_start.is_none() {
+        let fn_wrapper_kinds = ["arrow_function", "function_expression", "generator_function"];
+        let mut outer = symbol_node.walk();
+        'outer: for child in symbol_node.children(&mut outer) {
+            if fn_wrapper_kinds.contains(&child.kind()) {
+                let mut inner = child.walk();
+                for grandchild in child.children(&mut inner) {
+                    if body_kinds.contains(&grandchild.kind()) {
+                        body_start = Some(grandchild.start_byte());
+                        break 'outer;
+                    }
+                }
+            }
         }
     }
 
