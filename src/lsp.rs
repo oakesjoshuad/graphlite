@@ -250,36 +250,48 @@ impl LspClient {
         }
     }
 
-    pub fn initialize(&mut self) -> Result<()> {
+    pub fn initialize(&mut self, init_options: Option<Value>) -> Result<()> {
         let abs_root = std::fs::canonicalize(&self.root)
             .unwrap_or_else(|_| std::path::PathBuf::from(&self.root));
         let root_uri = format!("file://{}", abs_root.display());
 
-        let _result = self.call(
-            "initialize",
-            json!({
-                "processId": std::process::id(),
-                "rootUri": root_uri,
-                "capabilities": {
-                    "textDocument": {
-                        "callHierarchy": {
-                            "dynamicRegistration": false
-                        }
-                    },
-                    "workspace": {
-                        "workspaceEdit": {
-                            "documentChanges": true
-                        }
-                    },
-                    "experimental": {
-                        "serverStatusNotification": true
-                    }
+        let mut params = json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {
+                "textDocument": {
+                    "callHierarchy": { "dynamicRegistration": false },
+                    "inlayHint": { "dynamicRegistration": false }
+                },
+                "workspace": {
+                    "workspaceEdit": { "documentChanges": true }
+                },
+                "experimental": {
+                    "serverStatusNotification": true
                 }
-            }),
-        )?;
+            }
+        });
 
+        if let Some(opts) = init_options {
+            params["initializationOptions"] = opts;
+        }
+
+        self.call("initialize", params)?;
         self.send_notification("initialized", json!({}))?;
         Ok(())
+    }
+
+    pub fn inlay_hints(&mut self, uri: &str, line_count: u32) -> Result<Value> {
+        self.call(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end":   { "line": line_count, "character": 0 }
+                }
+            }),
+        )
     }
 
     // Poll for experimental/serverStatus quiescent notification. Drains buffered
@@ -516,7 +528,7 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
     };
 
     let mut client = LspClient::spawn(&ra, &[], root)?;
-    client.initialize()?;
+    client.initialize(None)?;
     client.wait_for_ready(60)?;
 
     // Build (canonical_path, range_start) -> node_id index for fast target lookup
@@ -623,9 +635,20 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     };
 
     let mut client = LspClient::spawn(&ts, &["--stdio"], root)?;
-    client.initialize()?;
-    // No quiescent signal; 5 s is enough for the server to finish processing initialize
-    client.wait_for_ready(5)?;
+    client.initialize(Some(json!({
+        "preferences": {
+            "includeInlayParameterNameHints": "all",
+            "includeInlayParameterNameHintsWhenArgumentMatchesName": true,
+            "includeInlayFunctionParameterTypeHints": true,
+            "includeInlayVariableTypeHints": true,
+            "includeInlayVariableTypeHintsWhenTypeMatchesName": false,
+            "includeInlayPropertyDeclarationTypeHints": true,
+            "includeInlayFunctionLikeReturnTypeHints": true,
+            "includeInlayEnumMemberValueHints": true
+        }
+    })))?;
+    // No wait_for_ready — tsls has no quiescent signal and notification_buf
+    // is drained by wait_for_diagnostics before the call hierarchy loop.
 
     // Build (canonical_path, range_start) -> node_id index
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
@@ -678,11 +701,46 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
             }
         }
     }
+    // Snapshot opened URIs before wait_for_diagnostics consumes the set
+    let opened_uris: Vec<String> = pending.iter().cloned().collect();
     eprintln!(
         "LSP[ts]: opened {} file(s), waiting for diagnostics...",
         pending.len()
     );
     client.wait_for_diagnostics(pending, 60);
+
+    // Observe inlay hints for every opened file so we can see what type
+    // information the server inferred with the full preferences enabled.
+    for uri in &opened_uris {
+        match client.inlay_hints(uri, 9999) {
+            Ok(hints) if hints.is_array() => {
+                let arr = hints.as_array().unwrap();
+                if !arr.is_empty() {
+                    eprintln!("LSP[inlay] {}:", uri);
+                    for h in arr {
+                        let line = h["position"]["line"].as_u64().unwrap_or(0);
+                        let ch   = h["position"]["character"].as_u64().unwrap_or(0);
+                        let kind = match h["kind"].as_u64() {
+                            Some(1) => "type",
+                            Some(2) => "param",
+                            _       => "?",
+                        };
+                        let label = match &h["label"] {
+                            Value::String(s) => s.clone(),
+                            Value::Array(parts) => parts
+                                .iter()
+                                .filter_map(|p| p["value"].as_str())
+                                .collect::<Vec<_>>()
+                                .join(""),
+                            other => other.to_string(),
+                        };
+                        eprintln!("  L{}:{} [{}] {}", line + 1, ch, kind, label);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
 
@@ -736,9 +794,9 @@ fn enrich_svelte(conn: &Connection, root: &str) -> Result<()> {
     };
 
     let mut client = LspClient::spawn(&sv, &["--stdio"], root)?;
-    client.initialize()?;
-    // svelteserver has no quiescent signal; 5 s clears post-initialize noise
-    client.wait_for_ready(5)?;
+    client.initialize(None)?;
+    // No wait_for_ready — svelteserver has no quiescent signal and notification_buf
+    // is drained by wait_for_diagnostics before the call hierarchy loop.
 
     // Build (canonical_path, range_start) -> node_id index
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();

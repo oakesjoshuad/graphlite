@@ -38,7 +38,7 @@ pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
         lsp::which_rust_analyzer().ok_or_else(|| anyhow!("rust-analyzer not found in PATH"))?;
 
     let mut client = lsp::LspClient::spawn(&ra, &[], root)?;
-    client.initialize()?;
+    client.initialize(None)?;
     client.wait_for_ready(60)?;
 
     let abs_path = std::fs::canonicalize(&file)?;
