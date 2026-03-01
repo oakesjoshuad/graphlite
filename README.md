@@ -323,6 +323,19 @@ depth  = 2         # default traversal depth for graph/context
 
 ## For agents
 
+### Claude Code skill
+
+A ready-to-install skill is included at `skills/graphlite.md`. It teaches Claude to
+recognise phrases like "explore the codebase", "what calls X", "assess the impact of
+changing Y", and "orient in the repo" and respond with the correct graphlite workflow
+automatically.
+
+```bash
+cp skills/graphlite.md ~/.claude/commands/graphlite.md
+```
+
+Restart Claude Code (or open a new session) for the skill to appear.
+
 ### CLAUDE.md / agents.md snippet
 
 Paste this block into any project's `CLAUDE.md` (or `agents.md`, `.cursorrules`, or equivalent) after running `graphlite init`:
