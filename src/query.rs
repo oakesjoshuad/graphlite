@@ -20,14 +20,24 @@ pub(crate) fn resolve_symbol_id(conn: &Connection, arg: &str) -> Result<i64> {
     if let Ok(id) = arg.parse::<i64>() {
         return Ok(id);
     }
-    let name = arg.strip_prefix("sym:").unwrap_or(arg);
+    let key = arg.strip_prefix("sym:").unwrap_or(arg);
+    // stable_id format: file::kind::name or file::kind::ImplType::name (contains '::')
+    if key.contains("::") {
+        if let Ok(id) = conn.query_row(
+            "SELECT id FROM nodes WHERE stable_id = ?1 LIMIT 1",
+            rusqlite::params![key],
+            |r| r.get::<_, i64>(0),
+        ) {
+            return Ok(id);
+        }
+    }
     let id: i64 = conn
         .query_row(
             "SELECT id FROM nodes WHERE name = ?1 LIMIT 1",
-            rusqlite::params![name],
+            rusqlite::params![key],
             |r| r.get(0),
         )
-        .map_err(|_| anyhow!("symbol '{}' not found in database", name))?;
+        .map_err(|_| anyhow!("symbol '{}' not found in database", key))?;
     Ok(id)
 }
 
@@ -124,6 +134,7 @@ struct NodeRow {
     fan_out: i64,
     role: String,
     role_confidence: f64,
+    stable_id: String,
 }
 
 struct NeighborRow {
@@ -146,6 +157,7 @@ struct NeighborRow {
     fan_out: i64,
     role: String,
     role_confidence: f64,
+    stable_id: String,
 }
 
 fn role_attrs(role: &str, confidence: f64) -> String {
@@ -298,7 +310,7 @@ pub fn graph(
                     n.visibility, n.doc,
                     (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
                     (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
-                    n.role, n.role_confidence
+                    n.role, n.role_confidence, n.stable_id
              FROM nodes n WHERE n.id = ?1",
             rusqlite::params![root_id],
             |r| {
@@ -316,6 +328,7 @@ pub fn graph(
                     fan_out: r.get(10)?,
                     role: r.get(11)?,
                     role_confidence: r.get(12)?,
+                    stable_id: r.get(13)?,
                 })
             },
         )
@@ -362,7 +375,7 @@ pub fn graph(
                    nd.visibility, nd.doc,
                    (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
                    (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
-                   nd.role, nd.role_confidence
+                   nd.role, nd.role_confidence, nd.stable_id
             FROM nodes nd JOIN neighborhood nh ON nd.id = nh.id
             WHERE nd.id != ?1
             ORDER BY nh.depth, nd.name",
@@ -388,6 +401,7 @@ pub fn graph(
                     fan_out: r.get(14)?,
                     role: r.get(15)?,
                     role_confidence: r.get(16)?,
+                    stable_id: r.get(17)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -400,7 +414,7 @@ pub fn graph(
 
         print!(
             "{}",
-            render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, max_snippet_lines)
+            render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, snippets, max_snippet_lines)
         );
     }
 
@@ -413,9 +427,14 @@ fn render_graph_xml(
     neighbors: &[NeighborRow],
     edge_count: i64,
     snippets: bool,
+    show_focus_snippet: bool,
     max_snippet_lines: Option<usize>,
 ) -> String {
-    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines);
+    let snippet = if show_focus_snippet {
+        read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines)
+    } else {
+        None
+    };
 
     let mut all_ids: Vec<i64> = vec![focus.id];
     all_ids.extend(neighbors.iter().map(|n| n.id));
@@ -425,8 +444,9 @@ fn render_graph_xml(
 
     body.push_str("  <focus>\n");
     body.push_str(&format!(
-        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
+        "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
         focus.id,
+        xml_escape(&focus.stable_id),
         xml_escape(&focus.name),
         xml_escape(&focus.kind),
         xml_escape(&focus.file),
@@ -483,8 +503,9 @@ fn render_graph_xml(
         body.push_str(&format!("  <neighbors depth=\"{}\">\n", d));
         for n in neighbors.iter().filter(|n| n.depth == d) {
             body.push_str(&format!(
-                "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
+                "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
                 n.id,
+                xml_escape(&n.stable_id),
                 xml_escape(&n.name),
                 xml_escape(&n.kind),
                 xml_escape(&n.file),
@@ -662,7 +683,7 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_line
                nd.visibility, nd.doc,
                (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
                (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
-               nd.role, nd.role_confidence
+               nd.role, nd.role_confidence, nd.stable_id
         FROM nodes nd JOIN dependents nh ON nd.id = nh.id
         WHERE nd.id != ?1
         GROUP BY nd.id
@@ -686,6 +707,7 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_line
                     fan_out: r.get(11)?,
                     role: r.get(12)?,
                     role_confidence: r.get(13)?,
+                    stable_id: r.get(14)?,
                 },
                 r.get::<_, i64>(7)?,
             ))
@@ -698,7 +720,7 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_line
                     n.visibility, n.doc,
                     (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
                     (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
-                    n.role, n.role_confidence
+                    n.role, n.role_confidence, n.stable_id
              FROM nodes n WHERE n.id = ?1",
             rusqlite::params![root_id],
             |r| {
@@ -716,6 +738,7 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_line
                     fan_out: r.get(10)?,
                     role: r.get(11)?,
                     role_confidence: r.get(12)?,
+                    stable_id: r.get(13)?,
                 })
             },
         )
@@ -723,12 +746,18 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_line
 
     print!(
         "{}",
-        render_blast_radius_xml(&conn, &focus, &rows, snippets, max_snippet_lines)
+        render_blast_radius_xml(&conn, &focus, &rows, snippets, snippets, max_snippet_lines)
     );
     Ok(())
 }
 
-pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, max_snippet_lines: Option<usize>) -> Result<()> {
+pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, edit_mode: bool, max_snippet_lines: Option<usize>) -> Result<()> {
+    // edit_mode: signature+doc+annotation only on focus, no neighbor snippets, depth=1 each side
+    let (snippets, depth, blast_depth, show_focus_snippet) = if edit_mode {
+        (false, 1usize, 1usize, false)
+    } else {
+        (snippets, depth, blast_depth, snippets)
+    };
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
 
@@ -739,7 +768,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, m
                     n.visibility, n.doc,
                     (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
                     (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
-                    n.role, n.role_confidence
+                    n.role, n.role_confidence, n.stable_id
              FROM nodes n WHERE n.id = ?1",
             rusqlite::params![root_id],
             |r| {
@@ -757,6 +786,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, m
                     fan_out: r.get(10)?,
                     role: r.get(11)?,
                     role_confidence: r.get(12)?,
+                    stable_id: r.get(13)?,
                 })
             },
         )
@@ -778,7 +808,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, m
                nd.visibility, nd.doc,
                (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
                (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
-               nd.role, nd.role_confidence
+               nd.role, nd.role_confidence, nd.stable_id
         FROM nodes nd JOIN neighborhood nh ON nd.id = nh.id
         WHERE nd.id != ?1
         ORDER BY nh.depth, nd.name",
@@ -803,6 +833,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, m
                 fan_out: r.get(14)?,
                 role: r.get(15)?,
                 role_confidence: r.get(16)?,
+                stable_id: r.get(17)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -811,7 +842,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, m
         rusqlite::params![root_id],
         |r| r.get(0),
     )?;
-    let graph_xml = render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, max_snippet_lines);
+    let graph_xml = render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, show_focus_snippet, max_snippet_lines);
 
     // --- blast radius (callers) ---
     let blast_limit = if blast_depth == 0 {
@@ -832,7 +863,7 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, m
                nd.visibility, nd.doc,
                (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
                (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
-               nd.role, nd.role_confidence
+               nd.role, nd.role_confidence, nd.stable_id
         FROM nodes nd JOIN dependents nh ON nd.id = nh.id
         WHERE nd.id != ?1
         GROUP BY nd.id
@@ -855,12 +886,13 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, m
                     fan_out: r.get(11)?,
                     role: r.get(12)?,
                     role_confidence: r.get(13)?,
+                    stable_id: r.get(14)?,
                 },
                 r.get::<_, i64>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let blast_xml = render_blast_radius_xml(&conn, &focus, &dep_rows, snippets, max_snippet_lines);
+    let blast_xml = render_blast_radius_xml(&conn, &focus, &dep_rows, snippets, show_focus_snippet, max_snippet_lines);
 
     // --- unified context document ---
     let total_tokens = (graph_xml.len() + blast_xml.len()) / 4;
@@ -881,9 +913,14 @@ fn render_blast_radius_xml(
     focus: &NodeRow,
     dependents: &[(NodeRow, i64)],
     snippets: bool,
+    show_focus_snippet: bool,
     max_snippet_lines: Option<usize>,
 ) -> String {
-    let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines);
+    let snippet = if show_focus_snippet {
+        read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines)
+    } else {
+        None
+    };
 
     let mut all_ids: Vec<i64> = vec![focus.id];
     all_ids.extend(dependents.iter().map(|(n, _)| n.id));
@@ -893,8 +930,9 @@ fn render_blast_radius_xml(
 
     body.push_str("  <focus>\n");
     body.push_str(&format!(
-        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
+        "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
         focus.id,
+        xml_escape(&focus.stable_id),
         xml_escape(&focus.name),
         xml_escape(&focus.kind),
         xml_escape(&focus.file),
@@ -951,8 +989,9 @@ fn render_blast_radius_xml(
         body.push_str(&format!("  <dependents depth=\"{}\">\n", d));
         for (n, _) in dependents.iter().filter(|(_, dep)| *dep == d) {
             body.push_str(&format!(
-                "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
+                "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
                 n.id,
+                xml_escape(&n.stable_id),
                 xml_escape(&n.name),
                 xml_escape(&n.kind),
                 xml_escape(&n.file),
@@ -1029,6 +1068,15 @@ fn render_blast_radius_xml(
     format!("{}{}", header, body)
 }
 
+fn file_to_module(path: &str) -> String {
+    let normalized = path.trim_start_matches("./");
+    std::path::Path::new(normalized)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(normalized)
+        .to_string()
+}
+
 pub fn map(
     include_private: bool,
     top: usize,
@@ -1036,6 +1084,7 @@ pub fn map(
     with_file_docs: bool,
     all_edges: bool,
     role: Option<&str>,
+    by_file: bool,
 ) -> Result<()> {
     let conn = open_db()?;
 
@@ -1123,10 +1172,10 @@ pub fn map(
     };
 
     // Group by file (BTreeMap keeps files in alphabetical order)
-    let mut by_file: std::collections::BTreeMap<String, Vec<usize>> =
+    let mut by_path: std::collections::BTreeMap<String, Vec<usize>> =
         std::collections::BTreeMap::new();
     for (i, row) in rows.iter().enumerate() {
-        by_file.entry(row.file.clone()).or_default().push(i);
+        by_path.entry(row.file.clone()).or_default().push(i);
     }
 
     // Hotspots: top N across all files by hotspot_fan_in (trusted by default)
@@ -1157,25 +1206,47 @@ pub fn map(
     }
     out.push_str("  </hotspots>\n");
 
-    for (file, indices) in &by_file {
+    for (file, indices) in &by_path {
         let file_doc = if with_file_docs {
             file_doc_map.get(file.as_str())
         } else {
             None
         };
-        if let Some(fd) = file_doc {
-            out.push_str(&format!(
-                "  <file path=\"{}\" symbols=\"{}\">\n    <doc>{}</doc>\n",
-                xml_escape(file),
-                indices.len(),
-                xml_escape(fd),
-            ));
+        if by_file {
+            // --by-file mode: original <file path="..."> element
+            if let Some(fd) = file_doc {
+                out.push_str(&format!(
+                    "  <file path=\"{}\" symbols=\"{}\">\n    <doc>{}</doc>\n",
+                    xml_escape(file),
+                    indices.len(),
+                    xml_escape(fd),
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  <file path=\"{}\" symbols=\"{}\">\n",
+                    xml_escape(file),
+                    indices.len(),
+                ));
+            }
         } else {
-            out.push_str(&format!(
-                "  <file path=\"{}\" symbols=\"{}\">\n",
-                xml_escape(file),
-                indices.len(),
-            ));
+            // default: <module name="lsp" path="./src/lsp.rs"> element
+            let module_name = file_to_module(file);
+            if let Some(fd) = file_doc {
+                out.push_str(&format!(
+                    "  <module name=\"{}\" path=\"{}\" symbols=\"{}\">\n    <doc>{}</doc>\n",
+                    xml_escape(&module_name),
+                    xml_escape(file),
+                    indices.len(),
+                    xml_escape(fd),
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  <module name=\"{}\" path=\"{}\" symbols=\"{}\">\n",
+                    xml_escape(&module_name),
+                    xml_escape(file),
+                    indices.len(),
+                ));
+            }
         }
         for &i in indices {
             let s = &rows[i];
@@ -1204,16 +1275,20 @@ pub fn map(
                 out.push_str("/>\n");
             }
         }
-        out.push_str("  </file>\n");
+        if by_file {
+            out.push_str("  </file>\n");
+        } else {
+            out.push_str("  </module>\n");
+        }
     }
 
     out.push_str("</map>\n");
 
     let tokens = out.len() / 4;
-    let total_symbols: usize = by_file.values().map(|v| v.len()).sum();
+    let total_symbols: usize = by_path.values().map(|v| v.len()).sum();
     print!(
         "<map files=\"{}\" symbols=\"{}\" tokens=\"{}\">\n{}",
-        by_file.len(),
+        by_path.len(),
         total_symbols,
         tokens,
         out,

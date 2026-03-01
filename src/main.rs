@@ -118,6 +118,10 @@ enum Commands {
         /// Suppress source snippets from output
         #[arg(long)]
         no_snippets: bool,
+        /// Minimal edit surface: signature+doc+annotation only, no snippets, depth 1 each side
+        /// (~150–500 tokens). Implies --no-snippets and overrides --depth/--blast-depth.
+        #[arg(long)]
+        edit: bool,
         /// Truncate each snippet to at most N lines (appends a comment with remaining count)
         #[arg(long, value_name = "N")]
         max_snippet_lines: Option<usize>,
@@ -202,6 +206,9 @@ enum Commands {
         /// Filter by inferred role (orchestrator, entrypoint, leaf, infra, domain, model)
         #[arg(long, value_name = "ROLE")]
         role: Option<String>,
+        /// Group output by file path instead of module name (reverts default module grouping)
+        #[arg(long)]
+        by_file: bool,
     },
 }
 
@@ -238,11 +245,12 @@ fn main() -> Result<()> {
             depth,
             blast_depth,
             no_snippets,
+            edit,
             max_snippet_lines,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
             let blast_depth = blast_depth.unwrap_or(1);
-            query::context(&symbol, depth, blast_depth, !no_snippets, max_snippet_lines)?
+            query::context(&symbol, depth, blast_depth, !no_snippets, edit, max_snippet_lines)?
         }
         Commands::Rename {
             symbol,
@@ -274,7 +282,8 @@ fn main() -> Result<()> {
             with_file_docs,
             all_edges,
             role,
-        } => query::map(all, top, with_docs, with_file_docs, all_edges, role.as_deref())?,
+            by_file,
+        } => query::map(all, top, with_docs, with_file_docs, all_edges, role.as_deref(), by_file)?,
     }
 
     Ok(())

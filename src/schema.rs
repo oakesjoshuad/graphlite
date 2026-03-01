@@ -19,7 +19,8 @@ CREATE TABLE nodes (
     visibility TEXT NOT NULL DEFAULT 'private',
     doc TEXT,
     role TEXT NOT NULL DEFAULT 'unknown',
-    role_confidence REAL NOT NULL DEFAULT 0.0
+    role_confidence REAL NOT NULL DEFAULT 0.0,
+    stable_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE edges (
@@ -106,6 +107,10 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
     );
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_edges_to_source ON edges(to_id, source)",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE nodes ADD COLUMN stable_id TEXT NOT NULL DEFAULT ''",
         [],
     );
     Ok(conn)

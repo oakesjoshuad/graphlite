@@ -18,6 +18,7 @@ pub struct Symbol {
     pub content_hash: String,
     pub visibility: String,
     pub doc: Option<String>,
+    pub stable_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +328,13 @@ fn extract_symbols(
             let visibility = extract_visibility(&symbol_node, source);
             let doc = extract_doc(&symbol_node, source);
 
+            let impl_name = enclosing_impl_name(symbol_node, source);
+            let normalized_file = file_str.trim_start_matches("./");
+            let stable_id = match &impl_name {
+                Some(impl_n) => format!("{}::{}::{}::{}", normalized_file, kind, impl_n, name),
+                None => format!("{}::{}::{}", normalized_file, kind, name),
+            };
+
             symbols.push(Symbol {
                 name,
                 file: file_str.clone(),
@@ -338,6 +346,7 @@ fn extract_symbols(
                 content_hash,
                 visibility,
                 doc,
+                stable_id,
             });
         }
     }
@@ -375,6 +384,24 @@ fn enclosing_function_name<'a>(node: Node<'a>, source: &'a str) -> Option<String
                 }
             }
             return None;
+        }
+        current = n.parent();
+    }
+    None
+}
+
+fn enclosing_impl_name(node: Node<'_>, source: &str) -> Option<String> {
+    let container_kinds = ["impl_item", "class_declaration", "class"];
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if container_kinds.contains(&n.kind()) {
+            // Rust impl_item uses "type" field; TS class uses "name" field
+            let name_node = n
+                .child_by_field_name("type")
+                .or_else(|| n.child_by_field_name("name"));
+            return name_node
+                .and_then(|tn| tn.utf8_text(source.as_bytes()).ok())
+                .map(String::from);
         }
         current = n.parent();
     }
