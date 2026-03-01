@@ -216,9 +216,18 @@ impl LspClient {
     //   - has `method`, no `id` → notification; buffer for wait_for_ready
     //   - no `method`, matching `id` → our response; return it
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_with_timeout(method, params, Duration::from_secs(10))
+    }
+
+    fn call_with_timeout(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.send_request(method, params)?;
+        let deadline = Instant::now() + timeout;
         loop {
-            let msg = match self.read_message_timeout(Duration::from_secs(10)) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("timeout waiting for response to '{}'", method));
+            }
+            let msg = match self.read_message_timeout(remaining) {
                 Some(m) => m,
                 None => return Err(anyhow!("timeout waiting for response to '{}'", method)),
             };
@@ -337,12 +346,17 @@ impl LspClient {
         line: u32,
         char_offset: u32,
     ) -> Result<Vec<LspCallTarget>> {
-        let items = self.call(
+        // Use a shorter timeout than the default 10s — call hierarchy requests that
+        // will time out tend to do so quickly (server has no info for the symbol),
+        // and the sequential loop means each timeout multiplies wall-clock cost.
+        let ch_timeout = Duration::from_secs(5);
+        let items = self.call_with_timeout(
             "textDocument/prepareCallHierarchy",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": char_offset }
             }),
+            ch_timeout,
         )?;
 
         let items = match items {
@@ -352,7 +366,11 @@ impl LspClient {
 
         let mut targets = Vec::new();
         for item in &items {
-            let calls = match self.call("callHierarchy/outgoingCalls", json!({ "item": item })) {
+            let calls = match self.call_with_timeout(
+                "callHierarchy/outgoingCalls",
+                json!({ "item": item }),
+                ch_timeout,
+            ) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -563,9 +581,14 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
         }
     };
 
+    let t_start = Instant::now();
+
     let mut client = LspClient::spawn(&ra, &[], root)?;
     client.initialize(None)?;
+    eprintln!("LSP[rust]: initialized ({:.1}s)", t_start.elapsed().as_secs_f32());
+
     client.wait_for_ready(60)?;
+    eprintln!("LSP[rust]: server ready ({:.1}s)", t_start.elapsed().as_secs_f32());
 
     // Build (canonical_path, range_start) -> node_id index for fast target lookup
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
@@ -597,8 +620,15 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
         result
     };
 
+    eprintln!("LSP[rust]: querying call hierarchy for {} fn nodes...", fn_nodes.len());
+    let t_ch = Instant::now();
+
     // Collect trusted CALLS_TRUSTED edges via LSP call hierarchy
     let mut trusted_edges: Vec<(i64, i64, &'static str)> = Vec::new();
+    let mut calls_with_edges = 0usize;
+    let mut calls_timeout = 0usize;
+    let mut max_call_ms = 0u128;
+    let mut slowest_fn = String::new();
 
     for (fn_id, file, range_start, name) in &fn_nodes {
         let abs_path =
@@ -612,11 +642,26 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
         // produces selectionRange covering "fn" and outgoingCalls returns [].
         let char_offset = fn_name_char_offset(file, *range_start, name);
 
+        let t_call = Instant::now();
         let targets = match client.outgoing_calls(&uri, lsp_line, char_offset) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                if e.to_string().contains("timeout") {
+                    calls_timeout += 1;
+                    warn!("LSP[rust]: timeout for '{}' in {}", name, file);
+                }
+                continue;
+            }
         };
+        let call_ms = t_call.elapsed().as_millis();
+        if call_ms > max_call_ms {
+            max_call_ms = call_ms;
+            slowest_fn = name.clone();
+        }
 
+        if !targets.is_empty() {
+            calls_with_edges += 1;
+        }
         for target in targets {
             let target_path = uri_to_path(&target.uri);
             // LSP line is 0-indexed; range_start in DB is 1-indexed
@@ -626,6 +671,16 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
             }
         }
     }
+
+    eprintln!(
+        "LSP[rust]: call hierarchy done in {:.1}s — {}/{} with edges, {} timeout, max {}ms ({})",
+        t_ch.elapsed().as_secs_f32(),
+        calls_with_edges,
+        fn_nodes.len(),
+        calls_timeout,
+        max_call_ms,
+        slowest_fn
+    );
 
     // Collect TRAIT_IMPL edges via name matching
     {
@@ -657,7 +712,11 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
     }
     tx.commit()?;
 
-    eprintln!("LSP: inserted {} trusted edges (rust-analyzer)", edge_count);
+    eprintln!(
+        "LSP[rust]: done in {:.1}s — inserted {} trusted edges",
+        t_start.elapsed().as_secs_f32(),
+        edge_count
+    );
     Ok(())
 }
 
@@ -669,6 +728,8 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
             return Ok(());
         }
     };
+
+    let t_start = Instant::now();
 
     let mut client = LspClient::spawn(&ts, &["--stdio"], root)?;
     client.initialize(Some(json!({
@@ -683,6 +744,7 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
             "includeInlayEnumMemberValueHints": true
         }
     })))?;
+    eprintln!("LSP[ts]: initialized ({:.1}s)", t_start.elapsed().as_secs_f32());
     // No wait_for_ready — tsls has no quiescent signal and notification_buf
     // is drained by wait_for_diagnostics before the call hierarchy loop.
 
@@ -743,7 +805,9 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
         "LSP[ts]: opened {} file(s), waiting for diagnostics...",
         pending.len()
     );
+    let t_diag = Instant::now();
     client.wait_for_diagnostics(pending, 60);
+    eprintln!("LSP[ts]: diagnostics done ({:.1}s)", t_diag.elapsed().as_secs_f32());
 
     // Build per-URI index: uri -> [(node_id, lsp_line_0indexed, current_signature)]
     // Used to match return type hints back to fn nodes.
@@ -762,6 +826,7 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     // For each opened file: request inlay hints, collect return-type enrichments.
     // The return type hint is the last kind=1 (Type) hint on the function's
     // declaration line — placed by the server right after the closing `)`.
+    let t_inlay = Instant::now();
     let mut sig_updates: Vec<(i64, String)> = Vec::new();
     for uri in &opened_uris {
         let hints_val = match client.inlay_hints(uri, 9999) {
@@ -796,8 +861,19 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
             sig_updates.push((*node_id, new_sig));
         }
     }
+    eprintln!(
+        "LSP[ts]: inlay hints done in {:.1}s — {} signature(s) to enrich",
+        t_inlay.elapsed().as_secs_f32(),
+        sig_updates.len()
+    );
 
+    eprintln!("LSP[ts]: querying call hierarchy for {} fn nodes...", fn_nodes.len());
+    let t_ch = Instant::now();
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
+    let mut calls_with_edges = 0usize;
+    let mut calls_timeout = 0usize;
+    let mut max_call_ms = 0u128;
+    let mut slowest_fn = String::new();
 
     for (fn_id, file, range_start, name, _) in &fn_nodes {
         let abs_path =
@@ -806,11 +882,26 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
         let lsp_line = (*range_start - 1).max(0) as u32;
         let char_offset = fn_name_char_offset(file, *range_start, name);
 
+        let t_call = Instant::now();
         let targets = match client.outgoing_calls(&uri, lsp_line, char_offset) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                if e.to_string().contains("timeout") {
+                    calls_timeout += 1;
+                    warn!("LSP[ts]: timeout for '{}' in {}", name, file);
+                }
+                continue;
+            }
         };
+        let call_ms = t_call.elapsed().as_millis();
+        if call_ms > max_call_ms {
+            max_call_ms = call_ms;
+            slowest_fn = name.clone();
+        }
 
+        if !targets.is_empty() {
+            calls_with_edges += 1;
+        }
         for target in targets {
             let target_path = uri_to_path(&target.uri);
             let target_range_start = target.line as i64 + 1;
@@ -819,6 +910,16 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
             }
         }
     }
+
+    eprintln!(
+        "LSP[ts]: call hierarchy done in {:.1}s — {}/{} with edges, {} timeout, max {}ms ({})",
+        t_ch.elapsed().as_secs_f32(),
+        calls_with_edges,
+        fn_nodes.len(),
+        calls_timeout,
+        max_call_ms,
+        slowest_fn
+    );
 
     client.shutdown()?;
 
@@ -835,8 +936,6 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     }
     tx.commit()?;
 
-    eprintln!("LSP: inserted {} trusted edges (typescript-language-server)", edge_count);
-
     // Apply inferred return-type enrichments to signatures
     if !sig_updates.is_empty() {
         let tx = conn.unchecked_transaction()?;
@@ -848,8 +947,14 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
             }
         }
         tx.commit()?;
-        eprintln!("LSP: enriched {} signature(s) with inferred return types", sig_updates.len());
     }
+
+    eprintln!(
+        "LSP[ts]: done in {:.1}s — {} trusted edges, {} signatures enriched",
+        t_start.elapsed().as_secs_f32(),
+        edge_count,
+        sig_updates.len()
+    );
 
     Ok(())
 }
