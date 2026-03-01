@@ -415,6 +415,42 @@ impl LspClient {
     }
 }
 
+// Flatten an inlay hint label (string or array of InlayHintLabelPart) to a plain string.
+fn inlay_label_str(label: &Value) -> String {
+    match label {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["value"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+// True if the signature already carries an explicit return type annotation —
+// i.e. there is a `:` immediately after the closing `)` of the parameter list.
+fn has_explicit_return_type(sig: &str) -> bool {
+    sig.rfind(')')
+        .map(|pos| sig[pos + 1..].trim_start().starts_with(':'))
+        .unwrap_or(false)
+}
+
+// Among all `kind=1` (Type) inlay hints on `lsp_line` (0-indexed), return the
+// label at the highest character offset — that position is always the return
+// type, placed by the server right after the closing `)`.
+fn return_type_hint_on_line(hints: &[Value], lsp_line: u32) -> Option<String> {
+    hints
+        .iter()
+        .filter(|h| {
+            h["kind"].as_u64() == Some(1)
+                && h["position"]["line"].as_u64() == Some(lsp_line as u64)
+        })
+        .max_by_key(|h| h["position"]["character"].as_u64().unwrap_or(0))
+        .map(|h| inlay_label_str(&h["label"]))
+        .filter(|s| !s.is_empty())
+}
+
 fn diagnostics_uri(msg: &Value) -> Option<&str> {
     if msg.get("method").and_then(|v| v.as_str()) == Some("textDocument/publishDiagnostics") {
         msg["params"]["uri"].as_str()
@@ -670,19 +706,19 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
         }
     }
 
-    // Query fn nodes for the target language(s)
+    // Query fn nodes for the target language(s) — include signature for enrichment
     let lang_filter = match language {
         "javascript" => "'javascript'",
         _ => "'typescript', 'javascript'",
     };
     let sql = format!(
-        "SELECT id, file, range_start, name FROM nodes WHERE kind = 'fn' AND language IN ({})",
+        "SELECT id, file, range_start, name, signature FROM nodes WHERE kind = 'fn' AND language IN ({})",
         lang_filter
     );
-    let fn_nodes: Vec<(i64, String, i64, String)> = {
+    let fn_nodes: Vec<(i64, String, i64, String, Option<String>)> = {
         let mut stmt = conn.prepare(&sql)?;
         let result = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         result
     };
@@ -691,7 +727,7 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     // typescript-language-server is lazy: it only analyses files opened via didOpen.
     let language_id = if language == "javascript" { "javascript" } else { "typescript" };
     let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (_, file, _, _) in &fn_nodes {
+    for (_, file, _, _, _) in &fn_nodes {
         let abs_path =
             std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
         let uri = format!("file://{}", abs_path.display());
@@ -709,42 +745,61 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     );
     client.wait_for_diagnostics(pending, 60);
 
-    // Observe inlay hints for every opened file so we can see what type
-    // information the server inferred with the full preferences enabled.
+    // Build per-URI index: uri -> [(node_id, lsp_line_0indexed, current_signature)]
+    // Used to match return type hints back to fn nodes.
+    let mut uri_fn_index: HashMap<String, Vec<(i64, u32, Option<String>)>> = HashMap::new();
+    for (fn_id, file, range_start, _, sig) in &fn_nodes {
+        let abs_path =
+            std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+        let uri = format!("file://{}", abs_path.display());
+        let lsp_line = (*range_start as u32).saturating_sub(1);
+        uri_fn_index
+            .entry(uri)
+            .or_default()
+            .push((*fn_id, lsp_line, sig.clone()));
+    }
+
+    // For each opened file: request inlay hints, collect return-type enrichments.
+    // The return type hint is the last kind=1 (Type) hint on the function's
+    // declaration line — placed by the server right after the closing `)`.
+    let mut sig_updates: Vec<(i64, String)> = Vec::new();
     for uri in &opened_uris {
-        match client.inlay_hints(uri, 9999) {
-            Ok(hints) if hints.is_array() => {
-                let arr = hints.as_array().unwrap();
-                if !arr.is_empty() {
-                    eprintln!("LSP[inlay] {}:", uri);
-                    for h in arr {
-                        let line = h["position"]["line"].as_u64().unwrap_or(0);
-                        let ch   = h["position"]["character"].as_u64().unwrap_or(0);
-                        let kind = match h["kind"].as_u64() {
-                            Some(1) => "type",
-                            Some(2) => "param",
-                            _       => "?",
-                        };
-                        let label = match &h["label"] {
-                            Value::String(s) => s.clone(),
-                            Value::Array(parts) => parts
-                                .iter()
-                                .filter_map(|p| p["value"].as_str())
-                                .collect::<Vec<_>>()
-                                .join(""),
-                            other => other.to_string(),
-                        };
-                        eprintln!("  L{}:{} [{}] {}", line + 1, ch, kind, label);
-                    }
-                }
+        let hints_val = match client.inlay_hints(uri, 9999) {
+            Ok(v) if v.is_array() => v,
+            _ => continue,
+        };
+        let hints = hints_val.as_array().unwrap();
+
+        debug!("LSP[inlay] {} hint(s) for {}", hints.len(), uri);
+
+        let Some(nodes_in_file) = uri_fn_index.get(uri) else {
+            continue;
+        };
+        for (node_id, lsp_line, current_sig) in nodes_in_file {
+            // Only enrich if there is a source signature and it lacks a return type
+            let Some(sig) = current_sig else { continue };
+            if has_explicit_return_type(sig) {
+                continue;
             }
-            _ => {}
+            let Some(ret_type) = return_type_hint_on_line(hints, *lsp_line) else {
+                continue;
+            };
+            // Strip leading `: ` the server sometimes includes, truncate long types
+            let ret_type = ret_type.trim().trim_start_matches(':').trim();
+            let truncated: String = if ret_type.chars().count() > 120 {
+                format!("{}…", ret_type.chars().take(120).collect::<String>())
+            } else {
+                ret_type.to_string()
+            };
+            let new_sig = format!("{}: {}", sig, truncated);
+            debug!("LSP[sig] node {} <- {}", node_id, new_sig);
+            sig_updates.push((*node_id, new_sig));
         }
     }
 
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
 
-    for (fn_id, file, range_start, name) in &fn_nodes {
+    for (fn_id, file, range_start, name, _) in &fn_nodes {
         let abs_path =
             std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
         let uri = format!("file://{}", abs_path.display());
@@ -781,6 +836,21 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     tx.commit()?;
 
     eprintln!("LSP: inserted {} trusted edges (typescript-language-server)", edge_count);
+
+    // Apply inferred return-type enrichments to signatures
+    if !sig_updates.is_empty() {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare_cached("UPDATE nodes SET signature = ?1 WHERE id = ?2")?;
+            for (node_id, new_sig) in &sig_updates {
+                stmt.execute(rusqlite::params![new_sig, node_id])?;
+            }
+        }
+        tx.commit()?;
+        eprintln!("LSP: enriched {} signature(s) with inferred return types", sig_updates.len());
+    }
+
     Ok(())
 }
 
