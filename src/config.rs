@@ -5,7 +5,7 @@ use serde::Deserialize;
 pub const DEFAULT_CONFIG_TOML: &str = r#"# graphlite configuration
 
 # Additional directories to ignore during indexing.
-# Extends built-in defaults: node_modules, target, .git, .cache, .next, .nuxt, __pycache__
+# Extends built-in defaults: node_modules, target, build, dist, .svelte-kit, .git, .cache, .next, .nuxt, __pycache__
 ignore = []
 
 # LSP languages for semantic enrichment (auto-detected on init).

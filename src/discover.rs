@@ -16,6 +16,8 @@ use crate::{
 const IGNORED_DIRS: &[&str] = &[
     "node_modules",
     "target",
+    "build",
+    "dist",
     ".svelte-kit",
     ".git",
     ".cache",
