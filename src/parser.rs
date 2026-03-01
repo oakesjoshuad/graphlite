@@ -14,6 +14,9 @@ pub struct Symbol {
     pub range_start: u32,
     pub range_end: u32,
     pub signature: Option<String>,
+    pub content_hash: String,
+    pub visibility: String,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +31,7 @@ pub struct RawEdge {
 pub struct ParseResult {
     pub symbols: Vec<Symbol>,
     pub edges: Vec<RawEdge>,
+    pub file_doc: Option<String>,
 }
 
 pub fn parse_file(path: &Path) -> Result<ParseResult> {
@@ -47,16 +51,23 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
         .filter(|l| !l.trim_start().starts_with(';') && !l.trim().is_empty())
         .count();
 
+    let file_doc = extract_file_doc(&source, &language);
+
     if effective_src == 0 {
         return Ok(ParseResult {
             symbols: vec![],
             edges: vec![],
+            file_doc,
         });
     }
 
     let symbols = extract_symbols(&tree, &source, path, &language, &ts_lang, query_src)?;
     let edges = extract_edges(&tree, &source, path, &ts_lang, query_src)?;
-    Ok(ParseResult { symbols, edges })
+    Ok(ParseResult {
+        symbols,
+        edges,
+        file_doc,
+    })
 }
 
 // Maps tree-sitter node kind strings to our kind vocabulary.
@@ -129,6 +140,115 @@ fn extract_signature(symbol_node: &Node, source: &str) -> Option<String> {
     }
 }
 
+fn fnv1a_hash(data: &[u8]) -> String {
+    let mut hash: u64 = 14695981039346656037u64;
+    for byte in data {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(1099511628211u64);
+    }
+    format!("{:016x}", hash)
+}
+
+fn extract_visibility(symbol_node: &Node, source: &str) -> String {
+    let mut cursor = symbol_node.walk();
+    for child in symbol_node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            return child
+                .utf8_text(source.as_bytes())
+                .unwrap_or("pub")
+                .to_string();
+        }
+        // JS/TS: export keyword as first child
+        if child.kind() == "export" {
+            return "pub".to_string();
+        }
+    }
+    "private".to_string()
+}
+
+fn extract_doc(symbol_node: &Node, source: &str) -> Option<String> {
+    let start_line = symbol_node.start_position().row;
+    if start_line == 0 {
+        return None;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let mut doc_lines: Vec<String> = Vec::new();
+    let mut line_idx = start_line;
+    while line_idx > 0 {
+        line_idx -= 1;
+        let trimmed = lines[line_idx].trim();
+        if trimmed.starts_with("///") {
+            doc_lines.push(trimmed.trim_start_matches("///").trim().to_string());
+        } else if trimmed.starts_with("#[") || trimmed.starts_with("#![") || trimmed.is_empty() {
+            // attributes and blank lines between doc and definition are allowed
+            continue;
+        } else {
+            break;
+        }
+    }
+    if doc_lines.is_empty() {
+        return None;
+    }
+    doc_lines.reverse();
+    Some(doc_lines.join("\n"))
+}
+
+fn extract_file_doc(source: &str, language: &Language) -> Option<String> {
+    match language {
+        Language::Rust => {
+            // Collect consecutive `//!` lines at the top (inner module doc)
+            let lines: Vec<&str> = source
+                .lines()
+                .skip_while(|l| l.trim().is_empty())
+                .take_while(|l| l.trim_start().starts_with("//!"))
+                .map(|l| {
+                    l.trim_start()
+                        .trim_start_matches("//!")
+                        .trim_start_matches(' ')
+                })
+                .collect();
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        }
+        Language::TypeScript | Language::JavaScript => {
+            // First `/** ... */` block before any non-comment code
+            let trimmed = source.trim_start();
+            if !trimmed.starts_with("/**") {
+                return None;
+            }
+            let end = trimmed.find("*/")?;
+            let inner = &trimmed[3..end];
+            let text: String = inner
+                .lines()
+                .map(|l| l.trim_start().trim_start_matches('*').trim())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        Language::Svelte => {
+            // `<!-- @component ... -->` convention used by Svelte language tools
+            let start = source.find("<!-- @component")?;
+            let rest = &source[start + 15..];
+            let end = rest.find("-->")?;
+            let text = rest[..end].trim().to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn extract_symbols(
     tree: &tree_sitter::Tree,
     source: &str,
@@ -184,6 +304,12 @@ fn extract_symbols(
             let kind = kind_from_node(&symbol_node).to_string();
             let signature = extract_signature(&symbol_node, source);
 
+            let source_bytes = source.as_bytes();
+            let sym_bytes = &source_bytes[symbol_node.start_byte()..symbol_node.end_byte()];
+            let content_hash = fnv1a_hash(sym_bytes);
+            let visibility = extract_visibility(&symbol_node, source);
+            let doc = extract_doc(&symbol_node, source);
+
             symbols.push(Symbol {
                 name,
                 file: file_str.clone(),
@@ -192,6 +318,9 @@ fn extract_symbols(
                 range_start: (symbol_node.start_position().row + 1) as u32,
                 range_end: (symbol_node.end_position().row + 1) as u32,
                 signature,
+                content_hash,
+                visibility,
+                doc,
             });
         }
     }

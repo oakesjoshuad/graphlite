@@ -34,8 +34,8 @@ pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
         .map_err(|_| anyhow!("symbol '{}' not found in database", name))?
     };
 
-    let ra = lsp::which_rust_analyzer()
-        .ok_or_else(|| anyhow!("rust-analyzer not found in PATH"))?;
+    let ra =
+        lsp::which_rust_analyzer().ok_or_else(|| anyhow!("rust-analyzer not found in PATH"))?;
 
     let mut client = lsp::LspClient::spawn(&ra, root)?;
     client.initialize()?;
@@ -179,16 +179,19 @@ fn parse_text_edits(val: &Value) -> Result<Vec<TextEdit>> {
             Ok(TextEdit {
                 start_line: e["range"]["start"]["line"]
                     .as_u64()
-                    .ok_or_else(|| anyhow!("missing start.line"))? as u32,
+                    .ok_or_else(|| anyhow!("missing start.line"))?
+                    as u32,
                 start_char: e["range"]["start"]["character"]
                     .as_u64()
-                    .ok_or_else(|| anyhow!("missing start.character"))? as u32,
+                    .ok_or_else(|| anyhow!("missing start.character"))?
+                    as u32,
                 end_line: e["range"]["end"]["line"]
                     .as_u64()
                     .ok_or_else(|| anyhow!("missing end.line"))? as u32,
                 end_char: e["range"]["end"]["character"]
                     .as_u64()
-                    .ok_or_else(|| anyhow!("missing end.character"))? as u32,
+                    .ok_or_else(|| anyhow!("missing end.character"))?
+                    as u32,
                 new_text: e["newText"]
                     .as_str()
                     .ok_or_else(|| anyhow!("missing newText"))?

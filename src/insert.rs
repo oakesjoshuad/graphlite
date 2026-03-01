@@ -11,8 +11,8 @@ pub fn bulk_insert_symbols(conn: &Connection, symbols: &[Symbol]) -> Result<Hash
     let tx = conn.unchecked_transaction()?;
     {
         let mut node_stmt = tx.prepare_cached(
-            "INSERT INTO nodes (file, language, kind, name, range_start, range_end, signature)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO nodes (file, language, kind, name, range_start, range_end, signature, content_hash, visibility, doc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         let mut fts_stmt = tx.prepare_cached(
             "INSERT INTO fts_symbols (name, signature, file, language, node_id)
@@ -28,6 +28,9 @@ pub fn bulk_insert_symbols(conn: &Connection, symbols: &[Symbol]) -> Result<Hash
                 sym.range_start,
                 sym.range_end,
                 sym.signature,
+                sym.content_hash,
+                sym.visibility,
+                sym.doc,
             ])?;
             let node_id = tx.last_insert_rowid();
 
@@ -75,5 +78,19 @@ pub fn bulk_insert_edges(
     }
     tx.commit()?;
 
+    Ok(())
+}
+
+pub fn upsert_file_hash(
+    conn: &Connection,
+    path: &str,
+    hash: &str,
+    doc: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO files (path, file_hash, doc) VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET file_hash = excluded.file_hash, doc = excluded.doc",
+        rusqlite::params![path, hash, doc],
+    )?;
     Ok(())
 }

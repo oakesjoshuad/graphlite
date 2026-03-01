@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use log::{debug, warn};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -59,7 +60,7 @@ fn read_one_message(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
         .get("id")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".into());
-    eprintln!("LSP[recv] method={} id={}", method, id);
+    debug!("LSP[recv] method={} id={}", method, id);
 
     Ok(msg)
 }
@@ -225,13 +226,13 @@ impl LspClient {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                eprintln!("LSP: timeout waiting for ready, proceeding");
+                debug!("LSP: timeout waiting for ready, proceeding");
                 return Ok(());
             }
             match self.read_message_timeout(remaining) {
                 Some(msg) => {
                     if is_quiescent(&msg) {
-                        eprintln!("LSP: ready (quiescent)");
+                        debug!("LSP: ready (quiescent)");
                         return Ok(());
                     }
                     // Buffer non-quiescent notifications; ignore responses
@@ -240,7 +241,7 @@ impl LspClient {
                     }
                 }
                 None => {
-                    eprintln!("LSP: timeout waiting for ready, proceeding");
+                    debug!("LSP: timeout waiting for ready, proceeding");
                     return Ok(());
                 }
             }
@@ -387,7 +388,7 @@ pub(crate) fn fn_name_char_offset(file: &str, range_start: i64, name: &str) -> u
 
 pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
     if language != "rust" {
-        eprintln!(
+        warn!(
             "LSP: only 'rust' is supported in v0.2, skipping enrichment for '{}'",
             language
         );
@@ -397,7 +398,7 @@ pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
     let ra = match which_rust_analyzer() {
         Some(path) => path,
         None => {
-            eprintln!("LSP: rust-analyzer not found in PATH, skipping enrichment");
+            warn!("LSP: rust-analyzer not found in PATH, skipping enrichment");
             return Ok(());
         }
     };

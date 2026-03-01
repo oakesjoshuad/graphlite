@@ -14,7 +14,10 @@ CREATE TABLE nodes (
     name TEXT NOT NULL,
     range_start INTEGER NOT NULL,
     range_end INTEGER NOT NULL,
-    signature TEXT
+    signature TEXT,
+    content_hash TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'private',
+    doc TEXT
 );
 
 CREATE TABLE edges (
@@ -24,8 +27,26 @@ CREATE TABLE edges (
     edge_type TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'tree-sitter',
     confidence REAL NOT NULL DEFAULT 0.8,
-    FOREIGN KEY(from_id) REFERENCES nodes(id),
-    FOREIGN KEY(to_id) REFERENCES nodes(id)
+    FOREIGN KEY(from_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(to_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
+CREATE TABLE files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT UNIQUE NOT NULL,
+    file_hash TEXT NOT NULL,
+    doc TEXT
+);
+
+CREATE TABLE annotations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL UNIQUE REFERENCES nodes(id) ON DELETE CASCADE,
+    intent TEXT,
+    behavior TEXT,
+    tags TEXT,
+    source TEXT NOT NULL DEFAULT 'llm',
+    confidence REAL NOT NULL DEFAULT 0.8,
+    content_hash_at_annotation TEXT NOT NULL DEFAULT ''
 );
 
 CREATE VIRTUAL TABLE fts_symbols USING fts5(
@@ -39,6 +60,7 @@ CREATE VIRTUAL TABLE fts_symbols USING fts5(
 
 CREATE INDEX idx_edges_from ON edges(from_id);
 CREATE INDEX idx_edges_to ON edges(to_id);
+CREATE INDEX idx_nodes_file ON nodes(file);
 ";
 
 pub fn init_db(path: &str) -> Result<Connection> {
@@ -47,6 +69,31 @@ pub fn init_db(path: &str) -> Result<Connection> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
+    Ok(conn)
+}
+
+/// Opens an existing db if it has incremental-indexing support (files table),
+/// otherwise wipes and recreates it. Creates fresh if the file is absent.
+pub fn open_or_init_db(path: &str) -> Result<Connection> {
+    if !Path::new(path).exists() {
+        return init_db(path);
+    }
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let has_files: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_files {
+        drop(conn);
+        return init_db(path);
+    }
+    // Idempotent migration: add doc column to files if absent (pre-v0.4 dbs)
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN doc TEXT", []);
     Ok(conn)
 }
 

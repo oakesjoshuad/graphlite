@@ -5,6 +5,7 @@ pub enum Language {
     Rust,
     TypeScript,
     JavaScript,
+    Svelte,
     Html,
     Css,
 }
@@ -15,6 +16,7 @@ impl Language {
             "rs" => Some(Language::Rust),
             "ts" | "tsx" | "jsx" => Some(Language::TypeScript),
             "js" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "svelte" => Some(Language::Svelte),
             "html" | "htm" => Some(Language::Html),
             "css" => Some(Language::Css),
             _ => None,
@@ -26,6 +28,7 @@ impl Language {
             Language::Rust => "rust",
             Language::TypeScript => "typescript",
             Language::JavaScript => "javascript",
+            Language::Svelte => "svelte",
             Language::Html => "html",
             Language::Css => "css",
         }
@@ -36,8 +39,18 @@ impl Language {
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Language::Svelte => tree_sitter_svelte_ng::LANGUAGE.into(),
             Language::Html => tree_sitter_html::LANGUAGE.into(),
             Language::Css => tree_sitter_css::LANGUAGE.into(),
+        }
+    }
+
+    pub fn lsp_server_cmd(&self) -> Option<&'static str> {
+        match self {
+            Language::Rust => Some("rust-analyzer"),
+            Language::TypeScript | Language::JavaScript => Some("typescript-language-server"),
+            Language::Svelte => Some("svelte-language-server"),
+            Language::Html | Language::Css => None,
         }
     }
 
@@ -46,6 +59,7 @@ impl Language {
             Language::Rust => include_str!("../queries/rust.scm"),
             Language::TypeScript => include_str!("../queries/typescript.scm"),
             Language::JavaScript => include_str!("../queries/javascript.scm"),
+            Language::Svelte => include_str!("../queries/svelte.scm"),
             Language::Html => include_str!("../queries/html.scm"),
             Language::Css => include_str!("../queries/css.scm"),
         }

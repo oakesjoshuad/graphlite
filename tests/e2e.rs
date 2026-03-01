@@ -16,11 +16,11 @@ fn root() -> &'static str {
 fn ensure_db() {
     DB_READY.get_or_init(|| {
         let status = Command::new(bin())
-            .args(["discover", "."])
+            .args(["init", "."])
             .current_dir(root())
             .status()
-            .expect("failed to spawn graphlite discover");
-        assert!(status.success(), "graphlite discover failed");
+            .expect("failed to spawn graphlite init");
+        assert!(status.success(), "graphlite init failed");
     });
 }
 
@@ -40,8 +40,14 @@ fn blast_radius_open_db_has_known_dependents() {
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("name=\"symbols\""), "expected 'symbols' in blast radius");
-    assert!(text.contains("name=\"graph\""), "expected 'graph' in blast radius");
+    assert!(
+        text.contains("name=\"symbols\""),
+        "expected 'symbols' in blast radius"
+    );
+    assert!(
+        text.contains("name=\"graph\""),
+        "expected 'graph' in blast radius"
+    );
 }
 
 #[test]
@@ -54,34 +60,46 @@ fn symbols_fts_finds_xml_escape() {
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("xml_escape"), "FTS should find xml_escape symbol");
+    assert!(
+        text.contains("xml_escape"),
+        "FTS should find xml_escape symbol"
+    );
 }
 
 #[test]
 fn blast_radius_snippets_show_call_sites() {
     ensure_db();
     let out = Command::new(bin())
-        .args(["blast-radius", "--snippets", "--depth", "1", "sym:open_db"])
+        .args(["blast-radius", "--depth", "1", "sym:open_db"])
         .current_dir(root())
         .output()
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("<snippet>"), "expected <snippet> elements with --snippets");
-    assert!(text.contains("open_db"), "snippet should contain 'open_db' call");
+    assert!(
+        text.contains("<snippet>"),
+        "expected <snippet> elements (snippets on by default)"
+    );
+    assert!(
+        text.contains("open_db"),
+        "snippet should contain 'open_db' call"
+    );
 }
 
 #[test]
 fn graph_with_snippets_emits_snippets_for_neighbors() {
     ensure_db();
     let out = Command::new(bin())
-        .args(["graph", "--snippets", "--depth", "1", "sym:open_db"])
+        .args(["graph", "--depth", "1", "sym:open_db"])
         .current_dir(root())
         .output()
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("<snippet>"), "expected <snippet> elements with --snippets");
+    assert!(
+        text.contains("<snippet>"),
+        "expected <snippet> elements (snippets on by default)"
+    );
 }
 
 // --- token reduction measurement ---
@@ -90,7 +108,7 @@ fn graph_with_snippets_emits_snippets_for_neighbors() {
 fn token_reduction_blast_radius_vs_raw_files() {
     ensure_db();
     let out = Command::new(bin())
-        .args(["blast-radius", "--snippets", "--depth", "0", "sym:open_db"])
+        .args(["blast-radius", "--depth", "3", "sym:open_db"])
         .current_dir(root())
         .output()
         .unwrap();
@@ -175,7 +193,10 @@ fn lsp_apply_edits_and_cargo_builds() {
         .current_dir(root())
         .status()
         .unwrap();
-    assert!(build.success(), "cargo build must succeed after apply-edits");
+    assert!(
+        build.success(),
+        "cargo build must succeed after apply-edits"
+    );
     // Restore changes
     Command::new("git")
         .args(["checkout", "--", "."])
