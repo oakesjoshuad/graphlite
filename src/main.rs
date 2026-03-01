@@ -15,7 +15,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "graphlite", about = "Build and query a SQLite code graph")]
+#[command(
+    name = "graphlite",
+    about = "Build and query a SQLite code graph",
+    long_about = "Build and query a SQLite code graph.\n\nRecommended workflow: run `map` first to orient across the full symbol set, then use `context` selectively on the 1-2 symbols you cannot understand from signatures and roles alone."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -42,6 +46,10 @@ enum Commands {
         lsp: Option<String>,
     },
     /// Show a symbol and its graph neighborhood as XML
+    ///
+    /// Cheaper than `context` — no blast radius. Use when you need to understand what a symbol
+    /// calls without needing to know what depends on it. `--no-snippets` gives pure structural
+    /// output (signatures + roles) at significantly lower token cost.
     Graph {
         /// Symbol id (integer) or name (sym:Name)
         symbol: String,
@@ -67,6 +75,10 @@ enum Commands {
         language: Option<String>,
     },
     /// Find all symbols that (transitively) depend on a given symbol
+    ///
+    /// Emits call-site snippets (2 lines around each call) rather than full function bodies —
+    /// the intent is to show how each caller uses the target, not what the caller does overall.
+    /// Use `--no-snippets` if you only need the list of dependent symbol names.
     BlastRadius {
         /// Symbol id (integer) or name (sym:Name)
         symbol: String,
@@ -78,6 +90,15 @@ enum Commands {
         no_snippets: bool,
     },
     /// Show full context for a symbol: graph neighborhood + blast radius in one document
+    ///
+    /// Combines graph neighborhood and blast radius in one document. Snippets are included by
+    /// default and are the primary driver of token count — use selectively after `map` has
+    /// identified the specific symbol you need to understand deeply.
+    ///
+    /// Use `--no-snippets` when you need call structure only (who this calls, who depends on it)
+    /// without reading implementations. The `role` attribute on the focus node signals
+    /// architectural significance: `orchestrator` and `infra` nodes yield the most structural
+    /// insight per token.
     Context {
         /// Symbol id (integer) or name (sym:Name)
         symbol: String,
@@ -140,6 +161,15 @@ enum Commands {
         stale: bool,
     },
     /// Show a high-level map of public symbols grouped by file, with hotspots by fan-in
+    ///
+    /// Orientation command — run this before any other query. Emits all public symbols grouped
+    /// by file with roles, signatures, fan-in/fan-out, and hotspot ranking. Token count is
+    /// reported in the XML header so you know exactly what you consumed.
+    ///
+    /// Recommended starting point: `map --with-docs --with-file-docs` gives maximum signal in
+    /// one pass. From the role and fan-in attributes you can identify which 1-2 symbols warrant
+    /// a deeper `context` query. Use `--all` to include private symbols when you need
+    /// implementation-level detail without pulling full snippets.
     Map {
         /// Include private symbols (default: public/exported only)
         #[arg(long)]
