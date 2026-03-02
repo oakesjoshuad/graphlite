@@ -490,9 +490,16 @@ impl LspClient {
                     let to_item = &call["to"];
                     let name = to_item["name"].as_str().unwrap_or("").to_string();
                     let uri = to_item["uri"].as_str().unwrap_or("").to_string();
-                    // Use range.start.line (0-indexed) to match against DB range_start - 1
-                    let target_line =
-                        to_item["range"]["start"]["line"].as_u64().unwrap_or(0) as u32;
+                    // Use selectionRange.start.line, not range.start.line.
+                    // range.start includes leading doc comments; selectionRange covers
+                    // only the function name, which is on the same line as `fn`.
+                    // tree-sitter range_start is also the `fn` line, so these match.
+                    let target_line = to_item["selectionRange"]["start"]["line"]
+                        .as_u64()
+                        .unwrap_or_else(|| {
+                            to_item["range"]["start"]["line"].as_u64().unwrap_or(0)
+                        })
+                        as u32;
                     if !uri.is_empty() && !name.is_empty() {
                         targets.push(LspCallTarget {
                             name,
