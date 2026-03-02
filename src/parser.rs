@@ -63,8 +63,17 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
         });
     }
 
-    let symbols = extract_symbols(&tree, &source, path, &language, &ts_lang, query_src)?;
-    let edges = extract_edges(&tree, &source, path, &ts_lang, query_src)?;
+    let mut symbols = extract_symbols(&tree, &source, path, &language, &ts_lang, query_src)?;
+    let mut edges = extract_edges(&tree, &source, path, &ts_lang, query_src)?;
+
+    if matches!(language, Language::Svelte) {
+        let (script_symbols, script_edges) = extract_svelte_script_symbols(&tree, &source, path)?;
+        symbols.extend(script_symbols);
+        edges.extend(script_edges);
+        let mut seen = std::collections::HashSet::new();
+        symbols.retain(|s| seen.insert((s.file.clone(), s.range_start)));
+    }
+
     Ok(ParseResult {
         symbols,
         edges,
@@ -406,6 +415,68 @@ fn enclosing_impl_name(node: Node<'_>, source: &str) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+fn find_script_raw_texts<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    if node.kind() == "script_element" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "raw_text" {
+                out.push(child);
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_script_raw_texts(child, out);
+    }
+}
+
+fn extract_svelte_script_symbols(
+    svelte_tree: &tree_sitter::Tree,
+    source: &str,
+    path: &Path,
+) -> Result<(Vec<Symbol>, Vec<RawEdge>)> {
+    let mut raw_text_nodes: Vec<Node<'_>> = Vec::new();
+    find_script_raw_texts(svelte_tree.root_node(), &mut raw_text_nodes);
+
+    if raw_text_nodes.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+
+    let ts_language = Language::TypeScript;
+    let ts_ts_lang = ts_language.tree_sitter_language();
+    let ts_query_src = ts_language.query_source();
+    let mut ts_parser = Parser::new();
+    ts_parser.set_language(&ts_ts_lang)?;
+
+    let mut all_symbols = Vec::new();
+    let mut all_edges = Vec::new();
+
+    for raw_text_node in raw_text_nodes {
+        let script_start_row = raw_text_node.start_position().row as u32;
+        let raw_text = &source[raw_text_node.start_byte()..raw_text_node.end_byte()];
+
+        let ts_tree = match ts_parser.parse(raw_text, None) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let mut script_symbols =
+            extract_symbols(&ts_tree, raw_text, path, &ts_language, &ts_ts_lang, ts_query_src)?;
+        for sym in &mut script_symbols {
+            sym.range_start += script_start_row;
+            sym.range_end += script_start_row;
+            sym.language = "svelte".to_string();
+        }
+        all_symbols.extend(script_symbols);
+
+        let script_edges =
+            extract_edges(&ts_tree, raw_text, path, &ts_ts_lang, ts_query_src)?;
+        all_edges.extend(script_edges);
+    }
+
+    Ok((all_symbols, all_edges))
 }
 
 fn extract_edges(

@@ -593,11 +593,38 @@ fn inlay_label_str(label: &Value) -> String {
 }
 
 // True if the signature already carries an explicit return type annotation —
-// i.e. there is a `:` immediately after the closing `)` of the parameter list.
+// i.e. there is a `:` (TS/JS) or `->` (Rust) immediately after the closing `)`
+// of the parameter list.
+//
+// Uses depth-tracking to find the actual closing `)` of the parameter list.
+// rfind(')') was wrong: for `fn foo() -> Result<(), Error>` it found the `)`
+// inside `Result<()>` instead of the one that closes the parameter list.
 fn has_explicit_return_type(sig: &str) -> bool {
-    sig.rfind(')')
-        .map(|pos| sig[pos + 1..].trim_start().starts_with(':'))
-        .unwrap_or(false)
+    let start = match sig.find('(') {
+        Some(i) => i,
+        None => return false,
+    };
+    let mut depth = 0usize;
+    let mut param_close = None;
+    for (i, ch) in sig.char_indices().skip(start) {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    param_close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = match param_close {
+        Some(i) => i,
+        None => return false,
+    };
+    let after = sig[close + 1..].trim_start();
+    after.starts_with(':') || after.starts_with("->")
 }
 
 // Among all `kind=1` (Type) inlay hints on `lsp_line` (0-indexed), return the
@@ -713,9 +740,36 @@ fn is_crash_error(e: &anyhow::Error) -> bool {
     s.contains("LSP send failed") || s.contains("disconnected")
 }
 
-fn do_enrich(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
+/// Spawn, initialize, and wait for the LSP server to be ready.
+/// Returns a warmed client that can be passed directly to `enrich`.
+/// Called from discover before parsing so warm-up overlaps with tree-sitter work.
+pub fn warm_client(language: &str, root: &str) -> Result<LspClient> {
+    let t = Instant::now();
+    let config = LANGUAGE_CONFIGS
+        .iter()
+        .find(|c| c.language == language)
+        .ok_or_else(|| anyhow!("no LSP config for language '{}'", language))?;
+    let server = which_server(config.server_cmd)
+        .ok_or_else(|| anyhow!("LSP server '{}' not found in PATH", config.server_cmd))?;
+    let mut client = LspClient::spawn(&server, config.server_args, root)?;
+    client.initialize(None)?;
+    eprintln!("LSP[{}]: initialized ({:.1}s)", language, t.elapsed().as_secs_f32());
+    if config.has_quiescent_signal {
+        client.wait_for_ready(60)?;
+        eprintln!("LSP[{}]: server ready ({:.1}s)", language, t.elapsed().as_secs_f32());
+    }
+    Ok(client)
+}
+
+fn do_enrich(conn: &Connection, root: &str, language: &str, client: Option<LspClient>) -> Result<EnrichReport> {
     match language {
-        "rust" => enrich_rust(conn, root),
+        "rust" => {
+            let c = match client {
+                Some(c) => c,
+                None => warm_client("rust", root)?,
+            };
+            enrich_rust(conn, root, c)
+        }
         "typescript" | "javascript" => enrich_typescript(conn, root, language),
         "svelte" => enrich_svelte(conn, root),
         _ => Ok(EnrichReport {
@@ -731,10 +785,11 @@ fn do_enrich(conn: &Connection, root: &str, language: &str) -> Result<EnrichRepo
     }
 }
 
-fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
+fn enrich_with_retry(conn: &Connection, root: &str, language: &str, pre_warmed: Option<LspClient>) -> Result<EnrichReport> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = None;
     let mut crashes: u32 = 0;
+    let mut first_client = pre_warmed;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
             crashes += 1;
@@ -744,7 +799,7 @@ fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<En
             );
             std::thread::sleep(Duration::from_secs(attempt as u64));
         }
-        match do_enrich(conn, root, language) {
+        match do_enrich(conn, root, language, first_client.take()) {
             Ok(mut report) => {
                 report.crashes = crashes;
                 return Ok(report);
@@ -758,10 +813,10 @@ fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<En
     Err(last_err.unwrap())
 }
 
-pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
+pub fn enrich(conn: &Connection, root: &str, language: &str, pre_warmed: Option<LspClient>) -> Result<EnrichReport> {
     match language {
         "rust" | "typescript" | "javascript" | "svelte" => {
-            enrich_with_retry(conn, root, language)
+            enrich_with_retry(conn, root, language, pre_warmed)
         }
         _ => {
             warn!("LSP: no enrichment support for '{}', skipping", language);
@@ -783,32 +838,8 @@ pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<EnrichRep
 // Language-specific enrichment implementations
 // ---------------------------------------------------------------------------
 
-fn enrich_rust(conn: &Connection, root: &str) -> Result<EnrichReport> {
-    let ra = match which_rust_analyzer() {
-        Some(path) => path,
-        None => {
-            warn!("LSP: rust-analyzer not found in PATH, skipping enrichment");
-            return Ok(EnrichReport {
-                language: "rust".to_string(),
-                elapsed_secs: 0.0,
-                edges_inserted: 0,
-                fns_queried: 0,
-                sigs_enriched: 0,
-                recovered_on_retry: 0,
-                ultimately_failed: Vec::new(),
-                crashes: 0,
-            });
-        }
-    };
-
+fn enrich_rust(conn: &Connection, _root: &str, mut client: LspClient) -> Result<EnrichReport> {
     let t_start = Instant::now();
-
-    let mut client = LspClient::spawn(&ra, &[], root)?;
-    client.initialize(None)?;
-    eprintln!("LSP[rust]: initialized ({:.1}s)", t_start.elapsed().as_secs_f32());
-
-    client.wait_for_ready(60)?;
-    eprintln!("LSP[rust]: server ready ({:.1}s)", t_start.elapsed().as_secs_f32());
 
     // Build (canonical_path, range_start) -> node_id index for fast target lookup
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();

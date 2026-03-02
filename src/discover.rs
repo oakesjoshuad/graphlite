@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::thread;
 use walkdir::WalkDir;
 
 use crate::{
@@ -128,6 +129,26 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
     }
     eprintln!("{} file(s) changed, re-indexing", changed.len());
 
+    // Determine LSP languages now (files is available) and start warming in background
+    // so LSP server indexes the workspace while tree-sitter parses.
+    let effective_lsp: Vec<String> = if let Some(lang) = lsp_lang {
+        vec![lang.to_string()]
+    } else if !config.lsp.is_empty() {
+        config.lsp.clone()
+    } else {
+        detect_lsp_from_files(&files)
+    };
+    let root_owned = root.to_string();
+    let warm_handles: Vec<(String, thread::JoinHandle<Option<lsp::LspClient>>)> = effective_lsp
+        .iter()
+        .map(|lang| {
+            let lang_clone = lang.clone();
+            let root_clone = root_owned.clone();
+            let h = thread::spawn(move || lsp::warm_client(&lang_clone, &root_clone).ok());
+            (lang.clone(), h)
+        })
+        .collect();
+
     // Delete old edges and nodes for changed files.
     // Edges are deleted explicitly first because older db instances may lack ON DELETE CASCADE.
     for path in &changed {
@@ -190,15 +211,9 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
         db_path
     );
 
-    let effective_lsp: Vec<String> = if let Some(lang) = lsp_lang {
-        vec![lang.to_string()]
-    } else if !config.lsp.is_empty() {
-        config.lsp.clone()
-    } else {
-        detect_lsp_from_files(&files)
-    };
-    for lang in &effective_lsp {
-        match lsp::enrich(&conn, root, lang) {
+    for (lang, handle) in warm_handles {
+        let pre_warmed = handle.join().ok().flatten();
+        match lsp::enrich(&conn, root, &lang, pre_warmed) {
             Ok(report) => eprintln!("{}", report),
             Err(e) => eprintln!("LSP[{}]: enrichment failed: {}", lang, e),
         }
