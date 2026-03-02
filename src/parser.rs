@@ -70,6 +70,11 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
         let (script_symbols, script_edges) = extract_svelte_script_symbols(&tree, &source, path)?;
         symbols.extend(script_symbols);
         edges.extend(script_edges);
+    }
+
+    // Same AST node can be captured by multiple query patterns (e.g. an impl method
+    // matches both definition.method and definition.function). Deduplicate by position.
+    {
         let mut seen = std::collections::HashSet::new();
         symbols.retain(|s| seen.insert((s.file.clone(), s.range_start)));
     }
@@ -87,6 +92,7 @@ fn kind_from_node(node: &Node) -> &'static str {
     match node.kind() {
         // Rust
         "function_item" => "fn",
+        "function_signature_item" => "fn", // trait required methods (no body)
         "struct_item" => "struct",
         "enum_item" => "enum",
         "union_item" => "union",
@@ -380,6 +386,7 @@ fn extract_symbols(
 fn enclosing_function_name<'a>(node: Node<'a>, source: &'a str) -> Option<String> {
     let fn_kinds = [
         "function_item",
+        "function_signature_item",
         "function_declaration",
         "function_expression",
         "arrow_function",
@@ -409,7 +416,7 @@ fn enclosing_function_name<'a>(node: Node<'a>, source: &'a str) -> Option<String
 }
 
 fn enclosing_impl_name(node: Node<'_>, source: &str) -> Option<String> {
-    let container_kinds = ["impl_item", "class_declaration", "class"];
+    let container_kinds = ["impl_item", "trait_item", "class_declaration", "class"];
     let mut current = node.parent();
     while let Some(n) = current {
         if container_kinds.contains(&n.kind()) {

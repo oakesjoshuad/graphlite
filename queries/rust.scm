@@ -14,7 +14,20 @@
 (type_item
     name: (type_identifier) @name) @definition.class
 
-; function definitions
+; method definitions — functions with a body inside impl or trait blocks
+; canonical tags.scm pattern; dedup handles overlap with definition.function below
+(declaration_list
+    (function_item
+        name: (identifier) @name) @definition.method)
+
+; trait method signatures — required methods with no body (ends with ;)
+; not in canonical tags.scm; critical for graphlite: rust-analyzer resolves
+; generic dispatch (E: EventStore, A: Aggregate) to these declaration positions
+(declaration_list
+    (function_signature_item
+        name: (identifier) @name) @definition.method)
+
+; function definitions — free functions at module level
 (function_item
     name: (identifier) @name) @definition.function
 
@@ -53,6 +66,22 @@
 (call_expression
     function: (scoped_identifier
         name: (identifier) @name)) @reference.call
+
+; graphlite extension: generic (turbofish) calls — parse::<T>(), Vec::<T>::new(),
+; self.method::<T>() — from highlights.scm; not in canonical tags.scm
+(call_expression
+    function: (generic_function
+        function: (identifier) @name)) @reference.call
+
+(call_expression
+    function: (generic_function
+        function: (scoped_identifier
+            name: (identifier) @name))) @reference.call
+
+(call_expression
+    function: (generic_function
+        function: (field_expression
+            field: (field_identifier) @name))) @reference.call
 
 ; graphlite extension: impl blocks as searchable symbols
 ; always captures the implementing type (Bar in `impl Foo for Bar`, Foo in `impl Foo`)
