@@ -833,7 +833,7 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<EnrichReport> {
     // Query all fn nodes to drive call hierarchy requests
     let fn_nodes: Vec<(i64, String, i64, String)> = {
         let mut stmt =
-            conn.prepare("SELECT id, file, range_start, name FROM nodes WHERE kind = 'fn'")?;
+            conn.prepare("SELECT id, file, range_start, name FROM nodes WHERE kind = 'fn' AND language = 'rust'")?;
         let result = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;

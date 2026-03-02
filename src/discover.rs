@@ -20,6 +20,7 @@ const IGNORED_DIRS: &[&str] = &[
     "dist",
     ".svelte-kit",
     ".git",
+    ".claude",
     ".cache",
     ".next",
     ".nuxt",
