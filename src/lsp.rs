@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::io::BufReader;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -78,6 +79,50 @@ pub struct LspCallTarget {
     pub name: String,
     pub uri: String,
     pub line: u32,
+}
+
+/// Summary of a single LSP enrichment run, returned by `enrich()`.
+/// Displayable as a single human-readable line; also machine-readable for
+/// LLM-driven post-mortem analysis of partially-failed enrichment.
+pub struct EnrichReport {
+    pub language: String,
+    pub elapsed_secs: f32,
+    pub edges_inserted: usize,
+    pub fns_queried: usize,
+    pub sigs_enriched: usize,
+    pub recovered_on_retry: usize,
+    pub ultimately_failed: Vec<String>,
+    pub crashes: u32,
+}
+
+impl fmt::Display for EnrichReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "LSP[{}]: done in {:.1}s — {} edges, {}/{} fns, {} sigs enriched",
+            self.language,
+            self.elapsed_secs,
+            self.edges_inserted,
+            self.fns_queried.saturating_sub(self.ultimately_failed.len()),
+            self.fns_queried,
+            self.sigs_enriched,
+        )?;
+        if self.recovered_on_retry > 0 {
+            write!(f, ", {} recovered on retry", self.recovered_on_retry)?;
+        }
+        if !self.ultimately_failed.is_empty() {
+            write!(
+                f,
+                ", {} ultimately failed: [{}]",
+                self.ultimately_failed.len(),
+                self.ultimately_failed.join(", ")
+            )?;
+        }
+        if self.crashes > 0 {
+            write!(f, ", {} crash(es) restarted", self.crashes)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct LspClient {
@@ -182,7 +227,7 @@ impl LspClient {
         Ok(())
     }
 
-    fn read_message_timeout(&mut self, dur: Duration) -> Option<lsp_server::Message> {
+    fn read_message_timeout(&mut self, dur: Duration) -> Result<Option<lsp_server::Message>> {
         match self.connection.receiver.recv_timeout(dur) {
             Ok(msg) => {
                 let method = match &msg {
@@ -191,12 +236,11 @@ impl LspClient {
                     lsp_server::Message::Notification(n) => n.method.as_str(),
                 };
                 debug!("LSP[recv] method={}", method);
-                Some(msg)
+                Ok(Some(msg))
             }
-            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
-                debug!("LSP: receiver disconnected (server crashed)");
-                None
+                Err(anyhow!("LSP: receiver disconnected (server crashed)"))
             }
         }
     }
@@ -252,7 +296,21 @@ impl LspClient {
                 return pending;
             }
             match self.read_message_timeout(remaining) {
-                Some(msg) => {
+                // Disconnect: treat as deadline expiry — return whatever is still pending.
+                Err(_) | Ok(None) => return pending,
+                Ok(Some(lsp_server::Message::Request(req))) => {
+                    // Ack server-to-client requests so the server doesn't stall.
+                    let reply = lsp_server::Response {
+                        id: req.id,
+                        result: Some(Value::Null),
+                        error: None,
+                    };
+                    let _ = self
+                        .connection
+                        .sender
+                        .send(lsp_server::Message::Response(reply));
+                }
+                Ok(Some(msg)) => {
                     if let Some(uri) = diagnostics_uri(&msg) {
                         let uri = uri.to_string();
                         let was_pending = pending.remove(&uri);
@@ -266,7 +324,6 @@ impl LspClient {
                         }
                     }
                 }
-                None => return pending,
             }
         }
     }
@@ -289,7 +346,7 @@ impl LspClient {
             if remaining.is_zero() {
                 return Err(anyhow!("timeout waiting for response to '{}'", method));
             }
-            match self.read_message_timeout(remaining) {
+            match self.read_message_timeout(remaining)? {
                 None => return Err(anyhow!("timeout waiting for response to '{}'", method)),
                 Some(lsp_server::Message::Response(resp)) => {
                     if resp.id == lsp_server::RequestId::from(id as i32) {
@@ -387,7 +444,12 @@ impl LspClient {
                 return Ok(());
             }
             match self.read_message_timeout(remaining) {
-                Some(msg) => {
+                // Timeout or disconnect: proceed without waiting for ready.
+                Err(_) | Ok(None) => {
+                    debug!("LSP: timeout or disconnect waiting for ready, proceeding");
+                    return Ok(());
+                }
+                Ok(Some(msg)) => {
                     if is_quiescent(&msg) {
                         debug!("LSP: ready (quiescent)");
                         return Ok(());
@@ -396,10 +458,6 @@ impl LspClient {
                     if let lsp_server::Message::Notification(_) = msg {
                         self.notification_buf.push(msg);
                     }
-                }
-                None => {
-                    debug!("LSP: timeout waiting for ready, proceeding");
-                    return Ok(());
                 }
             }
         }
@@ -410,18 +468,15 @@ impl LspClient {
         uri: &str,
         line: u32,
         char_offset: u32,
+        timeout: Duration,
     ) -> Result<Vec<LspCallTarget>> {
-        // Use a shorter timeout than the default 10s — call hierarchy requests that
-        // will time out tend to do so quickly (server has no info for the symbol),
-        // and the sequential loop means each timeout multiplies wall-clock cost.
-        let ch_timeout = Duration::from_secs(5);
         let items = self.call_with_timeout(
             "textDocument/prepareCallHierarchy",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": char_offset }
             }),
-            ch_timeout,
+            timeout,
         )?;
 
         let items = match items {
@@ -434,10 +489,14 @@ impl LspClient {
             let calls = match self.call_with_timeout(
                 "callHierarchy/outgoingCalls",
                 json!({ "item": item }),
-                ch_timeout,
+                timeout,
             ) {
                 Ok(v) => v,
-                Err(_) => continue,
+                // Timeout on the second call: skip this item, don't propagate —
+                // the first prepareCallHierarchy already succeeded.
+                Err(e) if !e.to_string().contains("disconnected") => continue,
+                // Disconnect / crash: propagate immediately.
+                Err(e) => return Err(e),
             };
 
             if let Some(calls_arr) = calls.as_array() {
@@ -654,20 +713,31 @@ fn is_crash_error(e: &anyhow::Error) -> bool {
     s.contains("LSP send failed") || s.contains("disconnected")
 }
 
-fn do_enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
+fn do_enrich(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
     match language {
         "rust" => enrich_rust(conn, root),
         "typescript" | "javascript" => enrich_typescript(conn, root, language),
         "svelte" => enrich_svelte(conn, root),
-        _ => Ok(()),
+        _ => Ok(EnrichReport {
+            language: language.to_string(),
+            elapsed_secs: 0.0,
+            edges_inserted: 0,
+            fns_queried: 0,
+            sigs_enriched: 0,
+            recovered_on_retry: 0,
+            ultimately_failed: Vec::new(),
+            crashes: 0,
+        }),
     }
 }
 
-fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<()> {
+fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = None;
+    let mut crashes: u32 = 0;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
+            crashes += 1;
             warn!(
                 "LSP[{}]: crash on attempt {}/{}; restarting in {}s",
                 language, attempt, MAX_ATTEMPTS, attempt
@@ -675,7 +745,10 @@ fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<()
             std::thread::sleep(Duration::from_secs(attempt as u64));
         }
         match do_enrich(conn, root, language) {
-            Ok(()) => return Ok(()),
+            Ok(mut report) => {
+                report.crashes = crashes;
+                return Ok(report);
+            }
             Err(e) if is_crash_error(&e) => {
                 last_err = Some(e);
             }
@@ -685,14 +758,23 @@ fn enrich_with_retry(conn: &Connection, root: &str, language: &str) -> Result<()
     Err(last_err.unwrap())
 }
 
-pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
+pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
     match language {
         "rust" | "typescript" | "javascript" | "svelte" => {
             enrich_with_retry(conn, root, language)
         }
         _ => {
             warn!("LSP: no enrichment support for '{}', skipping", language);
-            Ok(())
+            Ok(EnrichReport {
+                language: language.to_string(),
+                elapsed_secs: 0.0,
+                edges_inserted: 0,
+                fns_queried: 0,
+                sigs_enriched: 0,
+                recovered_on_retry: 0,
+                ultimately_failed: Vec::new(),
+                crashes: 0,
+            })
         }
     }
 }
@@ -701,12 +783,21 @@ pub fn enrich(conn: &Connection, root: &str, language: &str) -> Result<()> {
 // Language-specific enrichment implementations
 // ---------------------------------------------------------------------------
 
-fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
+fn enrich_rust(conn: &Connection, root: &str) -> Result<EnrichReport> {
     let ra = match which_rust_analyzer() {
         Some(path) => path,
         None => {
             warn!("LSP: rust-analyzer not found in PATH, skipping enrichment");
-            return Ok(());
+            return Ok(EnrichReport {
+                language: "rust".to_string(),
+                elapsed_secs: 0.0,
+                edges_inserted: 0,
+                fns_queried: 0,
+                sigs_enriched: 0,
+                recovered_on_retry: 0,
+                ultimately_failed: Vec::new(),
+                crashes: 0,
+            });
         }
     };
 
@@ -753,11 +844,13 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
     let t_ch = Instant::now();
 
     // Collect trusted CALLS_TRUSTED edges via LSP call hierarchy
+    let ch_timeout = Duration::from_secs(5);
     let mut trusted_edges: Vec<(i64, i64, &'static str)> = Vec::new();
     let mut calls_with_edges = 0usize;
     let mut calls_timeout = 0usize;
     let mut max_call_ms = 0u128;
     let mut slowest_fn = String::new();
+    let mut timed_out_fns: Vec<(i64, String, i64, String)> = Vec::new();
 
     for (fn_id, file, range_start, name) in &fn_nodes {
         let abs_path =
@@ -772,12 +865,16 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
         let char_offset = fn_name_char_offset(file, *range_start, name);
 
         let t_call = Instant::now();
-        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset) {
+        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset, ch_timeout) {
             Ok(t) => t,
             Err(e) => {
                 if e.to_string().contains("timeout") {
                     calls_timeout += 1;
                     warn!("LSP[rust]: timeout for '{}' in {}", name, file);
+                    timed_out_fns.push((*fn_id, file.clone(), *range_start, name.clone()));
+                } else {
+                    // Disconnect or crash — propagate so enrich_with_retry can restart.
+                    return Err(e);
                 }
                 continue;
             }
@@ -811,6 +908,47 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
         slowest_fn
     );
 
+    // Retry phase: re-query timed-out functions with 3× the original timeout.
+    let mut recovered_on_retry = 0usize;
+    let mut ultimately_failed: Vec<String> = Vec::new();
+    if !timed_out_fns.is_empty() {
+        let retry_timeout = ch_timeout * 3;
+        eprintln!(
+            "LSP[rust]: retrying {} timed-out function(s) at {}s timeout...",
+            timed_out_fns.len(),
+            retry_timeout.as_secs()
+        );
+        for (fn_id, file, range_start, name) in &timed_out_fns {
+            let abs_path =
+                std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let uri = format!("file://{}", abs_path.display());
+            let lsp_line = (*range_start - 1).max(0) as u32;
+            let char_offset = fn_name_char_offset(file, *range_start, name);
+
+            match client.outgoing_calls(&uri, lsp_line, char_offset, retry_timeout) {
+                Ok(targets) => {
+                    recovered_on_retry += 1;
+                    for target in targets {
+                        let target_path = uri_to_path(&target.uri);
+                        let target_range_start = target.line as i64 + 1;
+                        if let Some(&to_id) =
+                            path_line_to_id.get(&(target_path, target_range_start))
+                        {
+                            trusted_edges.push((*fn_id, to_id, "CALLS_TRUSTED"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.to_string().contains("timeout") {
+                        ultimately_failed.push(name.clone());
+                    } else {
+                        return Err(e); // crash during retry
+                    }
+                }
+            }
+        }
+    }
+
     // Collect TRAIT_IMPL edges via name matching
     {
         let mut stmt = conn.prepare(
@@ -841,20 +979,33 @@ fn enrich_rust(conn: &Connection, root: &str) -> Result<()> {
     }
     tx.commit()?;
 
-    eprintln!(
-        "LSP[rust]: done in {:.1}s — inserted {} trusted edges",
-        t_start.elapsed().as_secs_f32(),
-        edge_count
-    );
-    Ok(())
+    Ok(EnrichReport {
+        language: "rust".to_string(),
+        elapsed_secs: t_start.elapsed().as_secs_f32(),
+        edges_inserted: edge_count,
+        fns_queried: fn_nodes.len(),
+        sigs_enriched: 0,
+        recovered_on_retry,
+        ultimately_failed,
+        crashes: 0,
+    })
 }
 
-fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()> {
+fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
     let ts = match which_typescript_language_server() {
         Some(path) => path,
         None => {
             warn!("LSP: typescript-language-server not found in PATH, skipping enrichment");
-            return Ok(());
+            return Ok(EnrichReport {
+                language: language.to_string(),
+                elapsed_secs: 0.0,
+                edges_inserted: 0,
+                fns_queried: 0,
+                sigs_enriched: 0,
+                recovered_on_retry: 0,
+                ultimately_failed: Vec::new(),
+                crashes: 0,
+            });
         }
     };
 
@@ -935,7 +1086,16 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
         pending.len()
     );
     let t_diag = Instant::now();
-    client.wait_for_diagnostics(pending, 60);
+    let not_ready = client.wait_for_diagnostics(pending, 60);
+    if !not_ready.is_empty() {
+        warn!(
+            "LSP[ts]: {} file(s) never got diagnostics, enrichment may be incomplete",
+            not_ready.len()
+        );
+        for uri in &not_ready {
+            warn!("LSP[ts]:   {}", uri);
+        }
+    }
     eprintln!("LSP[ts]: diagnostics done ({:.1}s)", t_diag.elapsed().as_secs_f32());
 
     // Build per-URI index: uri -> [(node_id, lsp_line_0indexed, current_signature)]
@@ -998,11 +1158,13 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
 
     eprintln!("LSP[ts]: querying call hierarchy for {} fn nodes...", fn_nodes.len());
     let t_ch = Instant::now();
+    let ch_timeout = Duration::from_secs(5);
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
     let mut calls_with_edges = 0usize;
     let mut calls_timeout = 0usize;
     let mut max_call_ms = 0u128;
     let mut slowest_fn = String::new();
+    let mut timed_out_fns: Vec<(i64, String, i64, String)> = Vec::new();
 
     for (fn_id, file, range_start, name, _) in &fn_nodes {
         let abs_path =
@@ -1012,12 +1174,15 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
         let char_offset = fn_name_char_offset(file, *range_start, name);
 
         let t_call = Instant::now();
-        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset) {
+        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset, ch_timeout) {
             Ok(t) => t,
             Err(e) => {
                 if e.to_string().contains("timeout") {
                     calls_timeout += 1;
                     warn!("LSP[ts]: timeout for '{}' in {}", name, file);
+                    timed_out_fns.push((*fn_id, file.clone(), *range_start, name.clone()));
+                } else {
+                    return Err(e);
                 }
                 continue;
             }
@@ -1050,6 +1215,47 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
         slowest_fn
     );
 
+    // Retry phase
+    let mut recovered_on_retry = 0usize;
+    let mut ultimately_failed: Vec<String> = Vec::new();
+    if !timed_out_fns.is_empty() {
+        let retry_timeout = ch_timeout * 3;
+        eprintln!(
+            "LSP[ts]: retrying {} timed-out function(s) at {}s timeout...",
+            timed_out_fns.len(),
+            retry_timeout.as_secs()
+        );
+        for (fn_id, file, range_start, name) in &timed_out_fns {
+            let abs_path =
+                std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let uri = format!("file://{}", abs_path.display());
+            let lsp_line = (*range_start - 1).max(0) as u32;
+            let char_offset = fn_name_char_offset(file, *range_start, name);
+
+            match client.outgoing_calls(&uri, lsp_line, char_offset, retry_timeout) {
+                Ok(targets) => {
+                    recovered_on_retry += 1;
+                    for target in targets {
+                        let target_path = uri_to_path(&target.uri);
+                        let target_range_start = target.line as i64 + 1;
+                        if let Some(&to_id) =
+                            path_line_to_id.get(&(target_path, target_range_start))
+                        {
+                            trusted_edges.push((*fn_id, to_id));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.to_string().contains("timeout") {
+                        ultimately_failed.push(name.clone());
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     client.shutdown()?;
 
     let edge_count = trusted_edges.len();
@@ -1066,6 +1272,7 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
     tx.commit()?;
 
     // Apply inferred return-type enrichments to signatures
+    let sigs_enriched = sig_updates.len();
     if !sig_updates.is_empty() {
         let tx = conn.unchecked_transaction()?;
         {
@@ -1078,22 +1285,34 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<()
         tx.commit()?;
     }
 
-    eprintln!(
-        "LSP[ts]: done in {:.1}s — {} trusted edges, {} signatures enriched",
-        t_start.elapsed().as_secs_f32(),
-        edge_count,
-        sig_updates.len()
-    );
-
-    Ok(())
+    Ok(EnrichReport {
+        language: language.to_string(),
+        elapsed_secs: t_start.elapsed().as_secs_f32(),
+        edges_inserted: edge_count,
+        fns_queried: fn_nodes.len(),
+        sigs_enriched,
+        recovered_on_retry,
+        ultimately_failed,
+        crashes: 0,
+    })
 }
 
-fn enrich_svelte(conn: &Connection, root: &str) -> Result<()> {
+fn enrich_svelte(conn: &Connection, root: &str) -> Result<EnrichReport> {
+    let t_start = Instant::now();
     let sv = match which_svelteserver() {
         Some(path) => path,
         None => {
             warn!("LSP: svelteserver not found in PATH or bun bin, skipping enrichment");
-            return Ok(());
+            return Ok(EnrichReport {
+                language: "svelte".to_string(),
+                elapsed_secs: 0.0,
+                edges_inserted: 0,
+                fns_queried: 0,
+                sigs_enriched: 0,
+                recovered_on_retry: 0,
+                ultimately_failed: Vec::new(),
+                crashes: 0,
+            });
         }
     };
 
@@ -1148,9 +1367,21 @@ fn enrich_svelte(conn: &Connection, root: &str) -> Result<()> {
         "LSP[svelte]: opened {} file(s), waiting for diagnostics...",
         pending.len()
     );
-    client.wait_for_diagnostics(pending, 60);
+    let not_ready = client.wait_for_diagnostics(pending, 60);
+    if !not_ready.is_empty() {
+        warn!(
+            "LSP[svelte]: {} file(s) never got diagnostics, enrichment may be incomplete",
+            not_ready.len()
+        );
+        for uri in &not_ready {
+            warn!("LSP[svelte]:   {}", uri);
+        }
+    }
 
+    let ch_timeout = Duration::from_secs(5);
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
+    let mut calls_timeout = 0usize;
+    let mut timed_out_fns: Vec<(i64, String, i64, String)> = Vec::new();
 
     for (fn_id, file, range_start, name) in &fn_nodes {
         let abs_path =
@@ -1159,9 +1390,17 @@ fn enrich_svelte(conn: &Connection, root: &str) -> Result<()> {
         let lsp_line = (*range_start - 1).max(0) as u32;
         let char_offset = fn_name_char_offset(file, *range_start, name);
 
-        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset) {
+        let targets = match client.outgoing_calls(&uri, lsp_line, char_offset, ch_timeout) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                if e.to_string().contains("timeout") {
+                    calls_timeout += 1;
+                    timed_out_fns.push((*fn_id, file.clone(), *range_start, name.clone()));
+                } else {
+                    return Err(e);
+                }
+                continue;
+            }
         };
 
         for target in targets {
@@ -1169,6 +1408,51 @@ fn enrich_svelte(conn: &Connection, root: &str) -> Result<()> {
             let target_range_start = target.line as i64 + 1;
             if let Some(&to_id) = path_line_to_id.get(&(target_path, target_range_start)) {
                 trusted_edges.push((*fn_id, to_id));
+            }
+        }
+    }
+
+    if calls_timeout > 0 {
+        eprintln!("LSP[svelte]: {} timeout(s) in call hierarchy", calls_timeout);
+    }
+
+    // Retry phase
+    let mut recovered_on_retry = 0usize;
+    let mut ultimately_failed: Vec<String> = Vec::new();
+    if !timed_out_fns.is_empty() {
+        let retry_timeout = ch_timeout * 3;
+        eprintln!(
+            "LSP[svelte]: retrying {} timed-out function(s) at {}s timeout...",
+            timed_out_fns.len(),
+            retry_timeout.as_secs()
+        );
+        for (fn_id, file, range_start, name) in &timed_out_fns {
+            let abs_path =
+                std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let uri = format!("file://{}", abs_path.display());
+            let lsp_line = (*range_start - 1).max(0) as u32;
+            let char_offset = fn_name_char_offset(file, *range_start, name);
+
+            match client.outgoing_calls(&uri, lsp_line, char_offset, retry_timeout) {
+                Ok(targets) => {
+                    recovered_on_retry += 1;
+                    for target in targets {
+                        let target_path = uri_to_path(&target.uri);
+                        let target_range_start = target.line as i64 + 1;
+                        if let Some(&to_id) =
+                            path_line_to_id.get(&(target_path, target_range_start))
+                        {
+                            trusted_edges.push((*fn_id, to_id));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.to_string().contains("timeout") {
+                        ultimately_failed.push(name.clone());
+                    } else {
+                        return Err(e);
+                    }
+                }
             }
         }
     }
@@ -1188,6 +1472,14 @@ fn enrich_svelte(conn: &Connection, root: &str) -> Result<()> {
     }
     tx.commit()?;
 
-    eprintln!("LSP: inserted {} trusted edges (svelte-language-server)", edge_count);
-    Ok(())
+    Ok(EnrichReport {
+        language: "svelte".to_string(),
+        elapsed_secs: t_start.elapsed().as_secs_f32(),
+        edges_inserted: edge_count,
+        fns_queried: fn_nodes.len(),
+        sigs_enriched: 0,
+        recovered_on_retry,
+        ultimately_failed,
+        crashes: 0,
+    })
 }

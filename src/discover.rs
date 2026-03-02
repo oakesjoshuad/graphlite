@@ -197,7 +197,10 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
         detect_lsp_from_files(&files)
     };
     for lang in &effective_lsp {
-        lsp::enrich(&conn, root, lang)?;
+        match lsp::enrich(&conn, root, lang) {
+            Ok(report) => eprintln!("{}", report),
+            Err(e) => eprintln!("LSP[{}]: enrichment failed: {}", lang, e),
+        }
     }
 
     roles::infer_roles(&conn)?;
