@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::thread;
 use walkdir::WalkDir;
+use crossbeam_channel;
 
 use crate::{
     config,
@@ -211,11 +212,68 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
         db_path
     );
 
-    for (lang, handle) in warm_handles {
-        let pre_warmed = handle.join().ok().flatten();
-        match lsp::enrich(&conn, root, &lang, pre_warmed) {
-            Ok(report) => eprintln!("{}", report),
-            Err(e) => eprintln!("LSP[{}]: enrichment failed: {}", lang, e),
+    // Spawn one enricher thread per language; they run in parallel.
+    // Edges are funneled through a channel to a single writer in the main thread.
+    let (edge_tx, edge_rx) = crossbeam_channel::unbounded::<lsp::EdgeMsg>();
+
+    let enricher_handles: Vec<(String, thread::JoinHandle<anyhow::Result<lsp::EnrichReport>>)> =
+        warm_handles
+            .into_iter()
+            .map(|(lang, warm_handle)| {
+                let db_path_clone = db_path.clone();
+                let root_clone = root_owned.clone();
+                let tx_clone = edge_tx.clone();
+                let lang_clone = lang.clone();
+                let h = thread::spawn(move || {
+                    let pre_warmed = warm_handle.join().ok().flatten();
+                    lsp::enrich_parallel(&db_path_clone, &root_clone, &lang_clone, pre_warmed, tx_clone)
+                });
+                (lang, h)
+            })
+            .collect();
+
+    // Drop our sender so the channel closes when all enricher threads finish.
+    drop(edge_tx);
+
+    // Drain the channel and write to the DB on the main thread (owns conn).
+    {
+        let mut edges: Vec<(i64, i64, &'static str, &'static str)> = Vec::new();
+        let mut sigs: Vec<(i64, String)> = Vec::new();
+        while let Ok(msg) = edge_rx.recv() {
+            match msg {
+                lsp::EdgeMsg::Edge { from_id, to_id, edge_type, source } => {
+                    edges.push((from_id, to_id, edge_type, source));
+                }
+                lsp::EdgeMsg::SigUpdate { node_id, sig } => {
+                    sigs.push((node_id, sig));
+                }
+            }
+        }
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
+                 VALUES (?1, ?2, ?3, ?4, 1.0)",
+            )?;
+            for (from_id, to_id, edge_type, source) in &edges {
+                stmt.execute(rusqlite::params![from_id, to_id, edge_type, source])?;
+            }
+        }
+        if !sigs.is_empty() {
+            let mut stmt =
+                tx.prepare_cached("UPDATE nodes SET signature = ?1 WHERE id = ?2")?;
+            for (node_id, sig) in &sigs {
+                stmt.execute(rusqlite::params![sig, node_id])?;
+            }
+        }
+        tx.commit()?;
+    }
+
+    for (lang, handle) in enricher_handles {
+        match handle.join() {
+            Ok(Ok(report)) => eprintln!("{}", report),
+            Ok(Err(e)) => eprintln!("LSP[{}]: enrichment failed: {}", lang, e),
+            Err(_) => eprintln!("LSP[{}]: enricher thread panicked", lang),
         }
     }
 

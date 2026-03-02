@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use crossbeam_channel::RecvTimeoutError;
+use crossbeam_channel::{RecvTimeoutError, Sender};
 use log::{debug, warn};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -24,6 +24,8 @@ pub struct LspLanguageConfig {
     pub edge_source: &'static str,
     pub has_quiescent_signal: bool,
     pub needs_did_open: bool,
+    /// Server emits `$/typescriptVersion` once it is ready to handle requests.
+    pub ts_version_signal: bool,
 }
 
 pub const LANGUAGE_CONFIGS: &[LspLanguageConfig] = &[
@@ -35,6 +37,7 @@ pub const LANGUAGE_CONFIGS: &[LspLanguageConfig] = &[
         edge_source: "rust-analyzer",
         has_quiescent_signal: true,
         needs_did_open: false,
+        ts_version_signal: false,
     },
     LspLanguageConfig {
         language: "typescript",
@@ -44,6 +47,7 @@ pub const LANGUAGE_CONFIGS: &[LspLanguageConfig] = &[
         edge_source: "typescript-language-server",
         has_quiescent_signal: false,
         needs_did_open: true,
+        ts_version_signal: true,
     },
     LspLanguageConfig {
         language: "javascript",
@@ -53,6 +57,7 @@ pub const LANGUAGE_CONFIGS: &[LspLanguageConfig] = &[
         edge_source: "typescript-language-server",
         has_quiescent_signal: false,
         needs_did_open: true,
+        ts_version_signal: true,
     },
     LspLanguageConfig {
         language: "svelte",
@@ -62,6 +67,7 @@ pub const LANGUAGE_CONFIGS: &[LspLanguageConfig] = &[
         edge_source: "svelte-language-server",
         has_quiescent_signal: false,
         needs_did_open: true,
+        ts_version_signal: true,
     },
     // Future — uncomment when tree-sitter grammar + queries/<lang>.scm are added:
     // LspLanguageConfig { language: "go", server_cmd: "gopls", server_args: &["serve"],
@@ -123,6 +129,20 @@ impl fmt::Display for EnrichReport {
         }
         Ok(())
     }
+}
+
+/// Messages sent from enricher threads to the single writer thread.
+pub enum EdgeMsg {
+    Edge {
+        from_id: i64,
+        to_id: i64,
+        edge_type: &'static str,
+        source: &'static str,
+    },
+    SigUpdate {
+        node_id: i64,
+        sig: String,
+    },
 }
 
 pub struct LspClient {
@@ -257,75 +277,6 @@ impl LspClient {
                 }
             }),
         )
-    }
-
-    // Wait until textDocument/publishDiagnostics has been received for every URI
-    // in `pending`, then return. If the deadline expires first, logs the stuck
-    // URIs at warn level and returns whatever is still pending — callers use
-    // this to understand which files the server struggled with.
-    //
-    // Drains notification_buf first so diagnostics buffered during initialize()
-    // are not missed.
-    pub fn wait_for_diagnostics(
-        &mut self,
-        mut pending: std::collections::HashSet<String>,
-        timeout_secs: u64,
-    ) -> std::collections::HashSet<String> {
-        // Drain any notifications already buffered during initialize/wait_for_ready
-        let buffered = std::mem::take(&mut self.notification_buf);
-        for msg in buffered {
-            if let Some(uri) = diagnostics_uri(&msg) {
-                pending.remove(uri);
-            }
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        loop {
-            if pending.is_empty() {
-                return pending;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                warn!(
-                    "LSP: timed out waiting for diagnostics; {} file(s) did not report back:",
-                    pending.len()
-                );
-                for uri in &pending {
-                    warn!("  {}", uri);
-                }
-                return pending;
-            }
-            match self.read_message_timeout(remaining) {
-                // Disconnect: treat as deadline expiry — return whatever is still pending.
-                Err(_) | Ok(None) => return pending,
-                Ok(Some(lsp_server::Message::Request(req))) => {
-                    // Ack server-to-client requests so the server doesn't stall.
-                    let reply = lsp_server::Response {
-                        id: req.id,
-                        result: Some(Value::Null),
-                        error: None,
-                    };
-                    let _ = self
-                        .connection
-                        .sender
-                        .send(lsp_server::Message::Response(reply));
-                }
-                Ok(Some(msg)) => {
-                    if let Some(uri) = diagnostics_uri(&msg) {
-                        let uri = uri.to_string();
-                        let was_pending = pending.remove(&uri);
-                        debug!(
-                            "LSP: diagnostics for {} (pending: {})",
-                            uri,
-                            pending.len()
-                        );
-                        if was_pending && pending.is_empty() {
-                            return pending;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // Send a request and wait for the matching response within 10 seconds.
@@ -463,6 +414,42 @@ impl LspClient {
         }
     }
 
+    // Poll for $/typescriptVersion notification, which typescript-language-server
+    // and svelteserver emit once they are ready to serve requests. Drains buffered
+    // notifications first, then waits up to timeout_secs for the signal.
+    pub fn wait_for_ts_ready(&mut self, timeout_secs: u64) -> Result<()> {
+        let buffered = std::mem::take(&mut self.notification_buf);
+        for msg in buffered {
+            if is_ts_version_signal(&msg) {
+                return Ok(());
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                debug!("LSP: timeout waiting for $/typescriptVersion, proceeding");
+                return Ok(());
+            }
+            match self.read_message_timeout(remaining) {
+                Err(_) | Ok(None) => {
+                    debug!("LSP: timeout or disconnect waiting for $/typescriptVersion, proceeding");
+                    return Ok(());
+                }
+                Ok(Some(msg)) => {
+                    if is_ts_version_signal(&msg) {
+                        debug!("LSP: ready ($/typescriptVersion)");
+                        return Ok(());
+                    }
+                    if let lsp_server::Message::Notification(_) = msg {
+                        self.notification_buf.push(msg);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn outgoing_calls(
         &mut self,
         uri: &str,
@@ -570,13 +557,12 @@ fn is_quiescent(msg: &lsp_server::Message) -> bool {
     }
 }
 
-fn diagnostics_uri(msg: &lsp_server::Message) -> Option<&str> {
+fn is_ts_version_signal(msg: &lsp_server::Message) -> bool {
     if let lsp_server::Message::Notification(n) = msg {
-        if n.method == "textDocument/publishDiagnostics" {
-            return n.params["uri"].as_str();
-        }
+        n.method == "$/typescriptVersion"
+    } else {
+        false
     }
-    None
 }
 
 // Flatten an inlay hint label (string or array of InlayHintLabelPart) to a plain string.
@@ -655,14 +641,6 @@ pub fn which_server_for_language(language: &str) -> Option<String> {
 
 pub(crate) fn which_rust_analyzer() -> Option<String> {
     which_server_for_language("rust")
-}
-
-pub(crate) fn which_typescript_language_server() -> Option<String> {
-    which_server_for_language("typescript")
-}
-
-pub(crate) fn which_svelteserver() -> Option<String> {
-    which_server_for_language("svelte")
 }
 
 pub(crate) fn which_server(name: &str) -> Option<String> {
@@ -757,21 +735,36 @@ pub fn warm_client(language: &str, root: &str) -> Result<LspClient> {
     if config.has_quiescent_signal {
         client.wait_for_ready(60)?;
         eprintln!("LSP[{}]: server ready ({:.1}s)", language, t.elapsed().as_secs_f32());
+    } else if config.ts_version_signal {
+        client.wait_for_ts_ready(60)?;
+        eprintln!("LSP[{}]: server ready ({:.1}s)", language, t.elapsed().as_secs_f32());
     }
     Ok(client)
 }
 
-fn do_enrich(conn: &Connection, root: &str, language: &str, client: Option<LspClient>) -> Result<EnrichReport> {
+fn do_enrich(db_path: &str, root: &str, language: &str, client: Option<LspClient>, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
     match language {
         "rust" => {
             let c = match client {
                 Some(c) => c,
                 None => warm_client("rust", root)?,
             };
-            enrich_rust(conn, root, c)
+            enrich_rust(db_path, root, c, edge_tx)
         }
-        "typescript" | "javascript" => enrich_typescript(conn, root, language),
-        "svelte" => enrich_svelte(conn, root),
+        "typescript" | "javascript" => {
+            let c = match client {
+                Some(c) => c,
+                None => warm_client(language, root)?,
+            };
+            enrich_typescript(db_path, root, language, c, edge_tx)
+        }
+        "svelte" => {
+            let c = match client {
+                Some(c) => c,
+                None => warm_client("svelte", root)?,
+            };
+            enrich_svelte(db_path, root, c, edge_tx)
+        }
         _ => Ok(EnrichReport {
             language: language.to_string(),
             elapsed_secs: 0.0,
@@ -785,7 +778,7 @@ fn do_enrich(conn: &Connection, root: &str, language: &str, client: Option<LspCl
     }
 }
 
-fn enrich_with_retry(conn: &Connection, root: &str, language: &str, pre_warmed: Option<LspClient>) -> Result<EnrichReport> {
+fn enrich_with_retry(db_path: &str, root: &str, language: &str, pre_warmed: Option<LspClient>, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = None;
     let mut crashes: u32 = 0;
@@ -799,7 +792,7 @@ fn enrich_with_retry(conn: &Connection, root: &str, language: &str, pre_warmed: 
             );
             std::thread::sleep(Duration::from_secs(attempt as u64));
         }
-        match do_enrich(conn, root, language, first_client.take()) {
+        match do_enrich(db_path, root, language, first_client.take(), edge_tx) {
             Ok(mut report) => {
                 report.crashes = crashes;
                 return Ok(report);
@@ -813,10 +806,12 @@ fn enrich_with_retry(conn: &Connection, root: &str, language: &str, pre_warmed: 
     Err(last_err.unwrap())
 }
 
-pub fn enrich(conn: &Connection, root: &str, language: &str, pre_warmed: Option<LspClient>) -> Result<EnrichReport> {
+/// Called from a dedicated thread per language. The caller owns the channel
+/// sender; dropping it signals the writer thread that this enricher is done.
+pub fn enrich_parallel(db_path: &str, root: &str, language: &str, pre_warmed: Option<LspClient>, edge_tx: Sender<EdgeMsg>) -> Result<EnrichReport> {
     match language {
         "rust" | "typescript" | "javascript" | "svelte" => {
-            enrich_with_retry(conn, root, language, pre_warmed)
+            enrich_with_retry(db_path, root, language, pre_warmed, &edge_tx)
         }
         _ => {
             warn!("LSP: no enrichment support for '{}', skipping", language);
@@ -838,8 +833,9 @@ pub fn enrich(conn: &Connection, root: &str, language: &str, pre_warmed: Option<
 // Language-specific enrichment implementations
 // ---------------------------------------------------------------------------
 
-fn enrich_rust(conn: &Connection, _root: &str, mut client: LspClient) -> Result<EnrichReport> {
+fn enrich_rust(db_path: &str, _root: &str, mut client: LspClient, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
     let t_start = Instant::now();
+    let conn = Connection::open(db_path)?;
 
     // Build (canonical_path, range_start) -> node_id index for fast target lookup
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
@@ -998,17 +994,16 @@ fn enrich_rust(conn: &Connection, _root: &str, mut client: LspClient) -> Result<
     client.shutdown()?;
 
     let edge_count = trusted_edges.len();
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
-             VALUES (?1, ?2, ?3, 'rust-analyzer', 1.0)",
-        )?;
-        for (from_id, to_id, edge_type) in &trusted_edges {
-            stmt.execute(rusqlite::params![from_id, to_id, edge_type])?;
-        }
+    for (from_id, to_id, edge_type) in &trusted_edges {
+        edge_tx
+            .send(EdgeMsg::Edge {
+                from_id: *from_id,
+                to_id: *to_id,
+                edge_type,
+                source: "rust-analyzer",
+            })
+            .map_err(|_| anyhow!("LSP writer closed"))?;
     }
-    tx.commit()?;
 
     Ok(EnrichReport {
         language: "rust".to_string(),
@@ -1022,42 +1017,9 @@ fn enrich_rust(conn: &Connection, _root: &str, mut client: LspClient) -> Result<
     })
 }
 
-fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<EnrichReport> {
-    let ts = match which_typescript_language_server() {
-        Some(path) => path,
-        None => {
-            warn!("LSP: typescript-language-server not found in PATH, skipping enrichment");
-            return Ok(EnrichReport {
-                language: language.to_string(),
-                elapsed_secs: 0.0,
-                edges_inserted: 0,
-                fns_queried: 0,
-                sigs_enriched: 0,
-                recovered_on_retry: 0,
-                ultimately_failed: Vec::new(),
-                crashes: 0,
-            });
-        }
-    };
-
+fn enrich_typescript(db_path: &str, _root: &str, language: &str, mut client: LspClient, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
     let t_start = Instant::now();
-
-    let mut client = LspClient::spawn(&ts, &["--stdio"], root)?;
-    client.initialize(Some(json!({
-        "preferences": {
-            "includeInlayParameterNameHints": "all",
-            "includeInlayParameterNameHintsWhenArgumentMatchesName": true,
-            "includeInlayFunctionParameterTypeHints": true,
-            "includeInlayVariableTypeHints": true,
-            "includeInlayVariableTypeHintsWhenTypeMatchesName": false,
-            "includeInlayPropertyDeclarationTypeHints": true,
-            "includeInlayFunctionLikeReturnTypeHints": true,
-            "includeInlayEnumMemberValueHints": true
-        }
-    })))?;
-    eprintln!("LSP[ts]: initialized ({:.1}s)", t_start.elapsed().as_secs_f32());
-    // No wait_for_ready — tsls has no quiescent signal and notification_buf
-    // is drained by wait_for_diagnostics before the call hierarchy loop.
+    let conn = Connection::open(db_path)?;
 
     // Build (canonical_path, range_start) -> node_id index
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
@@ -1110,24 +1072,8 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<En
             }
         }
     }
-    // Snapshot opened URIs before wait_for_diagnostics consumes the set
-    let opened_uris: Vec<String> = pending.iter().cloned().collect();
-    eprintln!(
-        "LSP[ts]: opened {} file(s), waiting for diagnostics...",
-        pending.len()
-    );
-    let t_diag = Instant::now();
-    let not_ready = client.wait_for_diagnostics(pending, 60);
-    if !not_ready.is_empty() {
-        warn!(
-            "LSP[ts]: {} file(s) never got diagnostics, enrichment may be incomplete",
-            not_ready.len()
-        );
-        for uri in &not_ready {
-            warn!("LSP[ts]:   {}", uri);
-        }
-    }
-    eprintln!("LSP[ts]: diagnostics done ({:.1}s)", t_diag.elapsed().as_secs_f32());
+    let opened_uris: Vec<String> = pending.into_iter().collect();
+    eprintln!("LSP[ts]: opened {} file(s)", opened_uris.len());
 
     // Build per-URI index: uri -> [(node_id, lsp_line_0indexed, current_signature)]
     // Used to match return type hints back to fn nodes.
@@ -1290,30 +1236,22 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<En
     client.shutdown()?;
 
     let edge_count = trusted_edges.len();
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
-             VALUES (?1, ?2, 'CALLS_TRUSTED', 'typescript-language-server', 1.0)",
-        )?;
-        for (from_id, to_id) in &trusted_edges {
-            stmt.execute(rusqlite::params![from_id, to_id])?;
-        }
+    for (from_id, to_id) in &trusted_edges {
+        edge_tx
+            .send(EdgeMsg::Edge {
+                from_id: *from_id,
+                to_id: *to_id,
+                edge_type: "CALLS_TRUSTED",
+                source: "typescript-language-server",
+            })
+            .map_err(|_| anyhow!("LSP writer closed"))?;
     }
-    tx.commit()?;
 
-    // Apply inferred return-type enrichments to signatures
     let sigs_enriched = sig_updates.len();
-    if !sig_updates.is_empty() {
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt =
-                tx.prepare_cached("UPDATE nodes SET signature = ?1 WHERE id = ?2")?;
-            for (node_id, new_sig) in &sig_updates {
-                stmt.execute(rusqlite::params![new_sig, node_id])?;
-            }
-        }
-        tx.commit()?;
+    for (node_id, sig) in sig_updates {
+        edge_tx
+            .send(EdgeMsg::SigUpdate { node_id, sig })
+            .map_err(|_| anyhow!("LSP writer closed"))?;
     }
 
     Ok(EnrichReport {
@@ -1328,29 +1266,9 @@ fn enrich_typescript(conn: &Connection, root: &str, language: &str) -> Result<En
     })
 }
 
-fn enrich_svelte(conn: &Connection, root: &str) -> Result<EnrichReport> {
+fn enrich_svelte(db_path: &str, _root: &str, mut client: LspClient, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
     let t_start = Instant::now();
-    let sv = match which_svelteserver() {
-        Some(path) => path,
-        None => {
-            warn!("LSP: svelteserver not found in PATH or bun bin, skipping enrichment");
-            return Ok(EnrichReport {
-                language: "svelte".to_string(),
-                elapsed_secs: 0.0,
-                edges_inserted: 0,
-                fns_queried: 0,
-                sigs_enriched: 0,
-                recovered_on_retry: 0,
-                ultimately_failed: Vec::new(),
-                crashes: 0,
-            });
-        }
-    };
-
-    let mut client = LspClient::spawn(&sv, &["--stdio"], root)?;
-    client.initialize(None)?;
-    // No wait_for_ready — svelteserver has no quiescent signal and notification_buf
-    // is drained by wait_for_diagnostics before the call hierarchy loop.
+    let conn = Connection::open(db_path)?;
 
     // Build (canonical_path, range_start) -> node_id index
     let mut path_line_to_id: HashMap<(String, i64), i64> = HashMap::new();
@@ -1394,20 +1312,7 @@ fn enrich_svelte(conn: &Connection, root: &str) -> Result<EnrichReport> {
             }
         }
     }
-    eprintln!(
-        "LSP[svelte]: opened {} file(s), waiting for diagnostics...",
-        pending.len()
-    );
-    let not_ready = client.wait_for_diagnostics(pending, 60);
-    if !not_ready.is_empty() {
-        warn!(
-            "LSP[svelte]: {} file(s) never got diagnostics, enrichment may be incomplete",
-            not_ready.len()
-        );
-        for uri in &not_ready {
-            warn!("LSP[svelte]:   {}", uri);
-        }
-    }
+    eprintln!("LSP[svelte]: opened {} file(s)", pending.len());
 
     let ch_timeout = Duration::from_secs(5);
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
@@ -1491,17 +1396,16 @@ fn enrich_svelte(conn: &Connection, root: &str) -> Result<EnrichReport> {
     client.shutdown()?;
 
     let edge_count = trusted_edges.len();
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
-             VALUES (?1, ?2, 'CALLS_TRUSTED', 'svelte-language-server', 1.0)",
-        )?;
-        for (from_id, to_id) in &trusted_edges {
-            stmt.execute(rusqlite::params![from_id, to_id])?;
-        }
+    for (from_id, to_id) in &trusted_edges {
+        edge_tx
+            .send(EdgeMsg::Edge {
+                from_id: *from_id,
+                to_id: *to_id,
+                edge_type: "CALLS_TRUSTED",
+                source: "svelte-language-server",
+            })
+            .map_err(|_| anyhow!("LSP writer closed"))?;
     }
-    tx.commit()?;
 
     Ok(EnrichReport {
         language: "svelte".to_string(),
