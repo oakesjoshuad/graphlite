@@ -109,7 +109,8 @@ impl fmt::Display for EnrichReport {
             self.language,
             self.elapsed_secs,
             self.edges_inserted,
-            self.fns_queried.saturating_sub(self.ultimately_failed.len()),
+            self.fns_queried
+                .saturating_sub(self.ultimately_failed.len()),
             self.fns_queried,
             self.sigs_enriched,
         )?;
@@ -179,11 +180,9 @@ impl LspClient {
             .ok_or_else(|| anyhow!("no stdout on child process"))?;
 
         // Outgoing: main thread → writer thread → child stdin
-        let (outgoing_tx, outgoing_rx) =
-            crossbeam_channel::bounded::<lsp_server::Message>(16);
+        let (outgoing_tx, outgoing_rx) = crossbeam_channel::bounded::<lsp_server::Message>(16);
         // Incoming: reader thread → main thread
-        let (incoming_tx, incoming_rx) =
-            crossbeam_channel::bounded::<lsp_server::Message>(16);
+        let (incoming_tx, incoming_rx) = crossbeam_channel::bounded::<lsp_server::Message>(16);
 
         // Writer thread: drain outgoing channel, write each message to child stdin.
         // lsp_server::Message::write() handles Content-Length framing.
@@ -239,10 +238,12 @@ impl LspClient {
     fn send_notification(&mut self, method: &str, params: Value) -> Result<()> {
         self.connection
             .sender
-            .send(lsp_server::Message::Notification(lsp_server::Notification {
-                method: method.to_string(),
-                params,
-            }))
+            .send(lsp_server::Message::Notification(
+                lsp_server::Notification {
+                    method: method.to_string(),
+                    params,
+                },
+            ))
             .map_err(|e| anyhow!("LSP send failed (server crashed?): {}", e))?;
         Ok(())
     }
@@ -302,11 +303,7 @@ impl LspClient {
                 Some(lsp_server::Message::Response(resp)) => {
                     if resp.id == lsp_server::RequestId::from(id as i32) {
                         if let Some(err) = resp.error {
-                            return Err(anyhow!(
-                                "LSP error for '{}': {:?}",
-                                method,
-                                err
-                            ));
+                            return Err(anyhow!("LSP error for '{}': {:?}", method, err));
                         }
                         return Ok(resp.result.unwrap_or(Value::Null));
                     }
@@ -434,7 +431,9 @@ impl LspClient {
             }
             match self.read_message_timeout(remaining) {
                 Err(_) | Ok(None) => {
-                    debug!("LSP: timeout or disconnect waiting for $/typescriptVersion, proceeding");
+                    debug!(
+                        "LSP: timeout or disconnect waiting for $/typescriptVersion, proceeding"
+                    );
                     return Ok(());
                 }
                 Ok(Some(msg)) => {
@@ -550,8 +549,7 @@ impl LspClient {
 
 fn is_quiescent(msg: &lsp_server::Message) -> bool {
     if let lsp_server::Message::Notification(n) = msg {
-        n.method == "experimental/serverStatus"
-            && n.params["quiescent"].as_bool() == Some(true)
+        n.method == "experimental/serverStatus" && n.params["quiescent"].as_bool() == Some(true)
     } else {
         false
     }
@@ -620,8 +618,7 @@ fn return_type_hint_on_line(hints: &[Value], lsp_line: u32) -> Option<String> {
     hints
         .iter()
         .filter(|h| {
-            h["kind"].as_u64() == Some(1)
-                && h["position"]["line"].as_u64() == Some(lsp_line as u64)
+            h["kind"].as_u64() == Some(1) && h["position"]["line"].as_u64() == Some(lsp_line as u64)
         })
         .max_by_key(|h| h["position"]["character"].as_u64().unwrap_or(0))
         .map(|h| inlay_label_str(&h["label"]))
@@ -731,18 +728,36 @@ pub fn warm_client(language: &str, root: &str) -> Result<LspClient> {
         .ok_or_else(|| anyhow!("LSP server '{}' not found in PATH", config.server_cmd))?;
     let mut client = LspClient::spawn(&server, config.server_args, root)?;
     client.initialize(None)?;
-    eprintln!("LSP[{}]: initialized ({:.1}s)", language, t.elapsed().as_secs_f32());
+    eprintln!(
+        "LSP[{}]: initialized ({:.1}s)",
+        language,
+        t.elapsed().as_secs_f32()
+    );
     if config.has_quiescent_signal {
         client.wait_for_ready(60)?;
-        eprintln!("LSP[{}]: server ready ({:.1}s)", language, t.elapsed().as_secs_f32());
+        eprintln!(
+            "LSP[{}]: server ready ({:.1}s)",
+            language,
+            t.elapsed().as_secs_f32()
+        );
     } else if config.ts_version_signal {
         client.wait_for_ts_ready(60)?;
-        eprintln!("LSP[{}]: server ready ({:.1}s)", language, t.elapsed().as_secs_f32());
+        eprintln!(
+            "LSP[{}]: server ready ({:.1}s)",
+            language,
+            t.elapsed().as_secs_f32()
+        );
     }
     Ok(client)
 }
 
-fn do_enrich(db_path: &str, root: &str, language: &str, client: Option<LspClient>, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
+fn do_enrich(
+    db_path: &str,
+    root: &str,
+    language: &str,
+    client: Option<LspClient>,
+    edge_tx: &Sender<EdgeMsg>,
+) -> Result<EnrichReport> {
     match language {
         "rust" => {
             let c = match client {
@@ -778,7 +793,13 @@ fn do_enrich(db_path: &str, root: &str, language: &str, client: Option<LspClient
     }
 }
 
-fn enrich_with_retry(db_path: &str, root: &str, language: &str, pre_warmed: Option<LspClient>, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
+fn enrich_with_retry(
+    db_path: &str,
+    root: &str,
+    language: &str,
+    pre_warmed: Option<LspClient>,
+    edge_tx: &Sender<EdgeMsg>,
+) -> Result<EnrichReport> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = None;
     let mut crashes: u32 = 0;
@@ -808,7 +829,13 @@ fn enrich_with_retry(db_path: &str, root: &str, language: &str, pre_warmed: Opti
 
 /// Called from a dedicated thread per language. The caller owns the channel
 /// sender; dropping it signals the writer thread that this enricher is done.
-pub fn enrich_parallel(db_path: &str, root: &str, language: &str, pre_warmed: Option<LspClient>, edge_tx: Sender<EdgeMsg>) -> Result<EnrichReport> {
+pub fn enrich_parallel(
+    db_path: &str,
+    root: &str,
+    language: &str,
+    pre_warmed: Option<LspClient>,
+    edge_tx: Sender<EdgeMsg>,
+) -> Result<EnrichReport> {
     match language {
         "rust" | "typescript" | "javascript" | "svelte" => {
             enrich_with_retry(db_path, root, language, pre_warmed, &edge_tx)
@@ -833,7 +860,12 @@ pub fn enrich_parallel(db_path: &str, root: &str, language: &str, pre_warmed: Op
 // Language-specific enrichment implementations
 // ---------------------------------------------------------------------------
 
-fn enrich_rust(db_path: &str, _root: &str, mut client: LspClient, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
+fn enrich_rust(
+    db_path: &str,
+    _root: &str,
+    mut client: LspClient,
+    edge_tx: &Sender<EdgeMsg>,
+) -> Result<EnrichReport> {
     let t_start = Instant::now();
     let conn = Connection::open(db_path)?;
 
@@ -859,15 +891,19 @@ fn enrich_rust(db_path: &str, _root: &str, mut client: LspClient, edge_tx: &Send
 
     // Query all fn nodes to drive call hierarchy requests
     let fn_nodes: Vec<(i64, String, i64, String)> = {
-        let mut stmt =
-            conn.prepare("SELECT id, file, range_start, name FROM nodes WHERE kind = 'fn' AND language = 'rust'")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file, range_start, name FROM nodes WHERE kind = 'fn' AND language = 'rust'",
+        )?;
         let result = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         result
     };
 
-    eprintln!("LSP[rust]: querying call hierarchy for {} fn nodes...", fn_nodes.len());
+    eprintln!(
+        "LSP[rust]: querying call hierarchy for {} fn nodes...",
+        fn_nodes.len()
+    );
     let t_ch = Instant::now();
 
     // Collect trusted CALLS_TRUSTED edges via LSP call hierarchy
@@ -1017,7 +1053,13 @@ fn enrich_rust(db_path: &str, _root: &str, mut client: LspClient, edge_tx: &Send
     })
 }
 
-fn enrich_typescript(db_path: &str, _root: &str, language: &str, mut client: LspClient, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
+fn enrich_typescript(
+    db_path: &str,
+    _root: &str,
+    language: &str,
+    mut client: LspClient,
+    edge_tx: &Sender<EdgeMsg>,
+) -> Result<EnrichReport> {
     let t_start = Instant::now();
     let conn = Connection::open(db_path)?;
 
@@ -1053,14 +1095,20 @@ fn enrich_typescript(db_path: &str, _root: &str, language: &str, mut client: Lsp
     let fn_nodes: Vec<(i64, String, i64, String, Option<String>)> = {
         let mut stmt = conn.prepare(&sql)?;
         let result = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         result
     };
 
     // Open all unique source files so the language server builds semantic models.
     // typescript-language-server is lazy: it only analyses files opened via didOpen.
-    let language_id = if language == "javascript" { "javascript" } else { "typescript" };
+    let language_id = if language == "javascript" {
+        "javascript"
+    } else {
+        "typescript"
+    };
     let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, file, _, _, _) in &fn_nodes {
         let abs_path =
@@ -1133,7 +1181,10 @@ fn enrich_typescript(db_path: &str, _root: &str, language: &str, mut client: Lsp
         sig_updates.len()
     );
 
-    eprintln!("LSP[ts]: querying call hierarchy for {} fn nodes...", fn_nodes.len());
+    eprintln!(
+        "LSP[ts]: querying call hierarchy for {} fn nodes...",
+        fn_nodes.len()
+    );
     let t_ch = Instant::now();
     let ch_timeout = Duration::from_secs(5);
     let mut trusted_edges: Vec<(i64, i64)> = Vec::new();
@@ -1266,7 +1317,12 @@ fn enrich_typescript(db_path: &str, _root: &str, language: &str, mut client: Lsp
     })
 }
 
-fn enrich_svelte(db_path: &str, _root: &str, mut client: LspClient, edge_tx: &Sender<EdgeMsg>) -> Result<EnrichReport> {
+fn enrich_svelte(
+    db_path: &str,
+    _root: &str,
+    mut client: LspClient,
+    edge_tx: &Sender<EdgeMsg>,
+) -> Result<EnrichReport> {
     let t_start = Instant::now();
     let conn = Connection::open(db_path)?;
 
@@ -1349,7 +1405,10 @@ fn enrich_svelte(db_path: &str, _root: &str, mut client: LspClient, edge_tx: &Se
     }
 
     if calls_timeout > 0 {
-        eprintln!("LSP[svelte]: {} timeout(s) in call hierarchy", calls_timeout);
+        eprintln!(
+            "LSP[svelte]: {} timeout(s) in call hierarchy",
+            calls_timeout
+        );
     }
 
     // Retry phase

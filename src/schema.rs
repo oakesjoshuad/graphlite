@@ -72,7 +72,10 @@ pub fn init_db(path: &str) -> Result<Connection> {
         fs::remove_file(path)?;
     }
     let conn = Connection::open(path)?;
-    conn.execute_batch(SCHEMA_SQL)?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;\n{}",
+        SCHEMA_SQL
+    ))?;
     Ok(conn)
 }
 
@@ -83,7 +86,9 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
         return init_db(path);
     }
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
+    )?;
     let has_files: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'",

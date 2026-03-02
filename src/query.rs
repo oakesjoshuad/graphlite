@@ -249,7 +249,11 @@ fn read_snippet(
     if let Some(max) = max_lines {
         if lines.len() > max {
             let truncated = lines[..max].join("\n");
-            return Some(format!("{}\n// \u{2026}{} more lines", truncated, lines.len() - max));
+            return Some(format!(
+                "{}\n// \u{2026}{} more lines",
+                truncated,
+                lines.len() - max
+            ));
         }
     }
     Some(lines.join("\n"))
@@ -414,7 +418,15 @@ pub fn graph(
 
         print!(
             "{}",
-            render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, snippets, max_snippet_lines)
+            render_graph_xml(
+                &conn,
+                &focus,
+                &neighbors,
+                edge_count,
+                snippets,
+                snippets,
+                max_snippet_lines
+            )
         );
     }
 
@@ -431,7 +443,12 @@ fn render_graph_xml(
     max_snippet_lines: Option<usize>,
 ) -> String {
     let snippet = if show_focus_snippet {
-        read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines)
+        read_snippet(
+            &focus.file,
+            focus.range_start,
+            focus.range_end,
+            max_snippet_lines,
+        )
     } else {
         None
     };
@@ -664,7 +681,12 @@ fn print_xml_trust_split(focus: &NodeRow, edges: &[EdgeInfo]) {
     print!("{}{}", header, body);
 }
 
-pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_lines: Option<usize>) -> Result<()> {
+pub fn blast_radius(
+    symbol: &str,
+    depth: usize,
+    snippets: bool,
+    max_snippet_lines: Option<usize>,
+) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
 
@@ -751,7 +773,14 @@ pub fn blast_radius(symbol: &str, depth: usize, snippets: bool, max_snippet_line
     Ok(())
 }
 
-pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, edit_mode: bool, max_snippet_lines: Option<usize>) -> Result<()> {
+pub fn context(
+    symbol: &str,
+    depth: usize,
+    blast_depth: usize,
+    snippets: bool,
+    edit_mode: bool,
+    max_snippet_lines: Option<usize>,
+) -> Result<()> {
     // edit_mode: signature+doc+annotation only on focus, no neighbor snippets, depth=1 each side
     let (snippets, depth, blast_depth, show_focus_snippet) = if edit_mode {
         (false, 1usize, 1usize, false)
@@ -842,7 +871,15 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, e
         rusqlite::params![root_id],
         |r| r.get(0),
     )?;
-    let graph_xml = render_graph_xml(&conn, &focus, &neighbors, edge_count, snippets, show_focus_snippet, max_snippet_lines);
+    let graph_xml = render_graph_xml(
+        &conn,
+        &focus,
+        &neighbors,
+        edge_count,
+        snippets,
+        show_focus_snippet,
+        max_snippet_lines,
+    );
 
     // --- blast radius (callers) ---
     let blast_limit = if blast_depth == 0 {
@@ -892,7 +929,14 @@ pub fn context(symbol: &str, depth: usize, blast_depth: usize, snippets: bool, e
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let blast_xml = render_blast_radius_xml(&conn, &focus, &dep_rows, snippets, show_focus_snippet, max_snippet_lines);
+    let blast_xml = render_blast_radius_xml(
+        &conn,
+        &focus,
+        &dep_rows,
+        snippets,
+        show_focus_snippet,
+        max_snippet_lines,
+    );
 
     // --- unified context document ---
     let total_tokens = (graph_xml.len() + blast_xml.len()) / 4;
@@ -917,7 +961,12 @@ fn render_blast_radius_xml(
     max_snippet_lines: Option<usize>,
 ) -> String {
     let snippet = if show_focus_snippet {
-        read_snippet(&focus.file, focus.range_start, focus.range_end, max_snippet_lines)
+        read_snippet(
+            &focus.file,
+            focus.range_start,
+            focus.range_end,
+            max_snippet_lines,
+        )
     } else {
         None
     };

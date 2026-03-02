@@ -3,6 +3,7 @@ mod config;
 mod discover;
 mod init_cmd;
 mod insert;
+mod ipc;
 mod language;
 mod lsp;
 mod parser;
@@ -10,6 +11,7 @@ mod query;
 mod refactor;
 mod roles;
 mod schema;
+mod watch;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -174,6 +176,20 @@ enum Commands {
         #[arg(long)]
         stale: bool,
     },
+    /// Watch a source tree for changes and re-index automatically
+    ///
+    /// Runs as a long-lived process. Listens on `.graphlite/watcher.sock` for IPC
+    /// from `graphlite annotate` and other clients. File changes trigger a fast
+    /// tree-sitter-only re-index (no LSP). Use `--lsp` to enable full LSP re-index
+    /// on demand via the socket `reindex` message.
+    Watch {
+        /// Root directory to watch (default: .)
+        #[arg(default_value = ".")]
+        root: String,
+        /// Enable full LSP re-index on Reindex messages (slow)
+        #[arg(long)]
+        lsp: bool,
+    },
     /// Show a high-level map of public symbols grouped by file, with hotspots by fan-in
     ///
     /// Orientation command — run this before any other query. Emits all public symbols grouped
@@ -228,7 +244,14 @@ fn main() -> Result<()> {
             max_snippet_lines,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
-            query::graph(&symbol, depth, &format, show_trust, !no_snippets, max_snippet_lines)?
+            query::graph(
+                &symbol,
+                depth,
+                &format,
+                show_trust,
+                !no_snippets,
+                max_snippet_lines,
+            )?
         }
         Commands::Symbols { query, language } => query::symbols(&query, language.as_deref())?,
         Commands::BlastRadius {
@@ -250,7 +273,14 @@ fn main() -> Result<()> {
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
             let blast_depth = blast_depth.unwrap_or(1);
-            query::context(&symbol, depth, blast_depth, !no_snippets, edit, max_snippet_lines)?
+            query::context(
+                &symbol,
+                depth,
+                blast_depth,
+                !no_snippets,
+                edit,
+                max_snippet_lines,
+            )?
         }
         Commands::Rename {
             symbol,
@@ -275,6 +305,7 @@ fn main() -> Result<()> {
             confidence,
         )?,
         Commands::Annotations { stale } => annotate::list_annotations(stale)?,
+        Commands::Watch { root, lsp } => watch::run(&root, lsp)?,
         Commands::Map {
             all,
             top,
@@ -283,7 +314,15 @@ fn main() -> Result<()> {
             all_edges,
             role,
             by_file,
-        } => query::map(all, top, with_docs, with_file_docs, all_edges, role.as_deref(), by_file)?,
+        } => query::map(
+            all,
+            top,
+            with_docs,
+            with_file_docs,
+            all_edges,
+            role.as_deref(),
+            by_file,
+        )?,
     }
 
     Ok(())

@@ -124,7 +124,12 @@ fn kind_from_node(node: &Node) -> &'static str {
 fn extract_signature(symbol_node: &Node, source: &str) -> Option<String> {
     let source_bytes = source.as_bytes();
 
-    let body_kinds = ["block", "statement_block", "declaration_block", "class_body"];
+    let body_kinds = [
+        "block",
+        "statement_block",
+        "declaration_block",
+        "class_body",
+    ];
 
     // Pass 1: body as a direct child (function_declaration, method_definition, etc.)
     let mut body_start: Option<usize> = None;
@@ -141,7 +146,11 @@ fn extract_signature(symbol_node: &Node, source: &str) -> Option<String> {
     // and pair nodes where the value is `(...) => { body }` — the statement_block
     // is a grandchild, invisible to pass 1.
     if body_start.is_none() {
-        let fn_wrapper_kinds = ["arrow_function", "function_expression", "generator_function"];
+        let fn_wrapper_kinds = [
+            "arrow_function",
+            "function_expression",
+            "generator_function",
+        ];
         let mut outer = symbol_node.walk();
         'outer: for child in symbol_node.children(&mut outer) {
             if fn_wrapper_kinds.contains(&child.kind()) {
@@ -462,8 +471,14 @@ fn extract_svelte_script_symbols(
             None => continue,
         };
 
-        let mut script_symbols =
-            extract_symbols(&ts_tree, raw_text, path, &ts_language, &ts_ts_lang, ts_query_src)?;
+        let mut script_symbols = extract_symbols(
+            &ts_tree,
+            raw_text,
+            path,
+            &ts_language,
+            &ts_ts_lang,
+            ts_query_src,
+        )?;
         for sym in &mut script_symbols {
             sym.range_start += script_start_row;
             sym.range_end += script_start_row;
@@ -471,8 +486,7 @@ fn extract_svelte_script_symbols(
         }
         all_symbols.extend(script_symbols);
 
-        let script_edges =
-            extract_edges(&ts_tree, raw_text, path, &ts_ts_lang, ts_query_src)?;
+        let script_edges = extract_edges(&ts_tree, raw_text, path, &ts_ts_lang, ts_query_src)?;
         all_edges.extend(script_edges);
     }
 

@@ -39,6 +39,23 @@ impl Default for Config {
     }
 }
 
+/// Walk up from `start` looking for a `.graphlite/` directory.
+/// Returns the directory that contains `.graphlite/` as a string, or an error
+/// if none is found up to the filesystem root.
+pub fn find_root(start: &str) -> anyhow::Result<String> {
+    use anyhow::anyhow;
+    let mut dir = Path::new(start).canonicalize()?;
+    loop {
+        if dir.join(".graphlite").is_dir() {
+            return Ok(dir.to_string_lossy().into_owned());
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => return Err(anyhow!("no .graphlite/ directory found from {}", start)),
+        }
+    }
+}
+
 /// Load config from `{root}/.graphlite/config.toml`.
 /// Returns `Config::default()` silently if the file is absent or unparseable —
 /// this keeps `discover` idempotent without requiring `init` first.
