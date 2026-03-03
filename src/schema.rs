@@ -61,6 +61,13 @@ CREATE VIRTUAL TABLE fts_symbols USING fts5(
     tokenize='porter unicode61'
 );
 
+CREATE TABLE role_overrides (
+    stable_id TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX idx_edges_from ON edges(from_id);
 CREATE INDEX idx_edges_to ON edges(to_id);
 CREATE INDEX idx_edges_to_source ON edges(to_id, source);
@@ -116,6 +123,15 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
     );
     let _ = conn.execute(
         "ALTER TABLE nodes ADD COLUMN stable_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS role_overrides (
+            stable_id TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
         [],
     );
     Ok(conn)

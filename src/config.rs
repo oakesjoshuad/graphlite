@@ -13,7 +13,50 @@ ignore = []
 
 # Default traversal depth for graph and blast-radius commands.
 depth = 2
+
+# Forbidden context coupling rules for `graphlite viz`.
+# Each rule flags edges where a node in `from_context` calls into `to_context`.
+# Complements the built-in role-layer heuristic.
+# Example:
+# [[violations]]
+# from_context = "presentation"
+# to_context   = "persistence"
+# reason       = "presentation must not access persistence directly"
+
+# Suppression rules for known-acceptable violation patterns.
+# All specified fields must match; omitted fields are wildcards.
+# Example:
+# [[exceptions]]
+# from_context = "runtime"
+# to_role      = "utility"
+# reason       = "runtime infrastructure may use shared utilities"
 "#;
+
+/// A forbidden context coupling rule. Edges from `from_context` to `to_context`
+/// are flagged as violations in `graphlite viz`, regardless of edge source.
+#[derive(Debug, Deserialize, Default)]
+pub struct ViolationRule {
+    pub from_context: String,
+    pub to_context: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A suppression rule for known-acceptable violation patterns.
+/// All specified fields must match for suppression to fire; omitted fields are wildcards.
+#[derive(Debug, Deserialize, Default)]
+pub struct ViolationException {
+    #[serde(default)]
+    pub from_context: Option<String>,
+    #[serde(default)]
+    pub to_context: Option<String>,
+    #[serde(default)]
+    pub from_role: Option<String>,
+    #[serde(default)]
+    pub to_role: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -23,6 +66,12 @@ pub struct Config {
     pub lsp: Vec<String>,
     #[serde(default = "default_depth")]
     pub depth: usize,
+    /// Forbidden context coupling rules for `graphlite viz`.
+    #[serde(default)]
+    pub violations: Vec<ViolationRule>,
+    /// Suppression rules for known-acceptable violation patterns.
+    #[serde(default)]
+    pub exceptions: Vec<ViolationException>,
 }
 
 fn default_depth() -> usize {
@@ -35,6 +84,8 @@ impl Default for Config {
             ignore: vec![],
             lsp: vec![],
             depth: default_depth(),
+            violations: vec![],
+            exceptions: vec![],
         }
     }
 }

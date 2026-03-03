@@ -5,10 +5,13 @@ struct NodeMetrics {
     id: i64,
     kind: String,
     visibility: String,
+    file: String,
+    name: String,
     fan_in: i64,
     fan_out: i64,
     io_call_count: i64,
     caller_file_spread: i64,
+    callee_file_spread: i64,
 }
 
 /// Percentile rank: fraction of sorted values <= value.
@@ -30,6 +33,8 @@ pub fn infer_roles(conn: &Connection) -> Result<()> {
              n.id,
              n.kind,
              n.visibility,
+             n.file,
+             n.name,
              (SELECT COUNT(*) FROM edges WHERE from_id = n.id)           AS fan_out,
              (SELECT COUNT(*) FROM edges WHERE to_id   = n.id)           AS fan_in,
              -- IO proximity: callee names matching known IO patterns
@@ -50,8 +55,14 @@ pub fn infer_roles(conn: &Connection) -> Result<()> {
              (SELECT COUNT(DISTINCT caller.file)
               FROM edges e
               JOIN nodes caller ON e.from_id = caller.id
-              WHERE e.to_id = n.id)                                      AS caller_file_spread
-         FROM nodes n",
+              WHERE e.to_id = n.id)                                      AS caller_file_spread,
+             -- Callee spread: how many distinct files this node calls into
+             (SELECT COUNT(DISTINCT callee.file)
+              FROM edges e
+              JOIN nodes callee ON e.to_id = callee.id
+              WHERE e.from_id = n.id)                                    AS callee_file_spread
+         FROM nodes n
+         WHERE n.role_confidence < 0.99",
     )?;
 
     let nodes: Vec<NodeMetrics> = stmt
@@ -60,10 +71,13 @@ pub fn infer_roles(conn: &Connection) -> Result<()> {
                 id: r.get(0)?,
                 kind: r.get(1)?,
                 visibility: r.get(2)?,
-                fan_out: r.get(3)?,
-                fan_in: r.get(4)?,
-                io_call_count: r.get(5)?,
-                caller_file_spread: r.get(6)?,
+                file: r.get(3)?,
+                name: r.get(4)?,
+                fan_out: r.get(5)?,
+                fan_in: r.get(6)?,
+                io_call_count: r.get(7)?,
+                caller_file_spread: r.get(8)?,
+                callee_file_spread: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -101,6 +115,15 @@ pub fn infer_roles(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
 
+    // Apply stable_id-keyed manual overrides — survive re-index naturally.
+    let _ = conn.execute(
+        "UPDATE nodes
+         SET role = (SELECT role FROM role_overrides WHERE role_overrides.stable_id = nodes.stable_id),
+             role_confidence = 1.0
+         WHERE stable_id != '' AND stable_id IN (SELECT stable_id FROM role_overrides)",
+        [],
+    );
+
     eprintln!("Roles inferred for {} nodes", nodes.len());
     Ok(())
 }
@@ -111,6 +134,21 @@ fn classify(
     fan_in_sorted: &[i64],
     spread_penalty: f64,
 ) -> (&'static str, f64) {
+    // Test files are classified structurally — skip graph-metric classification.
+    if crate::arch::is_test_file(&node.file) {
+        return ("test", 0.95);
+    }
+
+    // Name heuristic: private fns with no callers whose name starts with `test_`.
+    // Catches inline test helpers that aren't decorated with `#[test]`.
+    if node.fan_in == 0
+        && node.kind == "fn"
+        && node.visibility != "pub"
+        && node.name.starts_with("test_")
+    {
+        return ("test", 0.75);
+    }
+
     let fo_rank = percentile_rank(node.fan_out, fan_out_sorted);
     let fi_rank = percentile_rank(node.fan_in, fan_in_sorted);
 
@@ -142,8 +180,10 @@ fn classify(
 
     // --- Distribution-based (relative, spread-penalised) ---
 
-    // Top 20% by fan_out → coordinates many things
-    if fo_rank >= 0.80 {
+    // Top 20% by fan_out AND calls across multiple files → true coordinator.
+    // Requiring callee_file_spread >= 2 prevents high-fan-out helpers that only call
+    // within their own file (e.g. apply_cors_headers) from being misclassified.
+    if fo_rank >= 0.80 && node.callee_file_spread >= 2 {
         // Interpolate from 0.70 at the 80th percentile to 0.80 at the 100th
         let scaled = 0.70 + 0.10 * (fo_rank - 0.80) / 0.20;
         return ("orchestrator", scaled * spread_penalty);

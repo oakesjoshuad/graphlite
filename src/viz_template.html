@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>graphlite viz</title>
+  <style>
+    :root {
+      --nord0:  #2e3440;
+      --nord1:  #3b4252;
+      --nord2:  #434c5e;
+      --nord3:  #4c566a;
+      --nord4:  #d8dee9;
+      --nord5:  #e5e9f0;
+      --nord6:  #eceff4;
+      --nord8:  #88c0d0;
+      --nord10: #5e81ac;
+      --nord11: #bf616a;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--nord6);
+      overflow: hidden;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      color: var(--nord0);
+    }
+
+    canvas { display: block; }
+
+    /* ── Info panel ─────────────────────────────────────────── */
+    #info-panel {
+      position: fixed;
+      bottom: 24px;
+      left: 24px;
+      width: 340px;
+      background: var(--nord5);
+      border: 1px solid var(--nord4);
+      border-left: 3px solid var(--role-color, var(--nord10));
+      border-radius: 6px;
+      padding: 16px;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 0.15s ease, transform 0.15s ease;
+      pointer-events: none;
+      z-index: 100;
+      box-shadow: 0 4px 16px rgba(46,52,64,0.12);
+    }
+
+    #info-panel.visible {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    #info-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--nord0);
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+
+    #info-stable-id {
+      font-size: 10px;
+      color: var(--nord3);
+      margin-bottom: 10px;
+      word-break: break-all;
+      line-height: 1.4;
+    }
+
+    .info-badges {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .badge {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 3px;
+      background: var(--nord4);
+      color: var(--nord1);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .badge.role {
+      background: var(--role-color, var(--nord10));
+      color: var(--nord6);
+      font-weight: 600;
+    }
+
+    .info-metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .metric { text-align: center; }
+
+    .metric-value {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--nord0);
+    }
+
+    .metric-value.trusted { color: var(--nord10); }
+
+    .metric-label {
+      font-size: 9px;
+      color: var(--nord3);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-top: 2px;
+    }
+
+    #info-violations { margin-bottom: 10px; }
+
+    #info-violations-title {
+      font-size: 9px;
+      color: var(--nord11);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+    }
+
+    .violation-item {
+      font-size: 10px;
+      color: var(--nord1);
+      background: rgba(191,97,106,0.08);
+      border-left: 2px solid var(--nord11);
+      padding: 3px 7px;
+      margin-bottom: 2px;
+      border-radius: 0 3px 3px 0;
+      word-break: break-all;
+    }
+
+    #info-signature {
+      font-size: 11px;
+      color: var(--nord1);
+      background: var(--nord6);
+      border: 1px solid var(--nord4);
+      border-radius: 4px;
+      padding: 8px 10px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 120px;
+      overflow-y: auto;
+      line-height: 1.55;
+    }
+
+    #info-signature:empty { display: none; }
+
+    /* ── Legend ─────────────────────────────────────────────── */
+    #legend {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: var(--nord5);
+      border: 1px solid var(--nord4);
+      border-radius: 6px;
+      padding: 12px 14px;
+      z-index: 100;
+      min-width: 130px;
+      box-shadow: 0 2px 8px rgba(46,52,64,0.10);
+    }
+
+    .legend-title {
+      color: var(--nord3);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 9px;
+      margin-bottom: 8px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+      font-size: 11px;
+      color: var(--nord1);
+    }
+
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .legend-sep {
+      border: none;
+      border-top: 1px solid var(--nord4);
+      margin: 8px 0;
+    }
+
+    .legend-edge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+      font-size: 11px;
+      color: var(--nord1);
+    }
+
+    .legend-line {
+      width: 18px;
+      height: 2px;
+      flex-shrink: 0;
+      border-radius: 1px;
+    }
+
+    /* ── Stats ──────────────────────────────────────────────── */
+    #stats {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      font-size: 11px;
+      color: var(--nord3);
+      z-index: 100;
+      line-height: 1.8;
+      max-width: 380px;
+    }
+
+    #stats .summary { margin-bottom: 2px; }
+
+    #stats .violation-stat {
+      color: var(--nord11);
+      font-weight: 600;
+    }
+
+    #stats .ctx-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 3px 8px;
+    }
+
+    #stats .ctx-pill {
+      cursor: pointer;
+      border-radius: 3px;
+      padding: 1px 4px;
+      transition: background 0.1s, opacity 0.1s;
+      opacity: 0.70;
+    }
+
+    #stats .ctx-pill:hover {
+      opacity: 1;
+      background: var(--nord4);
+    }
+
+    /* ── Filter panel ────────────────────────────────────────── */
+    #filter-panel {
+      position: fixed;
+      bottom: 24px;
+      right: 20px;
+      background: var(--nord5);
+      border: 1px solid var(--nord4);
+      border-radius: 6px;
+      padding: 10px 14px;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(46,52,64,0.10);
+      max-width: 320px;
+    }
+
+    .filter-section { margin-bottom: 8px; }
+    .filter-section:last-child { margin-bottom: 0; }
+
+    .filter-title {
+      font-size: 9px;
+      color: var(--nord3);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 5px;
+    }
+
+    .filter-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .filter-chip {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      color: var(--nord6);
+      transition: opacity 0.12s;
+      user-select: none;
+      letter-spacing: 0.03em;
+    }
+
+    .filter-chip.inactive { opacity: 0.25; }
+
+    /* ── Context labels ──────────────────────────────────────── */
+    .context-label {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+
+<div id="stats"></div>
+<div id="legend"><div class="legend-title">Role</div></div>
+
+<div id="filter-panel">
+  <div class="filter-section">
+    <div class="filter-title">Filter · Role</div>
+    <div class="filter-chips" id="role-chips"></div>
+  </div>
+  <div class="filter-section">
+    <div class="filter-title">Filter · Context</div>
+    <div class="filter-chips" id="ctx-chips"></div>
+  </div>
+</div>
+
+<div id="info-panel">
+  <div id="info-name"></div>
+  <div id="info-stable-id"></div>
+  <div class="info-badges">
+    <span class="badge role" id="info-role"></span>
+    <span class="badge" id="info-kind"></span>
+    <span class="badge" id="info-context"></span>
+    <span class="badge" id="info-visibility"></span>
+  </div>
+  <div class="info-metrics">
+    <div class="metric">
+      <div class="metric-value" id="m-fan-in"></div>
+      <div class="metric-label">fan in</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value trusted" id="m-fan-in-t"></div>
+      <div class="metric-label">trusted in</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" id="m-fan-out"></div>
+      <div class="metric-label">fan out</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value trusted" id="m-fan-out-t"></div>
+      <div class="metric-label">trusted out</div>
+    </div>
+  </div>
+  <div id="info-violations"></div>
+  <div id="info-signature"></div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three":         "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls }              from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { LineSegments2 }              from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry }       from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial }               from 'three/addons/lines/LineMaterial.js';
+
+const GRAPH = __GRAPH_DATA__;
+
+// ── Role → Aurora colour ─────────────────────────────────────────
+const ROLE_COLOR = {
+  entrypoint:   0xebcb8b,   // nord13
+  orchestrator: 0xd08770,   // nord12
+  domain:       0xa3be8c,   // nord14
+  utility:      0x88c0d0,   // nord8
+  infra:        0xbf616a,   // nord11 — IO/side-effects
+  model:        0xb48ead,   // nord15
+  leaf:         0x81a1c1,   // nord9
+  unknown:      0xd8dee9,   // nord4
+};
+
+const ROLE_HEX = {
+  entrypoint:   '#ebcb8b',
+  orchestrator: '#d08770',
+  domain:       '#a3be8c',
+  utility:      '#88c0d0',
+  infra:        '#bf616a',
+  model:        '#b48ead',
+  leaf:         '#81a1c1',
+};
+
+const FROST_CYCLE = ['#5e81ac', '#81a1c1', '#88c0d0', '#8fbcbb'];
+
+// ── Noise filtering ───────────────────────────────────────────────
+// Remove HTML/parse artifacts (unknown), structural containers (impl, mod),
+// and fully isolated nodes with no edges at all.
+const NOISE_KINDS = new Set(['unknown', 'impl', 'mod']);
+
+const visibleNodes = GRAPH.nodes.filter(n =>
+  !NOISE_KINDS.has(n.kind) &&
+  (n.fan_in > 0 || n.fan_out > 0)
+);
+
+const filteredCount = GRAPH.nodes.length - visibleNodes.length;
+
+// nodeById maps original GRAPH node id → index in visibleNodes
+const nodeById = new Map(visibleNodes.map((n, i) => [n.id, i]));
+
+// ── Violation index — per node, list of violation edge descriptions ──
+// Used to populate the info panel when a node is clicked.
+const nodeViolations = new Map(); // nodeIdx → [{dir, desc, peer}]
+GRAPH.edges.forEach(e => {
+  if (!e.violation) return;
+  const fi = nodeById.get(e.from);
+  const ti = nodeById.get(e.to);
+  if (fi !== undefined) {
+    if (!nodeViolations.has(fi)) nodeViolations.set(fi, []);
+    nodeViolations.get(fi).push({ dir: 'out', desc: e.violation, peer: visibleNodes[ti]?.name ?? '?' });
+  }
+  if (ti !== undefined) {
+    if (!nodeViolations.has(ti)) nodeViolations.set(ti, []);
+    nodeViolations.get(ti).push({ dir: 'in', desc: e.violation, peer: visibleNodes[fi]?.name ?? '?' });
+  }
+});
+
+// ── Violation node set — IDs of nodes that touch any violation edge ──
+const violationNodeIds = new Set();
+GRAPH.edges.forEach(e => {
+  if (!e.violation) return;
+  violationNodeIds.add(e.from);
+  violationNodeIds.add(e.to);
+});
+
+// ── Filter state ──────────────────────────────────────────────────
+const activeRoles    = new Set(Object.keys(ROLE_COLOR));
+const activeContexts = new Set(GRAPH.contexts.map(c => c.name));
+let focusedIdx    = -1;
+let violationsOnly = false;
+
+function isNodeActive(n) {
+  if (violationsOnly && !violationNodeIds.has(n.id)) return false;
+  return activeRoles.has(n.role) && activeContexts.has(n.context);
+}
+
+// ── Pre-compute edge data with baked positions ────────────────────
+// Avoids re-walking GRAPH.edges on every rebuildEdges() call.
+const edgeData = [];
+GRAPH.edges.forEach(e => {
+  const fi = nodeById.get(e.from);
+  const ti = nodeById.get(e.to);
+  if (fi === undefined || ti === undefined) return;
+  const fn_ = visibleNodes[fi];
+  const tn  = visibleNodes[ti];
+  edgeData.push({
+    fi, ti,
+    violation: e.violation ?? null,
+    trusted:   e.source === 'rust-analyzer',
+    fx: fn_.pos.x, fy: fn_.pos.y, fz: fn_.pos.z,
+    tx: tn.pos.x,  ty: tn.pos.y,  tz: tn.pos.z,
+  });
+});
+
+// ── Adjacency map for O(1) neighbour lookup during focus ──────────
+const adjacency = new Map();
+edgeData.forEach(({ fi, ti }) => {
+  if (!adjacency.has(fi)) adjacency.set(fi, new Set());
+  if (!adjacency.has(ti)) adjacency.set(ti, new Set());
+  adjacency.get(fi).add(ti);
+  adjacency.get(ti).add(fi);
+});
+
+// ── Scene ────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xeceff4);
+scene.fog = new THREE.FogExp2(0xeceff4, 0.004);
+
+// ── Camera — auto-scaled to graph extent ─────────────────────────
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 2000);
+
+const maxXY = visibleNodes.reduce(
+  (m, n) => Math.max(m, Math.hypot(n.pos.x, n.pos.y)), 1
+);
+const initDist = Math.max(maxXY * 2.4, 80);
+camera.position.set(initDist * 0.45, initDist * 0.28, initDist);
+camera.lookAt(0, 0, 0);
+
+// ── Renderer ─────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// ── CSS2D renderer ────────────────────────────────────────────────
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(innerWidth, innerHeight);
+labelRenderer.domElement.style.cssText = 'position:absolute;top:0;pointer-events:none;';
+document.body.appendChild(labelRenderer.domElement);
+
+// ── Controls ─────────────────────────────────────────────────────
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping  = true;
+controls.dampingFactor  = 0.06;
+controls.minDistance    = 2;
+controls.maxDistance    = 2000;
+controls.target.set(0, 0, 0);
+
+// ── Lighting ─────────────────────────────────────────────────────
+scene.add(new THREE.AmbientLight(0xffffff, 0.70));
+const sun = new THREE.DirectionalLight(0x4c566a, 0.55);
+sun.position.set(40, 80, 50);
+scene.add(sun);
+
+// ── Nodes (InstancedMesh) ─────────────────────────────────────────
+const nodeGeo = new THREE.IcosahedronGeometry(1, 1);
+const nodeMat = new THREE.MeshStandardMaterial({
+  roughness: 0.55, metalness: 0.05, transparent: true, opacity: 0.88,
+});
+
+const mesh = new THREE.InstancedMesh(nodeGeo, nodeMat, visibleNodes.length);
+mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+const baseRadius   = new Float32Array(visibleNodes.length);
+const origColorHex = new Uint32Array(visibleNodes.length);
+const dummy        = new THREE.Object3D();
+const col          = new THREE.Color();
+
+function nodeRadius(n) {
+  return 0.22 + 0.18 * Math.min(Math.log1p(n.fan_in + n.fan_out), Math.log1p(50)) / Math.log1p(50);
+}
+
+visibleNodes.forEach((n, i) => {
+  const r = nodeRadius(n);
+  baseRadius[i] = r;
+  dummy.position.set(n.pos.x, n.pos.y, n.pos.z);
+  dummy.scale.setScalar(r);
+  dummy.updateMatrix();
+  mesh.setMatrixAt(i, dummy.matrix);
+
+  const hex = ROLE_COLOR[n.role] ?? ROLE_COLOR.unknown;
+  origColorHex[i] = hex;
+  col.setHex(hex);
+  mesh.setColorAt(i, col);
+});
+
+mesh.instanceMatrix.needsUpdate = true;
+mesh.instanceColor.needsUpdate  = true;
+scene.add(mesh);
+
+// ── Edges — three layers rebuilt dynamically ──────────────────────
+// Line objects live for the page lifetime; geometry is swapped on filter/focus.
+function initEdgeLines(color, opacity) {
+  const geo  = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+  const mat  = new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthWrite: false });
+  const lines = new THREE.LineSegments(geo, mat);
+  scene.add(lines);
+  return lines;
+}
+
+function updateEdgeGeo(lines, posArray) {
+  lines.geometry.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
+}
+
+const trustedLines    = initEdgeLines(0x5e81ac, 0.45);   // nord10
+const structuralLines = initEdgeLines(0xb8c5d6, 0.15);   // dim noise
+
+// ── Violation lines — fat dashed with marching-ants flow animation ──
+const violationGeo = new LineSegmentsGeometry();
+const violationMat = new LineMaterial({
+  color:       0xbf616a,
+  linewidth:   3.5,
+  dashed:      true,
+  dashSize:    0.6,
+  gapSize:     0.35,
+  dashOffset:  0,
+  transparent: true,
+  opacity:     0.92,
+  depthWrite:  false,
+  resolution:  new THREE.Vector2(innerWidth, innerHeight),
+});
+const violationLines = new LineSegments2(violationGeo, violationMat);
+violationLines.visible = false;
+scene.add(violationLines);
+
+function updateViolationGeo(posArray) {
+  if (posArray.length === 0) {
+    violationLines.visible = false;
+    return;
+  }
+  violationLines.visible = true;
+  violationGeo.setPositions(posArray);
+  violationLines.computeLineDistances();
+  // mark attributes dirty after setPositions
+  if (violationGeo.attributes.instanceStart) violationGeo.attributes.instanceStart.needsUpdate = true;
+  if (violationGeo.attributes.instanceEnd)   violationGeo.attributes.instanceEnd.needsUpdate   = true;
+}
+
+function rebuildEdges() {
+  const tp = [], sp = [], vp = [];
+  edgeData.forEach(({ fi, ti, violation, trusted, fx, fy, fz, tx, ty, tz }) => {
+    if (!isNodeActive(visibleNodes[fi]) || !isNodeActive(visibleNodes[ti])) return;
+    if (focusedIdx >= 0 && fi !== focusedIdx && ti !== focusedIdx) return;
+    if (violationsOnly && !violation) return;
+    const pts = [fx, fy, fz, tx, ty, tz];
+    if (violation)      vp.push(...pts);
+    else if (trusted)   tp.push(...pts);
+    else                sp.push(...pts);
+  });
+  updateEdgeGeo(trustedLines,    tp);
+  updateEdgeGeo(structuralLines, sp);
+  updateViolationGeo(vp);
+}
+
+rebuildEdges(); // initial population
+
+// ── Context centroids (computed from visible node positions) ──────
+const centroidAcc = {};
+GRAPH.contexts.forEach(c => { centroidAcc[c.name] = { x: 0, y: 0, z: 0, n: 0 }; });
+visibleNodes.forEach(nd => {
+  const c = centroidAcc[nd.context];
+  if (c) { c.x += nd.pos.x; c.y += nd.pos.y; c.z += nd.pos.z; c.n++; }
+});
+
+const centroids = {};
+Object.entries(centroidAcc).forEach(([name, c]) => {
+  if (c.n > 0) centroids[name] = { x: c.x / c.n, y: c.y / c.n, z: c.z / c.n };
+});
+
+// ── Context orbs (click to fly camera) ───────────────────────────
+const orbGeo      = new THREE.SphereGeometry(2.5, 20, 14);
+const contextOrbs = [];
+
+Object.entries(centroids).forEach(([name, pos], idx) => {
+  const mat = new THREE.MeshStandardMaterial({
+    color:       new THREE.Color(FROST_CYCLE[idx % FROST_CYCLE.length]),
+    transparent: true,
+    opacity:     0.18,
+    roughness:   1.0,
+    metalness:   0.0,
+    depthWrite:  false,
+  });
+  const orb = new THREE.Mesh(orbGeo, mat);
+  orb.position.set(pos.x, pos.y, pos.z);
+  orb.userData = { contextName: name, pos };
+  scene.add(orb);
+  contextOrbs.push(orb);
+
+  const div = document.createElement('div');
+  div.className   = 'context-label';
+  div.textContent = name;
+  div.style.color = FROST_CYCLE[idx % FROST_CYCLE.length];
+  const label = new CSS2DObject(div);
+  label.position.set(pos.x, pos.y + 4, pos.z);
+  scene.add(label);
+});
+
+// ── Pulsing nodes ─────────────────────────────────────────────────
+const pulsingNodes = visibleNodes
+  .map((n, i) => ({ n, i }))
+  .filter(({ n }) => n.role === 'orchestrator' || n.role === 'entrypoint');
+
+// ── Focus + filter management ─────────────────────────────────────
+
+function setFocus(idx) {
+  focusedIdx = idx;
+  const connected = adjacency.get(idx) ?? new Set();
+  const bg = new THREE.Color(0xeceff4); // scene background
+
+  visibleNodes.forEach((n, i) => {
+    if (!isNodeActive(n)) return;
+    col.setHex(origColorHex[i]);
+    if (i !== idx && !connected.has(i)) col.lerp(bg, 0.82);
+    mesh.setColorAt(i, col);
+  });
+  mesh.instanceColor.needsUpdate = true;
+  rebuildEdges();
+}
+
+function clearFocus() {
+  focusedIdx = -1;
+  visibleNodes.forEach((n, i) => {
+    if (!isNodeActive(n)) return;
+    col.setHex(origColorHex[i]);
+    mesh.setColorAt(i, col);
+  });
+  mesh.instanceColor.needsUpdate = true;
+  rebuildEdges();
+}
+
+function applyFilters() {
+  visibleNodes.forEach((n, i) => {
+    dummy.position.set(n.pos.x, n.pos.y, n.pos.z);
+    dummy.scale.setScalar(isNodeActive(n) ? baseRadius[i] : 0);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+
+  if (focusedIdx >= 0 && !isNodeActive(visibleNodes[focusedIdx])) {
+    // Focused node was filtered out — drop focus entirely
+    clearFocus();
+    hidePanel();
+  } else if (focusedIdx >= 0) {
+    setFocus(focusedIdx); // re-apply dimming against new active set
+  } else {
+    rebuildEdges();
+  }
+}
+
+// ── Legend ────────────────────────────────────────────────────────
+const legendEl = document.getElementById('legend');
+
+Object.entries(ROLE_HEX).forEach(([role, hex]) => {
+  const item  = document.createElement('div');
+  item.className = 'legend-item';
+  const dot   = document.createElement('div');
+  dot.className  = 'legend-dot';
+  dot.style.background = hex;
+  const label = document.createElement('span');
+  label.textContent = role;
+  item.appendChild(dot);
+  item.appendChild(label);
+  legendEl.appendChild(item);
+});
+
+const sep = document.createElement('hr');
+sep.className = 'legend-sep';
+legendEl.appendChild(sep);
+
+[
+  { color: '#5e81ac', label: 'trusted edge' },
+  { color: '#bf616a', label: 'violation' },
+  { color: '#b8c5d6', label: 'structural' },
+].forEach(({ color, label }) => {
+  const item = document.createElement('div');
+  item.className = 'legend-edge';
+  const line = document.createElement('div');
+  line.className = 'legend-line';
+  line.style.background = color;
+  const lbl = document.createElement('span');
+  lbl.textContent = label;
+  item.appendChild(line);
+  item.appendChild(lbl);
+  legendEl.appendChild(item);
+});
+
+// ── Stats ─────────────────────────────────────────────────────────
+const statsEl = document.getElementById('stats');
+
+const summary = document.createElement('div');
+summary.className = 'summary';
+summary.textContent = `${visibleNodes.length} nodes  ${GRAPH.meta.total_edges} edges  (${filteredCount} filtered)`;
+statsEl.appendChild(summary);
+
+if (GRAPH.meta.violation_count > 0) {
+  const vstat = document.createElement('div');
+  vstat.className = 'violation-stat';
+  const suppressed = GRAPH.meta.suppressed_violation_count || 0;
+  vstat.textContent = suppressed > 0
+    ? `${GRAPH.meta.violation_count} dependency violations  (${suppressed} suppressed)`
+    : `${GRAPH.meta.violation_count} dependency violations`;
+  statsEl.appendChild(vstat);
+}
+
+const ctxGrid = document.createElement('div');
+ctxGrid.className = 'ctx-grid';
+GRAPH.contexts.forEach((c, i) => {
+  const pill = document.createElement('span');
+  pill.className   = 'ctx-pill';
+  pill.textContent = `${c.name} ${c.node_count}`;
+  pill.style.color = FROST_CYCLE[i % FROST_CYCLE.length];
+  pill.addEventListener('click', () => {
+    const pos = centroids[c.name];
+    if (pos) flyTo(pos.x, pos.y, pos.z);
+  });
+  ctxGrid.appendChild(pill);
+});
+statsEl.appendChild(ctxGrid);
+
+// ── Filter chips ──────────────────────────────────────────────────
+const roleChipsEl = document.getElementById('role-chips');
+Object.entries(ROLE_HEX).forEach(([role, hex]) => {
+  const chip = document.createElement('span');
+  chip.className = 'filter-chip';
+  chip.textContent = role;
+  chip.style.background = hex;
+  chip.addEventListener('click', () => {
+    if (activeRoles.has(role)) {
+      activeRoles.delete(role);
+      chip.classList.add('inactive');
+    } else {
+      activeRoles.add(role);
+      chip.classList.remove('inactive');
+    }
+    applyFilters();
+  });
+  roleChipsEl.appendChild(chip);
+});
+
+const ctxChipsEl = document.getElementById('ctx-chips');
+GRAPH.contexts.forEach((c, i) => {
+  const chip = document.createElement('span');
+  chip.className = 'filter-chip';
+  chip.textContent = c.name;
+  chip.style.background = FROST_CYCLE[i % FROST_CYCLE.length];
+  chip.addEventListener('click', () => {
+    if (activeContexts.has(c.name)) {
+      activeContexts.delete(c.name);
+      chip.classList.add('inactive');
+    } else {
+      activeContexts.add(c.name);
+      chip.classList.remove('inactive');
+    }
+    applyFilters();
+  });
+  ctxChipsEl.appendChild(chip);
+});
+
+// ── Violations-only toggle (only shown when violations exist) ──────
+if (GRAPH.meta.violation_count > 0) {
+  const section = document.createElement('div');
+  section.className = 'filter-section';
+  const title = document.createElement('div');
+  title.className = 'filter-title';
+  title.textContent = 'Focus';
+  const chips = document.createElement('div');
+  chips.className = 'filter-chips';
+  const chip = document.createElement('span');
+  chip.className = 'filter-chip inactive';
+  chip.textContent = 'violations only';
+  chip.style.background = '#bf616a';
+  chip.addEventListener('click', () => {
+    violationsOnly = !violationsOnly;
+    chip.classList.toggle('inactive', !violationsOnly);
+    applyFilters();
+  });
+  chips.appendChild(chip);
+  section.appendChild(title);
+  section.appendChild(chips);
+  document.getElementById('filter-panel').appendChild(section);
+}
+
+// ── Info panel ────────────────────────────────────────────────────
+const panel = document.getElementById('info-panel');
+
+function showPanel(idx) {
+  const n = visibleNodes[idx];
+  const roleHex = ROLE_HEX[n.role] ?? '#81a1c1';
+
+  panel.style.setProperty('--role-color', roleHex);
+  document.getElementById('info-name').textContent       = n.name;
+  document.getElementById('info-stable-id').textContent  = n.stable_id;
+  document.getElementById('info-role').textContent       = n.role;
+  document.getElementById('info-kind').textContent       = n.kind;
+  document.getElementById('info-context').textContent    = n.context;
+  document.getElementById('info-visibility').textContent = n.visibility;
+  document.getElementById('m-fan-in').textContent        = n.fan_in;
+  document.getElementById('m-fan-in-t').textContent      = n.fan_in_trusted;
+  document.getElementById('m-fan-out').textContent       = n.fan_out;
+  document.getElementById('m-fan-out-t').textContent     = n.fan_out_trusted;
+  document.getElementById('info-signature').textContent  = n.signature ?? '';
+
+  const violDiv = document.getElementById('info-violations');
+  violDiv.textContent = '';
+  const viols = nodeViolations.get(idx);
+  if (viols?.length) {
+    const title = document.createElement('div');
+    title.id = 'info-violations-title';
+    title.textContent = `${viols.length} violation${viols.length > 1 ? 's' : ''}`;
+    violDiv.appendChild(title);
+    viols.slice(0, 4).forEach(v => {
+      const item = document.createElement('div');
+      item.className = 'violation-item';
+      const arrow = v.dir === 'out' ? '\u2192' : '\u2190';
+      item.textContent = `${arrow} ${v.peer}  (${v.desc})`;
+      violDiv.appendChild(item);
+    });
+    if (viols.length > 4) {
+      const more = document.createElement('div');
+      more.className = 'violation-item';
+      more.style.opacity = '0.6';
+      more.textContent = `+${viols.length - 4} more`;
+      violDiv.appendChild(more);
+    }
+  }
+
+  panel.classList.add('visible');
+}
+
+function hidePanel() { panel.classList.remove('visible'); }
+
+// ── Camera fly-to ─────────────────────────────────────────────────
+let flyTarget = null;
+
+function flyTo(cx, cy, cz) {
+  const offset = Math.max(maxXY * 0.6, 30);
+  flyTarget = {
+    camPos: new THREE.Vector3(cx + offset * 0.6, cy + offset * 0.35, cz + offset * 0.75),
+    lookAt: new THREE.Vector3(cx, cy, cz),
+  };
+}
+
+// ── Raycaster ─────────────────────────────────────────────────────
+const raycaster = new THREE.Raycaster();
+const pointer   = new THREE.Vector2();
+let   hoveredIdx  = -1;
+let   hoveredOrb  = null;
+
+function setNodeColor(idx, hex) {
+  col.setHex(hex);
+  mesh.setColorAt(idx, col);
+  mesh.instanceColor.needsUpdate = true;
+}
+
+renderer.domElement.addEventListener('pointermove', e => {
+  pointer.set(
+     (e.clientX / innerWidth)  * 2 - 1,
+    -(e.clientY / innerHeight) * 2 + 1,
+  );
+  raycaster.setFromCamera(pointer, camera);
+
+  const orbHits = raycaster.intersectObjects(contextOrbs);
+  if (orbHits.length > 0) {
+    const orb = orbHits[0].object;
+    if (orb !== hoveredOrb) {
+      if (hoveredOrb) hoveredOrb.material.opacity = 0.18;
+      hoveredOrb = orb;
+      hoveredOrb.material.opacity = 0.40;
+      document.body.style.cursor = 'pointer';
+    }
+    if (hoveredIdx >= 0) { setNodeColor(hoveredIdx, origColorHex[hoveredIdx]); hoveredIdx = -1; }
+    return;
+  } else if (hoveredOrb) {
+    hoveredOrb.material.opacity = 0.18;
+    hoveredOrb = null;
+  }
+
+  // In focus mode, skip colour changes — just update the cursor
+  if (focusedIdx >= 0) {
+    const hits = raycaster.intersectObject(mesh);
+    document.body.style.cursor = hits.length > 0 ? 'pointer' : '';
+    return;
+  }
+
+  const hits = raycaster.intersectObject(mesh);
+  if (hits.length > 0) {
+    const idx = hits[0].instanceId;
+    if (idx !== hoveredIdx) {
+      if (hoveredIdx >= 0) setNodeColor(hoveredIdx, origColorHex[hoveredIdx]);
+      hoveredIdx = idx;
+      const darkened = new THREE.Color(origColorHex[idx]).lerp(new THREE.Color(0x2e3440), 0.30);
+      setNodeColor(idx, darkened.getHex());
+      document.body.style.cursor = 'pointer';
+    }
+  } else {
+    if (hoveredIdx >= 0) { setNodeColor(hoveredIdx, origColorHex[hoveredIdx]); hoveredIdx = -1; }
+    document.body.style.cursor = '';
+  }
+});
+
+renderer.domElement.addEventListener('click', e => {
+  pointer.set(
+     (e.clientX / innerWidth)  * 2 - 1,
+    -(e.clientY / innerHeight) * 2 + 1,
+  );
+  raycaster.setFromCamera(pointer, camera);
+
+  const orbHits = raycaster.intersectObjects(contextOrbs);
+  if (orbHits.length > 0) {
+    const { pos } = orbHits[0].object.userData;
+    flyTo(pos.x, pos.y, pos.z);
+    clearFocus();
+    hidePanel();
+    return;
+  }
+
+  const hits = raycaster.intersectObject(mesh);
+  if (hits.length > 0) {
+    const idx = hits[0].instanceId;
+    if (idx === focusedIdx) {
+      // Click same node again → clear focus
+      clearFocus();
+      hidePanel();
+    } else {
+      setFocus(idx);
+      showPanel(idx);
+    }
+  } else {
+    clearFocus();
+    hidePanel();
+  }
+});
+
+// ── Resize ────────────────────────────────────────────────────────
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  labelRenderer.setSize(innerWidth, innerHeight);
+  violationMat.resolution.set(innerWidth, innerHeight);
+});
+
+// ── Animate ───────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  const t = performance.now() * 0.001;
+
+  // Smooth camera fly-to
+  if (flyTarget) {
+    camera.position.lerp(flyTarget.camPos, 0.07);
+    controls.target.lerp(flyTarget.lookAt, 0.07);
+    if (camera.position.distanceTo(flyTarget.camPos) < 0.5) flyTarget = null;
+  }
+
+  // Violation edges: march dashes forward (caller → callee direction) + fade-pulse
+  violationMat.dashOffset    += 0.018;
+  violationMat.opacity        = 0.72 + 0.20 * Math.sin(t * Math.PI * 1.2);
+
+  // Pulse orchestrator + entrypoint — skip filtered-out nodes
+  pulsingNodes.forEach(({ n, i }) => {
+    if (i === hoveredIdx || !isNodeActive(n)) return;
+    const freq  = 0.4 + Math.min(n.fan_in_trusted, 12) / 12 * 1.2;
+    const scale = baseRadius[i] * (1 + 0.45 * Math.sin(t * freq * Math.PI * 2));
+    dummy.position.set(n.pos.x, n.pos.y, n.pos.z);
+    dummy.scale.setScalar(scale);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+  });
+
+  mesh.instanceMatrix.needsUpdate = true;
+  controls.update();
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

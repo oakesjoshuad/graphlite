@@ -70,6 +70,11 @@ fn collect_source_files(root: &str, extra_ignore: &[String]) -> Result<Vec<PathB
     Ok(files)
 }
 
+/// Languages excluded from auto-detection on init.
+/// TypeScript, JavaScript, and Svelte servers are slow to start and often add
+/// little value over tree-sitter alone. Users opt-in by editing config.toml.
+const LSP_AUTODETECT_EXCLUDE: &[&str] = &["typescript", "javascript", "svelte"];
+
 fn detect_lsp_from_files(files: &[PathBuf]) -> Vec<String> {
     use std::collections::HashSet;
     // Collect the set of languages that have files in this project
@@ -77,6 +82,7 @@ fn detect_lsp_from_files(files: &[PathBuf]) -> Vec<String> {
         .iter()
         .filter_map(|p| detect_language(p))
         .filter_map(|lang| lang.lsp_server_cmd().map(|_| lang.as_str().to_string()))
+        .filter(|lang_str| !LSP_AUTODETECT_EXCLUDE.contains(&lang_str.as_str()))
         .collect();
     // For each present language, check if server is in PATH
     present
@@ -361,8 +367,8 @@ fn restore_annotations(conn: &rusqlite::Connection, saved: &[SavedAnnotation]) -
 // ─── Fast re-index (tree-sitter only, no LSP) ─────────────────────────────────
 
 /// Re-index changed files using tree-sitter only (no LSP enrichment).
-/// Called from the file-watcher loop where LSP startup cost would be prohibitive.
-pub fn run_fast(root: &str, conn: &rusqlite::Connection) -> Result<()> {
+/// Returns the list of changed paths for callers that need to drive incremental LSP enrichment.
+pub fn run_fast(root: &str, conn: &rusqlite::Connection) -> Result<Vec<PathBuf>> {
     let config = config::load(root);
     let files = collect_source_files(root, &config.ignore)?;
 
@@ -384,7 +390,7 @@ pub fn run_fast(root: &str, conn: &rusqlite::Connection) -> Result<()> {
         .collect();
 
     if changed.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
     eprintln!(
         "[watch] {} file(s) changed, re-indexing (fast)",
@@ -446,5 +452,5 @@ pub fn run_fast(root: &str, conn: &rusqlite::Connection) -> Result<()> {
 
     roles::infer_roles(conn)?;
     eprintln!("[watch] re-index complete: {} symbols", symbols.len());
-    Ok(())
+    Ok(changed)
 }

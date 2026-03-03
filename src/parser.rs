@@ -19,6 +19,9 @@ pub struct Symbol {
     pub visibility: String,
     pub doc: Option<String>,
     pub stable_id: String,
+    /// True when the symbol has a `#[test]` attribute or lives inside a `#[cfg(test)]` module.
+    /// Only set for Rust symbols; always false for other languages.
+    pub is_test_fn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +294,50 @@ fn extract_file_doc(source: &str, language: &Language) -> Option<String> {
     }
 }
 
+/// Returns true if the AST node has a `#[test]` attribute as a preceding sibling.
+/// Walks the prev_sibling chain, skipping other attribute_item nodes.
+fn node_has_test_attr(node: Node<'_>, source: &[u8]) -> bool {
+    let mut sib = node.prev_sibling();
+    while let Some(s) = sib {
+        if s.kind() == "attribute_item" {
+            if let Ok(text) = s.utf8_text(source) {
+                if text == "#[test]" {
+                    return true;
+                }
+            }
+            sib = s.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Returns true if the AST node is nested inside a `#[cfg(test)]` module.
+/// Walks the ancestor chain looking for a `mod_item` with a `cfg(test)` attribute sibling.
+fn is_in_cfg_test_mod(node: Node<'_>, source: &[u8]) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "mod_item" {
+            let mut sib = n.prev_sibling();
+            while let Some(s) = sib {
+                if s.kind() == "attribute_item" {
+                    if let Ok(text) = s.utf8_text(source) {
+                        if text.contains("cfg") && text.contains("test") {
+                            return true;
+                        }
+                    }
+                    sib = s.prev_sibling();
+                } else {
+                    break;
+                }
+            }
+        }
+        current = n.parent();
+    }
+    false
+}
+
 fn extract_symbols(
     tree: &tree_sitter::Tree,
     source: &str,
@@ -359,6 +406,11 @@ fn extract_symbols(
                 None => format!("{}::{}::{}", normalized_file, kind, name),
             };
 
+            let source_bytes = source.as_bytes();
+            let is_test_fn = matches!(*language, Language::Rust)
+                && (node_has_test_attr(symbol_node, source_bytes)
+                    || is_in_cfg_test_mod(symbol_node, source_bytes));
+
             symbols.push(Symbol {
                 name,
                 file: file_str.clone(),
@@ -371,6 +423,7 @@ fn extract_symbols(
                 visibility,
                 doc,
                 stable_id,
+                is_test_fn,
             });
         }
     }

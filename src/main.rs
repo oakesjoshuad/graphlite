@@ -1,4 +1,5 @@
 mod annotate;
+mod arch;
 mod config;
 mod discover;
 mod init_cmd;
@@ -8,10 +9,15 @@ mod language;
 mod lsp;
 mod parser;
 mod query;
+mod reclassify;
 mod refactor;
 mod roles;
 mod schema;
+mod serve;
+mod violations;
+mod viz;
 mod watch;
+mod watcher_engine;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -190,6 +196,78 @@ enum Commands {
         #[arg(long)]
         lsp: bool,
     },
+    /// Serve the viz as a live-reloading web page
+    ///
+    /// Starts a local HTTP server and watches for source-file changes. On each
+    /// change the graph is re-indexed (tree-sitter only, or with LSP when
+    /// --lsp is passed) and the browser automatically reloads.
+    Serve {
+        /// Project root to watch
+        #[arg(default_value = ".")]
+        root: String,
+        /// Port to listen on
+        #[arg(long, default_value = "7765")]
+        port: u16,
+        /// Enable persistent LSP enrichment on file changes
+        #[arg(long)]
+        lsp: bool,
+    },
+    /// Export the code graph as JSON or a self-contained HTML visualization
+    ///
+    /// Default: emits JSON (nodes with 3D positions, edges, bounded contexts).
+    /// With --html: emits a single HTML file with embedded data and a three.js
+    /// 3D visualization. Open in any browser, no server required.
+    Viz {
+        /// Emit a self-contained HTML file instead of JSON
+        #[arg(long)]
+        html: bool,
+    },
+    /// Show architectural violations: role-layer inversions and forbidden context couplings
+    ///
+    /// Queries only rust-analyzer trusted edges (tree-sitter structural edges are excluded
+    /// to prevent false positives from unresolved common names). Test nodes are excluded.
+    /// Use `[[exceptions]]` in `.graphlite/config.toml` to suppress known-acceptable patterns.
+    Violations {
+        /// Filter to edges leaving this bounded context
+        #[arg(long, value_name = "CTX")]
+        from_context: Option<String>,
+        /// Filter to edges arriving at this bounded context
+        #[arg(long, value_name = "CTX")]
+        to_context: Option<String>,
+        /// Show violations touching this context (from or to)
+        #[arg(long, value_name = "CTX")]
+        context: Option<String>,
+        /// Role pattern filter: "from_role:to_role" (e.g. "infra:domain")
+        #[arg(long, value_name = "PATTERN")]
+        pattern: Option<String>,
+        /// Max violations to show, 0 = unlimited (default: 50)
+        #[arg(long, default_value = "50")]
+        top: usize,
+        /// Suppress caller/callee signatures from output
+        #[arg(long)]
+        no_snippets: bool,
+    },
+    /// Override the inferred role for a symbol (persists across re-index via stable_id)
+    ///
+    /// Overrides are stored in the `role_overrides` table and applied at the end of every
+    /// `discover` / `init` run, so they survive incremental re-indexing. Use `--list` to
+    /// review all active overrides, and `--clear` to remove one.
+    Reclassify {
+        /// Symbol id (integer), name (sym:Name), or stable_id (e.g. sym:src/lsp.rs::fn::run)
+        symbol: Option<String>,
+        /// Role to assign (entrypoint, orchestrator, domain, utility, infra, model, leaf, test)
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
+        /// Optional explanation for this override
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// Remove the role override for the symbol
+        #[arg(long)]
+        clear: bool,
+        /// List all active role overrides
+        #[arg(long)]
+        list: bool,
+    },
     /// Show a high-level map of public symbols grouped by file, with hotspots by fan-in
     ///
     /// Orientation command — run this before any other query. Emits all public symbols grouped
@@ -306,6 +384,47 @@ fn main() -> Result<()> {
         )?,
         Commands::Annotations { stale } => annotate::list_annotations(stale)?,
         Commands::Watch { root, lsp } => watch::run(&root, lsp)?,
+        Commands::Serve { root, port, lsp } => serve::run(&root, port, lsp)?,
+        Commands::Viz { html } => viz::run(html)?,
+        Commands::Violations {
+            from_context,
+            to_context,
+            context,
+            pattern,
+            top,
+            no_snippets,
+        } => violations::run(&violations::Params {
+            from_context: from_context.as_deref(),
+            to_context: to_context.as_deref(),
+            context: context.as_deref(),
+            pattern: pattern.as_deref(),
+            top,
+            no_snippets,
+        })?,
+        Commands::Reclassify {
+            symbol,
+            role,
+            reason,
+            clear,
+            list,
+        } => {
+            if list {
+                reclassify::list()?;
+            } else if clear {
+                let sym = symbol
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--clear requires a symbol argument"))?;
+                reclassify::clear(sym)?;
+            } else if let (Some(sym), Some(r)) = (symbol.as_deref(), role.as_deref()) {
+                reclassify::set(&reclassify::SetParams {
+                    symbol: sym,
+                    role: r,
+                    reason: reason.as_deref(),
+                })?;
+            } else {
+                anyhow::bail!("provide a symbol and --role ROLE, or --clear, or --list");
+            }
+        }
         Commands::Map {
             all,
             top,

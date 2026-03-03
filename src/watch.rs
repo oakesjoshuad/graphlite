@@ -108,6 +108,7 @@ pub fn run(root: &str, lsp: bool) -> Result<()> {
                     if let Err(e) = run_fast(&root, &c) {
                         eprintln!("[watch] re-index error: {}", e);
                     }
+                    // changed files returned but not used here (no persistent LSP in watch mode)
                 }
             }
             Some(Inbox::FileChanged) => {
@@ -187,7 +188,7 @@ fn dispatch(
             } else {
                 match conn.lock() {
                     Ok(c) => match run_fast(root, &c) {
-                        Ok(()) => WatchResponse {
+                        Ok(_changed) => WatchResponse {
                             ok: true,
                             error: None,
                         },

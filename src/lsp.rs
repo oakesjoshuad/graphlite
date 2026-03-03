@@ -496,9 +496,7 @@ impl LspClient {
                     // tree-sitter range_start is also the `fn` line, so these match.
                     let target_line = to_item["selectionRange"]["start"]["line"]
                         .as_u64()
-                        .unwrap_or_else(|| {
-                            to_item["range"]["start"]["line"].as_u64().unwrap_or(0)
-                        })
+                        .unwrap_or_else(|| to_item["range"]["start"]["line"].as_u64().unwrap_or(0))
                         as u32;
                     if !uri.is_empty() && !name.is_empty() {
                         targets.push(LspCallTarget {
@@ -764,39 +762,34 @@ fn do_enrich(
     language: &str,
     client: Option<LspClient>,
     edge_tx: &Sender<EdgeMsg>,
-) -> Result<EnrichReport> {
+    file_filter: Option<&std::collections::HashSet<String>>,
+) -> Result<(EnrichReport, LspClient)> {
     match language {
         "rust" => {
             let c = match client {
                 Some(c) => c,
                 None => warm_client("rust", root)?,
             };
-            enrich_rust(db_path, root, c, edge_tx)
+            enrich_rust(db_path, root, c, edge_tx, file_filter)
         }
         "typescript" | "javascript" => {
             let c = match client {
                 Some(c) => c,
                 None => warm_client(language, root)?,
             };
-            enrich_typescript(db_path, root, language, c, edge_tx)
+            enrich_typescript(db_path, root, language, c, edge_tx, file_filter)
         }
         "svelte" => {
             let c = match client {
                 Some(c) => c,
                 None => warm_client("svelte", root)?,
             };
-            enrich_svelte(db_path, root, c, edge_tx)
+            enrich_svelte(db_path, root, c, edge_tx, file_filter)
         }
-        _ => Ok(EnrichReport {
-            language: language.to_string(),
-            elapsed_secs: 0.0,
-            edges_inserted: 0,
-            fns_queried: 0,
-            sigs_enriched: 0,
-            recovered_on_retry: 0,
-            ultimately_failed: Vec::new(),
-            crashes: 0,
-        }),
+        _ => Err(anyhow!(
+            "unsupported language for LSP enrichment: {}",
+            language
+        )),
     }
 }
 
@@ -820,9 +813,10 @@ fn enrich_with_retry(
             );
             std::thread::sleep(Duration::from_secs(attempt as u64));
         }
-        match do_enrich(db_path, root, language, first_client.take(), edge_tx) {
-            Ok(mut report) => {
+        match do_enrich(db_path, root, language, first_client.take(), edge_tx, None) {
+            Ok((mut report, mut client)) => {
                 report.crashes = crashes;
+                let _ = client.shutdown();
                 return Ok(report);
             }
             Err(e) if is_crash_error(&e) => {
@@ -863,6 +857,30 @@ pub fn enrich_parallel(
     }
 }
 
+/// Enrich only the given files using a pre-warmed LSP client.
+/// Returns the client for reuse — the caller is responsible for shutdown.
+pub fn enrich_incremental(
+    db_path: &str,
+    root: &str,
+    language: &str,
+    client: LspClient,
+    files: &[std::path::PathBuf],
+    edge_tx: Sender<EdgeMsg>,
+) -> Result<(EnrichReport, LspClient)> {
+    let filter: std::collections::HashSet<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    do_enrich(
+        db_path,
+        root,
+        language,
+        Some(client),
+        &edge_tx,
+        Some(&filter),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Language-specific enrichment implementations
 // ---------------------------------------------------------------------------
@@ -872,7 +890,8 @@ fn enrich_rust(
     _root: &str,
     mut client: LspClient,
     edge_tx: &Sender<EdgeMsg>,
-) -> Result<EnrichReport> {
+    file_filter: Option<&std::collections::HashSet<String>>,
+) -> Result<(EnrichReport, LspClient)> {
     let t_start = Instant::now();
     let conn = Connection::open(db_path)?;
 
@@ -905,6 +924,16 @@ fn enrich_rust(
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         result
+    };
+
+    // Apply file filter for incremental enrichment (only query changed files).
+    let fn_nodes: Vec<(i64, String, i64, String)> = if let Some(filter) = file_filter {
+        fn_nodes
+            .into_iter()
+            .filter(|(_, file, _, _)| filter.contains(file))
+            .collect()
+    } else {
+        fn_nodes
     };
 
     eprintln!(
@@ -1034,8 +1063,6 @@ fn enrich_rust(
         }
     }
 
-    client.shutdown()?;
-
     let edge_count = trusted_edges.len();
     for (from_id, to_id, edge_type) in &trusted_edges {
         edge_tx
@@ -1048,16 +1075,19 @@ fn enrich_rust(
             .map_err(|_| anyhow!("LSP writer closed"))?;
     }
 
-    Ok(EnrichReport {
-        language: "rust".to_string(),
-        elapsed_secs: t_start.elapsed().as_secs_f32(),
-        edges_inserted: edge_count,
-        fns_queried: fn_nodes.len(),
-        sigs_enriched: 0,
-        recovered_on_retry,
-        ultimately_failed,
-        crashes: 0,
-    })
+    Ok((
+        EnrichReport {
+            language: "rust".to_string(),
+            elapsed_secs: t_start.elapsed().as_secs_f32(),
+            edges_inserted: edge_count,
+            fns_queried: fn_nodes.len(),
+            sigs_enriched: 0,
+            recovered_on_retry,
+            ultimately_failed,
+            crashes: 0,
+        },
+        client,
+    ))
 }
 
 fn enrich_typescript(
@@ -1066,7 +1096,8 @@ fn enrich_typescript(
     language: &str,
     mut client: LspClient,
     edge_tx: &Sender<EdgeMsg>,
-) -> Result<EnrichReport> {
+    file_filter: Option<&std::collections::HashSet<String>>,
+) -> Result<(EnrichReport, LspClient)> {
     let t_start = Instant::now();
     let conn = Connection::open(db_path)?;
 
@@ -1107,6 +1138,15 @@ fn enrich_typescript(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         result
+    };
+
+    let fn_nodes = if let Some(filter) = file_filter {
+        fn_nodes
+            .into_iter()
+            .filter(|(_, file, _, _, _)| filter.contains(file))
+            .collect::<Vec<_>>()
+    } else {
+        fn_nodes
     };
 
     // Open all unique source files so the language server builds semantic models.
@@ -1291,8 +1331,6 @@ fn enrich_typescript(
         }
     }
 
-    client.shutdown()?;
-
     let edge_count = trusted_edges.len();
     for (from_id, to_id) in &trusted_edges {
         edge_tx
@@ -1312,16 +1350,19 @@ fn enrich_typescript(
             .map_err(|_| anyhow!("LSP writer closed"))?;
     }
 
-    Ok(EnrichReport {
-        language: language.to_string(),
-        elapsed_secs: t_start.elapsed().as_secs_f32(),
-        edges_inserted: edge_count,
-        fns_queried: fn_nodes.len(),
-        sigs_enriched,
-        recovered_on_retry,
-        ultimately_failed,
-        crashes: 0,
-    })
+    Ok((
+        EnrichReport {
+            language: language.to_string(),
+            elapsed_secs: t_start.elapsed().as_secs_f32(),
+            edges_inserted: edge_count,
+            fns_queried: fn_nodes.len(),
+            sigs_enriched,
+            recovered_on_retry,
+            ultimately_failed,
+            crashes: 0,
+        },
+        client,
+    ))
 }
 
 fn enrich_svelte(
@@ -1329,7 +1370,8 @@ fn enrich_svelte(
     _root: &str,
     mut client: LspClient,
     edge_tx: &Sender<EdgeMsg>,
-) -> Result<EnrichReport> {
+    file_filter: Option<&std::collections::HashSet<String>>,
+) -> Result<(EnrichReport, LspClient)> {
     let t_start = Instant::now();
     let conn = Connection::open(db_path)?;
 
@@ -1361,6 +1403,15 @@ fn enrich_svelte(
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         result
+    };
+
+    let fn_nodes = if let Some(filter) = file_filter {
+        fn_nodes
+            .into_iter()
+            .filter(|(_, file, _, _)| filter.contains(file))
+            .collect::<Vec<_>>()
+    } else {
+        fn_nodes
     };
 
     // Open each .svelte file so svelteserver builds its TypeScript plugin model
@@ -1459,8 +1510,6 @@ fn enrich_svelte(
         }
     }
 
-    client.shutdown()?;
-
     let edge_count = trusted_edges.len();
     for (from_id, to_id) in &trusted_edges {
         edge_tx
@@ -1473,14 +1522,17 @@ fn enrich_svelte(
             .map_err(|_| anyhow!("LSP writer closed"))?;
     }
 
-    Ok(EnrichReport {
-        language: "svelte".to_string(),
-        elapsed_secs: t_start.elapsed().as_secs_f32(),
-        edges_inserted: edge_count,
-        fns_queried: fn_nodes.len(),
-        sigs_enriched: 0,
-        recovered_on_retry,
-        ultimately_failed,
-        crashes: 0,
-    })
+    Ok((
+        EnrichReport {
+            language: "svelte".to_string(),
+            elapsed_secs: t_start.elapsed().as_secs_f32(),
+            edges_inserted: edge_count,
+            fns_queried: fn_nodes.len(),
+            sigs_enriched: 0,
+            recovered_on_retry,
+            ultimately_failed,
+            crashes: 0,
+        },
+        client,
+    ))
 }
