@@ -113,8 +113,11 @@ fn capabilities_json_exposes_surface_and_unavailable() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\"commands\""), "expected commands list");
     assert!(text.contains("\"violations\""), "expected violations command");
-    assert!(text.contains("\"unavailable\""), "expected unavailable section");
-    assert!(text.contains("\"reclassify\""), "expected unavailable reclassify");
+    assert!(text.contains("\"reclassify\""), "expected reclassify command");
+    assert!(
+        !text.contains("\"unavailable\""),
+        "did not expect unavailable section for dropped features"
+    );
 }
 
 #[test]
@@ -910,6 +913,32 @@ fn symbols_namespace_query_uses_non_fts_fallback() {
 }
 
 #[test]
+fn symbols_infix_wildcard_and_scope_filters_work() {
+    ensure_db();
+    let out = Command::new(bin())
+        .args([
+            "symbols",
+            "*discover*",
+            "--language",
+            "rust",
+            "--file",
+            "src/discover.rs",
+            "--context",
+            "root",
+            "--md",
+        ])
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "symbols infix wildcard should succeed");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("src/discover.rs"),
+        "expected filtered discover file results"
+    );
+}
+
+#[test]
 fn resolve_returns_deterministic_top_candidate_with_strategy() {
     ensure_db();
     let out = Command::new(bin())
@@ -926,6 +955,22 @@ fn resolve_returns_deterministic_top_candidate_with_strategy() {
     assert!(
         text.contains("selected_id="),
         "expected selected_id on resolution output"
+    );
+}
+
+#[test]
+fn resolve_prefer_role_biases_selection() {
+    ensure_db();
+    let out = Command::new(bin())
+        .args(["resolve", "run", "--prefer-role", "orchestrator"])
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "resolve with prefer-role should succeed");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("role=\"orchestrator\""),
+        "expected orchestrator-preferred resolution, got: {text}"
     );
 }
 
@@ -1002,6 +1047,30 @@ fn trace_path_accepts_read_write_direction_aliases() {
     assert!(
         read_text.contains("direction=\"incoming\""),
         "read alias should map to incoming"
+    );
+}
+
+#[test]
+fn trace_path_high_level_mode_marks_output() {
+    ensure_db();
+    let out = Command::new(bin())
+        .args([
+            "trace-path",
+            "sym:src/discover.rs::fn::run",
+            "--high-level",
+            "--max-depth",
+            "3",
+            "--max-paths",
+            "3",
+        ])
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "trace-path --high-level should succeed");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("high_level=\"true\""),
+        "expected high_level marker on trace_path root"
     );
 }
 
@@ -1163,6 +1232,17 @@ fn blast_radius_compact_mode_defers_heavy_payloads() {
         "compact mode should defer snippets"
     );
     assert!(!text.contains("<annotation"), "compact mode should defer annotations");
+}
+
+#[test]
+fn reclassify_command_runs_successfully() {
+    ensure_db();
+    let out = Command::new(bin())
+        .args(["reclassify", "."])
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "reclassify should succeed");
 }
 
 #[test]

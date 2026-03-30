@@ -85,7 +85,13 @@ struct ResolveCandidate {
     fan_in: i64,
 }
 
-pub fn resolve(query: &str, language: Option<&str>, md: bool) -> Result<()> {
+pub fn resolve(
+    query: &str,
+    language: Option<&str>,
+    prefer_role: Option<&str>,
+    prefer_file: Option<&str>,
+    md: bool,
+) -> Result<()> {
     let conn = open_db()?;
     let (strategy, mut candidates) = resolve_candidates(&conn, query, language)?;
     if candidates.is_empty() {
@@ -93,8 +99,14 @@ pub fn resolve(query: &str, language: Option<&str>, md: bool) -> Result<()> {
     }
 
     candidates.sort_by(|a, b| {
-        b.fan_in
-            .cmp(&a.fan_in)
+        let a_role_pref = prefer_role.is_some_and(|r| a.role == r);
+        let b_role_pref = prefer_role.is_some_and(|r| b.role == r);
+        let a_file_pref = prefer_file.is_some_and(|p| a.file.contains(p));
+        let b_file_pref = prefer_file.is_some_and(|p| b.file.contains(p));
+        b_role_pref
+            .cmp(&a_role_pref)
+            .then_with(|| b_file_pref.cmp(&a_file_pref))
+            .then_with(|| b.fan_in.cmp(&a.fan_in))
             .then_with(|| (a.role == "test").cmp(&(b.role == "test")))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.id.cmp(&b.id))
@@ -381,10 +393,23 @@ fn fetch_candidates<P: rusqlite::Params>(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-pub fn symbols(fts_query: &str, language: Option<&str>, md: bool) -> Result<()> {
+pub fn symbols(
+    fts_query: &str,
+    language: Option<&str>,
+    file_filter: Option<&str>,
+    context_filter: Option<&str>,
+    crate_filter: Option<&str>,
+    md: bool,
+) -> Result<()> {
     let conn = open_db()?;
     let key = fts_query.strip_prefix("sym:").unwrap_or(fts_query);
+    let wildcard_infix = fts_query.starts_with('*')
+        || fts_query
+            .trim_end_matches('*')
+            .chars()
+            .any(|c| c == '*');
     let use_namespace_fallback = key.contains("::") || fts_query.starts_with("sym:");
+    let use_like_wildcard = wildcard_infix && !fts_query.contains(' ');
 
     let rows_data: Vec<SymbolSearchRow> = if use_namespace_fallback {
         let like_term = if key.contains("::") {
@@ -392,6 +417,50 @@ pub fn symbols(fts_query: &str, language: Option<&str>, md: bool) -> Result<()> 
         } else {
             format!("%{}%", key)
         };
+        if let Some(lang) = language {
+            let mut stmt = conn.prepare(
+                "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
+                 FROM nodes n
+                 WHERE n.language = ?2
+                   AND (n.stable_id LIKE ?1 OR n.qualified_name LIKE ?1 OR n.name LIKE ?1)
+                 ORDER BY n.file, n.name, n.id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![like_term, lang], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
+                 FROM nodes n
+                 WHERE n.stable_id LIKE ?1 OR n.qualified_name LIKE ?1 OR n.name LIKE ?1
+                 ORDER BY n.file, n.name, n.id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![like_term], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+    } else if use_like_wildcard {
+        let like_term = format!("%{}%", key.replace('*', "%"));
         if let Some(lang) = language {
             let mut stmt = conn.prepare(
                 "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
@@ -477,6 +546,25 @@ pub fn symbols(fts_query: &str, language: Option<&str>, md: bool) -> Result<()> 
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
+
+    let ws_graph = if crate_filter.is_some() {
+        crate::workspace::detect(".")
+    } else {
+        None
+    };
+    let rows_data: Vec<SymbolSearchRow> = rows_data
+        .into_iter()
+        .filter(|(_, _, _, _, _, file, _, _)| {
+            file_filter.is_none_or(|f| file.contains(f))
+                && context_filter
+                    .is_none_or(|ctx| crate::arch::file_to_context(file) == ctx)
+                && crate_filter.is_none_or(|want| {
+                    ws_graph.as_ref().is_some_and(|ws| {
+                        symbol_crate_for_file(ws, file).is_some_and(|c| c == want)
+                    })
+                })
+        })
+        .collect();
 
     let count = rows_data.len();
     eprintln!("{} match(es)", count);
@@ -1957,6 +2045,25 @@ fn file_to_module(path: &str) -> String {
         .to_string()
 }
 
+fn symbol_crate_for_file<'a>(ws: &'a crate::workspace::WorkspaceGraph, file: &str) -> Option<&'a str> {
+    let file_norm = file.trim_start_matches("./");
+    let mut members: Vec<&crate::workspace::CrateMember> = ws.members.iter().collect();
+    members.sort_by_key(|m| std::cmp::Reverse(m.path.len()));
+    for m in members {
+        if m.path.is_empty() {
+            if file_norm.starts_with("src/") {
+                return Some(m.name.as_str());
+            }
+            continue;
+        }
+        let prefix = format!("{}/", m.path);
+        if file_norm.starts_with(&prefix) {
+            return Some(m.name.as_str());
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn map(
     include_private: bool,
@@ -2204,6 +2311,7 @@ pub fn map(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn trace_path(
     symbol: &str,
     to: Option<&str>,
@@ -2212,6 +2320,7 @@ pub fn trace_path(
     max_paths: usize,
     with_async_boundaries: bool,
     with_channels: bool,
+    high_level: bool,
 ) -> Result<()> {
     let conn = open_db()?;
     let start_id = resolve_symbol_id(&conn, symbol)?;
@@ -2398,6 +2507,7 @@ pub fn trace_path(
     let max_depth_s = max_depth.to_string();
     let max_paths_s = max_paths.to_string();
     let found_s = emitted.len().to_string();
+    let high_level_s = high_level.to_string();
     vxml::open_attrs(
         &mut w,
         "trace_path",
@@ -2409,6 +2519,7 @@ pub fn trace_path(
             ("max_depth", &max_depth_s),
             ("max_paths", &max_paths_s),
             ("found", &found_s),
+            ("high_level", &high_level_s),
             ("tokens", "streaming"),
         ],
     )?;
@@ -2424,10 +2535,32 @@ pub fn trace_path(
     }
 
     for (idx, path) in emitted.iter().enumerate() {
+        let mut rendered: Vec<Hop> = if high_level {
+            let mut keep = Vec::new();
+            for (i, hop) in path.iter().enumerate() {
+                let from = load_node(hop.from, &mut node_stmt)?;
+                let to_node = load_node(hop.to, &mut node_stmt)?;
+                let low_role = |r: &str| matches!(r, "leaf" | "utility" | "unknown");
+                let is_low_signal = low_role(&from.role) && low_role(&to_node.role);
+                if i == 0 || i + 1 == path.len() || !is_low_signal {
+                    keep.push(hop.clone());
+                }
+            }
+            if keep.is_empty() && !path.is_empty() {
+                vec![path[0].clone()]
+            } else {
+                keep
+            }
+        } else {
+            path.clone()
+        };
+        if rendered.is_empty() {
+            continue;
+        }
         let i_s = (idx + 1).to_string();
-        let hops_s = path.len().to_string();
+        let hops_s = rendered.len().to_string();
         vxml::open_attrs(&mut w, "path", &[("index", &i_s), ("hops", &hops_s)])?;
-        for hop in path {
+        for hop in rendered.drain(..) {
             let from = load_node(hop.from, &mut node_stmt)?;
             let to_node = load_node(hop.to, &mut node_stmt)?;
             let attrs = vec![
@@ -2458,6 +2591,10 @@ pub fn trace_path(
                     || is_channelish(to_node.name.as_str(), to_node.signature.as_deref()))
             {
                 vxml::empty(&mut w, "boundary", &[("type", "channel_or_actor")])?;
+            }
+
+            if high_level {
+                vxml::empty(&mut w, "boundary", &[("type", "high_level_filter")])?;
             }
 
             vxml::close(&mut w, "hop")?;

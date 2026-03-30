@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Result};
 use rusqlite::Connection;
@@ -154,12 +155,21 @@ fn run_and_apply(
 // ── cargo rustdoc invocation ─────────────────────────────────────────────────
 
 fn run_cargo_rustdoc(root: &str, manifest_path: &Path, crate_name: &str) -> Result<PathBuf> {
+    let safe_name = crate_name.replace('-', "_");
+    let rustdoc_target = Path::new(root)
+        .join(".graphlite")
+        .join("rustdoc-json")
+        .join(&safe_name);
+    std::fs::create_dir_all(&rustdoc_target)?;
+
     let status = Command::new("cargo")
         .args([
             "+nightly",
             "rustdoc",
             "--manifest-path",
             manifest_path.to_str().unwrap_or(""),
+            "--target-dir",
+            rustdoc_target.to_str().unwrap_or(""),
             "--",
             "-Zunstable-options",
             "--output-format",
@@ -172,19 +182,78 @@ fn run_cargo_rustdoc(root: &str, manifest_path: &Path, crate_name: &str) -> Resu
         bail!("cargo +nightly rustdoc failed for {}", crate_name);
     }
 
-    // Cargo writes to <workspace_target>/doc/<crate_name>.json.
-    // The crate name in the file path uses underscores, not hyphens.
-    let target_dir = format!("{}/target/doc", root.trim_end_matches('/'));
-    let safe_name = crate_name.replace('-', "_");
-    let json_path = PathBuf::from(format!("{}/{}.json", target_dir, safe_name));
-
-    if !json_path.exists() {
+    let doc_dir = rustdoc_target.join("doc");
+    let candidates = rustdoc_json_candidates(&doc_dir)?;
+    if candidates.is_empty() {
         bail!(
-            "rustdoc JSON not found at {} — check that nightly rustdoc is installed",
-            json_path.display()
+            "rustdoc JSON not found under {} — check that nightly rustdoc is installed",
+            doc_dir.display()
         );
     }
-    Ok(json_path)
+
+    if let Some(path) = pick_rustdoc_json_candidate(&safe_name, &candidates) {
+        return Ok(path);
+    }
+
+    let names = candidates
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "rustdoc JSON candidates found but none selected for crate '{}': [{}]",
+        crate_name,
+        names
+    )
+}
+
+fn rustdoc_json_candidates(doc_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !doc_dir.exists() {
+        return Ok(files);
+    }
+    for ent in std::fs::read_dir(doc_dir)? {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let p = ent.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("json") {
+            files.push(p);
+        }
+    }
+    Ok(files)
+}
+
+fn pick_rustdoc_json_candidate(crate_name_safe: &str, candidates: &[PathBuf]) -> Option<PathBuf> {
+    // Preferred: exact stem match for expected crate name.
+    if let Some(p) = candidates.iter().find(|p| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == crate_name_safe)
+    }) {
+        return Some(p.clone());
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+
+    // Deterministic fallback: newest mtime, then lexical path.
+    let mut ranked: Vec<(PathBuf, SystemTime)> = candidates
+        .iter()
+        .map(|p| {
+            let mt = p
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (p.clone(), mt)
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_string_lossy().cmp(&b.0.to_string_lossy()))
+    });
+    ranked.first().map(|(p, _)| p.clone())
 }
 
 // ── JSON parsing and DB application ─────────────────────────────────────────
@@ -528,4 +597,27 @@ fn extract_rustdoc_signature(item: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_rustdoc_json_candidate;
+    use std::path::PathBuf;
+
+    #[test]
+    fn picks_exact_stem_match_first() {
+        let files = vec![
+            PathBuf::from("/tmp/doc/other.json"),
+            PathBuf::from("/tmp/doc/tools.json"),
+        ];
+        let picked = pick_rustdoc_json_candidate("tools", &files).expect("candidate");
+        assert_eq!(picked, PathBuf::from("/tmp/doc/tools.json"));
+    }
+
+    #[test]
+    fn picks_single_candidate_when_only_one_exists() {
+        let files = vec![PathBuf::from("/tmp/doc/bin_main.json")];
+        let picked = pick_rustdoc_json_candidate("tools", &files).expect("candidate");
+        assert_eq!(picked, PathBuf::from("/tmp/doc/bin_main.json"));
+    }
 }

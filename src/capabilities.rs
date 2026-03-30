@@ -20,7 +20,6 @@ struct CapabilitySurface {
     name: &'static str,
     version: &'static str,
     commands: Vec<CommandCap>,
-    unavailable: Vec<&'static str>,
 }
 
 pub fn run(json: bool) -> Result<()> {
@@ -33,13 +32,24 @@ pub fn run(json: bool) -> Result<()> {
             cmd(
                 "symbols",
                 "Search symbols by FTS query",
-                &[flag("language", true), flag("md", false)],
+                &[
+                    flag("language", true),
+                    flag("file", true),
+                    flag("context", true),
+                    flag("crate-name", true),
+                    flag("md", false),
+                ],
             ),
             cmd("deps", "Show workspace crate dependency graph", &[flag("md", false)]),
             cmd(
                 "resolve",
                 "Resolve ambiguous symbol selectors to deterministic top candidates",
-                &[flag("language", true), flag("md", false)],
+                &[
+                    flag("language", true),
+                    flag("prefer-role", true),
+                    flag("prefer-file", true),
+                    flag("md", false),
+                ],
             ),
             cmd(
                 "trace-path",
@@ -51,6 +61,7 @@ pub fn run(json: bool) -> Result<()> {
                     flag("max-paths", true),
                     flag("with-async-boundaries", false),
                     flag("with-channels", false),
+                    flag("high-level", false),
                 ],
             ),
             cmd(
@@ -99,6 +110,11 @@ pub fn run(json: bool) -> Result<()> {
             cmd(
                 "watch",
                 "Watch source files and re-index on change",
+                &[],
+            ),
+            cmd(
+                "reclassify",
+                "Re-run role classification over the current graph",
                 &[],
             ),
             cmd(
@@ -158,7 +174,6 @@ pub fn run(json: bool) -> Result<()> {
                 &[],
             ),
         ],
-        unavailable: vec!["serve", "viz", "reclassify", "lsp"],
     };
 
     if json {
@@ -184,9 +199,6 @@ pub fn run(json: bool) -> Result<()> {
             };
             println!("  {:<14} {}", c.name, c.summary);
             println!("  {:<14} {}", "flags:", flags);
-        }
-        if !surface.unavailable.is_empty() {
-            println!("unavailable: {}", surface.unavailable.join(", "));
         }
     }
 

@@ -70,6 +70,16 @@ CREATE TABLE crate_advisories (
     UNIQUE(package_name, version, advisory_id)
 );
 
+CREATE TABLE node_diagnostics (
+    id INTEGER PRIMARY KEY,
+    node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    code TEXT NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    suggestion TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
 CREATE VIRTUAL TABLE fts_symbols USING fts5(
     name,
     qualified_name,
@@ -84,6 +94,8 @@ CREATE INDEX idx_edges_from ON edges(from_id);
 CREATE INDEX idx_edges_to ON edges(to_id);
 CREATE INDEX idx_edges_to_source ON edges(to_id, source);
 CREATE INDEX idx_nodes_file ON nodes(file);
+CREATE INDEX idx_node_diagnostics_node ON node_diagnostics(node_id);
+CREATE INDEX idx_node_diagnostics_code ON node_diagnostics(code);
 ";
 
 pub fn init_db(path: &str) -> Result<Connection> {

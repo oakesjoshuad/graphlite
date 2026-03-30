@@ -119,6 +119,14 @@ pub fn infer_roles(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn run(root: &str) -> Result<()> {
+    let graphlite_dir = format!("{}/.graphlite", root.trim_end_matches('/'));
+    std::fs::create_dir_all(&graphlite_dir)?;
+    let db_path = format!("{}/codegraph.db", graphlite_dir);
+    let conn = crate::schema::open_or_init_db(&db_path)?;
+    infer_roles(&conn)
+}
+
 fn classify(
     node: &NodeMetrics,
     fan_out_sorted: &[i64],

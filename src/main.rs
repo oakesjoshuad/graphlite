@@ -115,6 +115,15 @@ enum Commands {
         /// Filter results by language
         #[arg(long, value_name = "LANG")]
         language: Option<String>,
+        /// Restrict results to files containing this substring
+        #[arg(long, value_name = "PATTERN")]
+        file: Option<String>,
+        /// Restrict results to a bounded context name (derived from file path)
+        #[arg(long, value_name = "CTX")]
+        context: Option<String>,
+        /// Restrict results to a workspace crate name
+        #[arg(long, value_name = "CRATE")]
+        crate_name: Option<String>,
         /// Output as markdown table instead of XML
         #[arg(long)]
         md: bool,
@@ -132,6 +141,12 @@ enum Commands {
         /// Filter candidates by language
         #[arg(long, value_name = "LANG")]
         language: Option<String>,
+        /// Prefer candidates in this inferred role (e.g. entrypoint, orchestrator)
+        #[arg(long, value_name = "ROLE")]
+        prefer_role: Option<String>,
+        /// Prefer candidates whose file path contains this substring
+        #[arg(long, value_name = "PATTERN")]
+        prefer_file: Option<String>,
         /// Output as markdown instead of XML
         #[arg(long)]
         md: bool,
@@ -158,6 +173,15 @@ enum Commands {
         /// Annotate channel/actor boundaries in path hops
         #[arg(long)]
         with_channels: bool,
+        /// Collapse low-signal utility/leaf hops to emphasize endpoint-to-core flow
+        #[arg(long)]
+        high_level: bool,
+    },
+    /// Re-run role classification over the current graph after indexing/annotations
+    Reclassify {
+        /// Project root
+        #[arg(default_value = ".")]
+        root: String,
     },
     /// Find all symbols that (transitively) depend on a given symbol
     ///
@@ -460,9 +484,35 @@ fn main() -> Result<()> {
                 },
             )?
         }
-        Commands::Symbols { query, language, md } => query::symbols(&query, language.as_deref(), md)?,
+        Commands::Symbols {
+            query,
+            language,
+            file,
+            context,
+            crate_name,
+            md,
+        } => query::symbols(
+            &query,
+            language.as_deref(),
+            file.as_deref(),
+            context.as_deref(),
+            crate_name.as_deref(),
+            md,
+        )?,
         Commands::Deps { md } => query::deps(md)?,
-        Commands::Resolve { query, language, md } => query::resolve(&query, language.as_deref(), md)?,
+        Commands::Resolve {
+            query,
+            language,
+            prefer_role,
+            prefer_file,
+            md,
+        } => query::resolve(
+            &query,
+            language.as_deref(),
+            prefer_role.as_deref(),
+            prefer_file.as_deref(),
+            md,
+        )?,
         Commands::TracePath {
             symbol,
             to,
@@ -471,6 +521,7 @@ fn main() -> Result<()> {
             max_paths,
             with_async_boundaries,
             with_channels,
+            high_level,
         } => query::trace_path(
             &symbol,
             to.as_deref(),
@@ -479,7 +530,9 @@ fn main() -> Result<()> {
             max_paths,
             with_async_boundaries,
             with_channels,
+            high_level,
         )?,
+        Commands::Reclassify { root } => roles::run(&root)?,
         Commands::BlastRadius {
             symbols,
             depth,

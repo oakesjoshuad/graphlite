@@ -59,6 +59,7 @@ graphlite init .
 graphlite discover .
 graphlite map
 graphlite symbols "parse*"
+graphlite symbols "*segment*" --context sales --file opportunities
 graphlite deps
 graphlite graph sym:run
 graphlite graph sym:run --budget-lines 25 --offset 0
@@ -79,6 +80,7 @@ graphlite policy init-pack ddd-hexagonal-rust
 graphlite policy lint
 graphlite policy lint --stale
 graphlite policy lint --fail-on-stale --fail-on-broad
+graphlite reclassify .
 graphlite capabilities --json
 ```
 
@@ -87,6 +89,9 @@ Notes:
 - `trace-path --direction` accepts `outgoing|incoming|both` plus aliases `write|read`.
 - `graph`, `blast-radius`, and `context` support deterministic output windows via `--budget-lines`, `--budget-tokens`, and `--offset`; truncated output includes `next_offset` for exact resume.
 - `--compact` on `graph`/`blast-radius`/`context` defers heavy payloads (docs/snippets/annotations) for lower-token passes.
+- `symbols` supports scope narrowing via `--file`, `--context`, and `--crate-name`; infix wildcard patterns like `*segment*` use non-FTS fallback.
+- `resolve` supports `--prefer-role` and `--prefer-file` for colliding names.
+- `trace-path --high-level` collapses utility/leaf-heavy hops for endpoint-to-core flow review.
 - `discover` now runs clippy (`check`) and advisory (`audit`) enrichment automatically in best-effort mode.
 - `check` and `audit` remain available for on-demand refreshes between discovers.
 - `policy init-pack` sets `[policy].pack` in `.graphlite/config.toml`; custom rules in `[[violations]]`, `[[exceptions]]`, `[[visibility_rules]]`, and `[workspace]` still apply as local overrides.
