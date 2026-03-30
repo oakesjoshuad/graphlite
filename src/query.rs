@@ -11,6 +11,20 @@ pub(crate) fn open_db() -> Result<Connection> {
     Ok(conn)
 }
 
+fn is_testish(file: &str, role: &str) -> bool {
+    if role == "test" {
+        return true;
+    }
+    let p = file.trim_start_matches("./").to_ascii_lowercase();
+    p.contains("/tests/")
+        || p.starts_with("tests/")
+        || p.ends_with("_test.rs")
+        || p.ends_with(".test.ts")
+        || p.ends_with(".test.js")
+        || p.ends_with(".spec.ts")
+        || p.ends_with(".spec.js")
+}
+
 fn is_trusted_source(source: &str) -> bool {
     matches!(source, "resolver" | "rustdoc")
 }
@@ -399,6 +413,7 @@ pub fn symbols(
     file_filter: Option<&str>,
     context_filter: Option<&str>,
     crate_filter: Option<&str>,
+    exclude_tests: bool,
     md: bool,
 ) -> Result<()> {
     let conn = open_db()?;
@@ -503,48 +518,21 @@ pub fn symbols(
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
-    } else if let Some(lang) = language {
-        let mut stmt = conn.prepare(
-            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
-             FROM fts_symbols f
-             JOIN nodes n ON n.id = f.node_id
-             WHERE fts_symbols MATCH ?1 AND n.language = ?2
-             ORDER BY rank",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![fts_query, lang], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare(
-            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
-             FROM fts_symbols f
-             JOIN nodes n ON n.id = f.node_id
-             WHERE fts_symbols MATCH ?1
-             ORDER BY rank",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![fts_query], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+        // FTS can be brittle for free-text with punctuation (e.g. hyphenated terms).
+        // Fallback to tokenized LIKE matching when FTS parse fails.
+        match fts_symbol_rows(&conn, fts_query, language) {
+            Ok(rows) => rows,
+            Err(_) => {
+                let like = tokenized_like_rows(&conn, fts_query, language)?;
+                if like.is_empty() {
+                    // Preserve original FTS error if fallback also misses.
+                    fts_symbol_rows(&conn, fts_query, language)?
+                } else {
+                    like
+                }
+            }
+        }
     };
 
     let ws_graph = if crate_filter.is_some() {
@@ -554,7 +542,7 @@ pub fn symbols(
     };
     let rows_data: Vec<SymbolSearchRow> = rows_data
         .into_iter()
-        .filter(|(_, _, _, _, _, file, _, _)| {
+        .filter(|(_, _, _, _, role, file, _, _)| {
             file_filter.is_none_or(|f| file.contains(f))
                 && context_filter
                     .is_none_or(|ctx| crate::arch::file_to_context(file) == ctx)
@@ -563,6 +551,7 @@ pub fn symbols(
                         symbol_crate_for_file(ws, file).is_some_and(|c| c == want)
                     })
                 })
+                && (!exclude_tests || !is_testish(file, role))
         })
         .collect();
 
@@ -605,6 +594,111 @@ pub fn symbols(
         vxml::finish_stream(w)?;
     }
     Ok(())
+}
+
+fn fts_symbol_rows(
+    conn: &Connection,
+    fts_query: &str,
+    language: Option<&str>,
+) -> Result<Vec<SymbolSearchRow>> {
+    if let Some(lang) = language {
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
+             FROM fts_symbols f
+             JOIN nodes n ON n.id = f.node_id
+             WHERE fts_symbols MATCH ?1 AND n.language = ?2
+             ORDER BY rank",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![fts_query, lang], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        return Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
+         FROM fts_symbols f
+         JOIN nodes n ON n.id = f.node_id
+         WHERE fts_symbols MATCH ?1
+         ORDER BY rank",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![fts_query], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, String>(7)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn tokenized_like_rows(
+    conn: &Connection,
+    query: &str,
+    language: Option<&str>,
+) -> Result<Vec<SymbolSearchRow>> {
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from(
+        "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
+         FROM nodes n WHERE 1=1",
+    );
+    if language.is_some() {
+        sql.push_str(" AND n.language = ?");
+    }
+    for _ in &tokens {
+        sql.push_str(
+            " AND (n.name LIKE ? OR n.qualified_name LIKE ? OR n.stable_id LIKE ? OR n.signature LIKE ?)",
+        );
+    }
+    sql.push_str(" ORDER BY n.file, n.name, n.id");
+
+    let mut params: Vec<String> = Vec::new();
+    if let Some(lang) = language {
+        params.push(lang.to_string());
+    }
+    for t in &tokens {
+        let like = format!("%{}%", t.replace("::", "%"));
+        params.push(like.clone());
+        params.push(like.clone());
+        params.push(like.clone());
+        params.push(like);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, String>(7)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1493,54 +1587,7 @@ fn blast_radius_one(
 ) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
-
-    let depth_limit = if depth == 0 { 50_i64 } else { depth as i64 };
-
-    let mut stmt = conn.prepare(
-        "WITH RECURSIVE dependents(id, depth) AS (
-            SELECT ?1, 0
-            UNION ALL
-            SELECT e.from_id, d.depth + 1
-            FROM dependents d JOIN edges e ON e.to_id = d.id
-            WHERE d.depth < ?2
-        )
-        SELECT nd.id, nd.name, nd.kind, nd.file, nd.range_start, nd.range_end,
-               nd.signature, MIN(nh.depth),
-               nd.visibility, nd.doc,
-               (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
-               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
-               nd.role, nd.role_confidence, nd.stable_id
-        FROM nodes nd JOIN dependents nh ON nd.id = nh.id
-        WHERE nd.id != ?1
-        GROUP BY nd.id
-        ORDER BY MIN(nh.depth), nd.name",
-    )?;
-
-    let rows: Vec<(NodeRow, i64)> = stmt
-        .query_map(rusqlite::params![root_id, depth_limit], |r| {
-            Ok((
-                NodeRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    kind: r.get(2)?,
-                    file: r.get(3)?,
-                    range_start: r.get(4)?,
-                    range_end: r.get(5)?,
-                    signature: r.get(6)?,
-                    visibility: r.get(8)?,
-                    doc: r.get(9)?,
-                    fan_in: r.get(10)?,
-                    fan_out: r.get(11)?,
-                    role: r.get(12)?,
-                    role_confidence: r.get(13)?,
-                    stable_id: r.get(14)?,
-                },
-                r.get::<_, i64>(7)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let focus: NodeRow = conn
+    let mut focus: NodeRow = conn
         .query_row(
             "SELECT n.id, n.name, n.kind, n.file, n.range_start, n.range_end, n.signature,
                     n.visibility, n.doc,
@@ -1569,6 +1616,84 @@ fn blast_radius_one(
             },
         )
         .map_err(|_| anyhow!("node id {} not found", root_id))?;
+
+    let depth_limit = if depth == 0 { 50_i64 } else { depth as i64 };
+    let include_type_users = matches!(
+        focus.kind.as_str(),
+        "struct" | "enum" | "type" | "trait" | "union"
+    );
+    if include_type_users {
+        let type_user_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM nodes n
+                 WHERE n.id != ?1
+                   AND (n.signature LIKE ('%' || ?2 || '%')
+                        OR n.doc LIKE ('%' || ?2 || '%'))",
+                rusqlite::params![root_id, focus.name],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        focus.fan_in += type_user_count;
+    }
+
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE type_users(id) AS (
+            SELECT n.id
+            FROM nodes n
+            WHERE ?4 = 1
+              AND n.id != ?1
+              AND (n.signature LIKE ('%' || ?3 || '%')
+                   OR n.doc LIKE ('%' || ?3 || '%'))
+        ),
+        dependents(id, depth) AS (
+            SELECT ?1, 0
+            UNION
+            SELECT tu.id, 1
+            FROM type_users tu
+            UNION ALL
+            SELECT e.from_id, d.depth + 1
+            FROM dependents d JOIN edges e ON e.to_id = d.id
+            WHERE d.depth < ?2
+        )
+        SELECT nd.id, nd.name, nd.kind, nd.file, nd.range_start, nd.range_end,
+               nd.signature, MIN(nh.depth),
+               nd.visibility, nd.doc,
+               (SELECT COUNT(*) FROM edges WHERE to_id = nd.id) AS fan_in,
+               (SELECT COUNT(*) FROM edges WHERE from_id = nd.id) AS fan_out,
+               nd.role, nd.role_confidence, nd.stable_id
+        FROM nodes nd JOIN dependents nh ON nd.id = nh.id
+        WHERE nd.id != ?1
+        GROUP BY nd.id
+        ORDER BY MIN(nh.depth), nd.name",
+    )?;
+
+    let rows: Vec<(NodeRow, i64)> = stmt
+        .query_map(
+            rusqlite::params![root_id, depth_limit, focus.name, include_type_users],
+            |r| {
+            Ok((
+                NodeRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    file: r.get(3)?,
+                    range_start: r.get(4)?,
+                    range_end: r.get(5)?,
+                    signature: r.get(6)?,
+                    visibility: r.get(8)?,
+                    doc: r.get(9)?,
+                    fan_in: r.get(10)?,
+                    fan_out: r.get(11)?,
+                    role: r.get(12)?,
+                    role_confidence: r.get(13)?,
+                    stable_id: r.get(14)?,
+                },
+                r.get::<_, i64>(7)?,
+            ))
+        },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut w = vxml::new_stream_writer();
     let (window, meta) = apply_window(
@@ -2072,6 +2197,7 @@ pub fn map(
     with_file_docs: bool,
     all_edges: bool,
     role: Option<&str>,
+    context: Option<&str>,
     by_file: bool,
     md: bool,
 ) -> Result<()> {
@@ -2131,7 +2257,7 @@ pub fn map(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<Row> = stmt
+    let mut rows: Vec<Row> = stmt
         .query_map([], |r| {
             Ok(Row {
                 file: r.get(0)?,
@@ -2149,6 +2275,10 @@ pub fn map(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if let Some(ctx) = context {
+        rows.retain(|r| crate::arch::file_to_context(&r.file) == ctx);
+    }
 
     // File-level docs: path -> doc (only loaded when --with-file-docs)
     let file_doc_map: std::collections::HashMap<String, String> = if with_file_docs {

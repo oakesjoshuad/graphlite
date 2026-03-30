@@ -124,6 +124,9 @@ enum Commands {
         /// Restrict results to a workspace crate name
         #[arg(long, value_name = "CRATE")]
         crate_name: Option<String>,
+        /// Exclude test symbols/files from results
+        #[arg(long)]
+        exclude_tests: bool,
         /// Output as markdown table instead of XML
         #[arg(long)]
         md: bool,
@@ -234,6 +237,9 @@ enum Commands {
         /// Traversal depth for blast radius callers (default: 1)
         #[arg(long)]
         blast_depth: Option<usize>,
+        /// Deprecated alias for --blast-depth (kept for compatibility)
+        #[arg(long, hide = true)]
+        max_depth: Option<usize>,
         /// Suppress source snippets from output
         #[arg(long)]
         no_snippets: bool,
@@ -407,6 +413,9 @@ enum Commands {
         /// Filter by inferred role (orchestrator, entrypoint, leaf, infra, domain, model)
         #[arg(long, value_name = "ROLE")]
         role: Option<String>,
+        /// Filter by bounded context name (derived from file path)
+        #[arg(long, value_name = "CTX")]
+        context: Option<String>,
         /// Group output by file path instead of module name (reverts default module grouping)
         #[arg(long)]
         by_file: bool,
@@ -490,6 +499,7 @@ fn main() -> Result<()> {
             file,
             context,
             crate_name,
+            exclude_tests,
             md,
         } => query::symbols(
             &query,
@@ -497,6 +507,7 @@ fn main() -> Result<()> {
             file.as_deref(),
             context.as_deref(),
             crate_name.as_deref(),
+            exclude_tests,
             md,
         )?,
         Commands::Deps { md } => query::deps(md)?,
@@ -561,6 +572,7 @@ fn main() -> Result<()> {
             symbols,
             depth,
             blast_depth,
+            max_depth,
             no_snippets,
             edit,
             max_snippet_lines,
@@ -570,7 +582,7 @@ fn main() -> Result<()> {
             compact,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
-            let blast_depth = blast_depth.unwrap_or(1);
+            let blast_depth = blast_depth.or(max_depth).unwrap_or(1);
             query::context(
                 &symbols,
                 depth,
@@ -665,6 +677,7 @@ fn main() -> Result<()> {
             with_file_docs,
             all_edges,
             role,
+            context,
             by_file,
             md,
         } => query::map(
@@ -674,6 +687,7 @@ fn main() -> Result<()> {
             with_file_docs,
             all_edges,
             role.as_deref(),
+            context.as_deref(),
             by_file,
             md,
         )?,

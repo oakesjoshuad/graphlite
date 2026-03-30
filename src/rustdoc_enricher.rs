@@ -435,7 +435,8 @@ fn node_file_match_keys(abs_root: &Path, file: &str) -> Vec<String> {
 
 fn span_file_match_keys(abs_root: &Path, crate_abs_dir: &Path, span_filename: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let span_path = Path::new(span_filename);
+    let span_no_dot = span_filename.strip_prefix("./").unwrap_or(span_filename);
+    let span_path = Path::new(span_no_dot);
 
     if span_path.is_absolute() {
         let abs = span_path.to_path_buf();
@@ -453,7 +454,7 @@ fn span_file_match_keys(abs_root: &Path, crate_abs_dir: &Path, span_filename: &s
 
     let rel_crate = crate_abs_dir.strip_prefix(abs_root).unwrap_or(crate_abs_dir);
     let mut rel = PathBuf::new();
-    if rel_crate != Path::new("") && rel_crate != Path::new(".") {
+    if rel_crate != Path::new("") && rel_crate != Path::new(".") && !span_path.starts_with(rel_crate) {
         rel.push(rel_crate);
     }
     rel.push(span_path);
@@ -708,5 +709,14 @@ mod tests {
         let keys = span_file_match_keys(&root, &crate_dir, "src/lib.rs");
         assert!(keys.contains(&"./tools/src/lib.rs".to_string()));
         assert!(keys.contains(&"/repo/tools/src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn span_keys_do_not_double_prefix_workspace_member_path() {
+        let root = PathBuf::from("/repo");
+        let crate_dir = PathBuf::from("/repo/sales");
+        let keys = span_file_match_keys(&root, &crate_dir, "sales/src/lib.rs");
+        assert!(keys.contains(&"./sales/src/lib.rs".to_string()));
+        assert!(!keys.contains(&"./sales/sales/src/lib.rs".to_string()));
     }
 }

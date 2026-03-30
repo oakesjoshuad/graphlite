@@ -37,6 +37,7 @@ pub fn run(json: bool) -> Result<()> {
                     flag("file", true),
                     flag("context", true),
                     flag("crate-name", true),
+                    flag("exclude-tests", false),
                     flag("md", false),
                 ],
             ),
@@ -98,6 +99,7 @@ pub fn run(json: bool) -> Result<()> {
                 &[
                     flag("depth", true),
                     flag("blast-depth", true),
+                    flag("max-depth", true),
                     flag("no-snippets", false),
                     flag("edit", false),
                     flag("max-snippet-lines", true),
@@ -154,6 +156,7 @@ pub fn run(json: bool) -> Result<()> {
                     flag("with-file-docs", false),
                     flag("all-edges", false),
                     flag("role", true),
+                    flag("context", true),
                     flag("by-file", false),
                     flag("md", false),
                 ],
