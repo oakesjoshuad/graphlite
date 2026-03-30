@@ -282,8 +282,8 @@ fn apply_json(
     let empty_map = serde_json::Map::new();
     let paths = doc["paths"].as_object().unwrap_or(&empty_map);
 
-    // Build node lookup: (db_file_path, range_start_1indexed) -> node_id
-    let node_map = build_node_map(conn)?;
+    // Build node lookup: (db_file_path_variant, range_start_1indexed) -> node_id
+    let node_map = build_node_map(conn, abs_root)?;
 
     // Build impl-to-trait map: item_id -> trait_name for items that are methods
     // inside a trait impl block.
@@ -314,11 +314,14 @@ fn apply_json(
             None => continue,
         };
 
-        let db_file = span_to_db_path(abs_root, crate_abs_dir, filename);
         let range_start = begin_line as i64; // parser stores 1-indexed lines
 
-        let node_id = match node_map.get(&(db_file, range_start)) {
-            Some(id) => *id,
+        let node_id = match lookup_node_id(
+            &node_map,
+            &span_file_match_keys(abs_root, crate_abs_dir, filename),
+            range_start,
+        ) {
+            Some(id) => id,
             None => continue,
         };
 
@@ -386,16 +389,108 @@ fn apply_json(
 
 // ── Helper: build (db_file, range_start) -> node_id lookup ──────────────────
 
-fn build_node_map(conn: &Connection) -> Result<HashMap<(String, i64), i64>> {
+fn build_node_map(conn: &Connection, abs_root: &Path) -> Result<HashMap<(String, i64), i64>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, file, range_start FROM nodes",
     )?;
-    let map: HashMap<(String, i64), i64> = stmt
+    let mut map: HashMap<(String, i64), i64> = HashMap::new();
+    for row in stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
-        .filter_map(|r| r.ok())
-        .map(|(id, file, rs)| ((file, rs), id))
-        .collect();
+    {
+        let (id, file, rs) = match row {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for key in node_file_match_keys(abs_root, &file) {
+            map.entry((key, rs)).or_insert(id);
+        }
+    }
     Ok(map)
+}
+
+fn node_file_match_keys(abs_root: &Path, file: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let file_path = Path::new(file);
+    push_unique(&mut out, file.to_string());
+
+    if file_path.is_absolute() {
+        if let Ok(rel) = file_path.strip_prefix(abs_root) {
+            let rel_str = rel.to_string_lossy().to_string();
+            push_unique(&mut out, rel_str.clone());
+            push_unique(&mut out, format!("./{}", rel_str));
+        }
+    } else {
+        let trimmed = file.strip_prefix("./").unwrap_or(file).to_string();
+        push_unique(&mut out, trimmed.clone());
+        push_unique(&mut out, format!("./{}", trimmed));
+        let abs = abs_root.join(&trimmed);
+        push_unique(&mut out, abs.to_string_lossy().to_string());
+        if let Ok(canon) = abs.canonicalize() {
+            push_unique(&mut out, canon.to_string_lossy().to_string());
+        }
+    }
+
+    out
+}
+
+fn span_file_match_keys(abs_root: &Path, crate_abs_dir: &Path, span_filename: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let span_path = Path::new(span_filename);
+
+    if span_path.is_absolute() {
+        let abs = span_path.to_path_buf();
+        push_unique(&mut out, abs.to_string_lossy().to_string());
+        if let Ok(rel) = abs.strip_prefix(abs_root) {
+            let rel_str = rel.to_string_lossy().to_string();
+            push_unique(&mut out, rel_str.clone());
+            push_unique(&mut out, format!("./{}", rel_str));
+        }
+        if let Ok(canon) = abs.canonicalize() {
+            push_unique(&mut out, canon.to_string_lossy().to_string());
+        }
+        return out;
+    }
+
+    let rel_crate = crate_abs_dir.strip_prefix(abs_root).unwrap_or(crate_abs_dir);
+    let mut rel = PathBuf::new();
+    if rel_crate != Path::new("") && rel_crate != Path::new(".") {
+        rel.push(rel_crate);
+    }
+    rel.push(span_path);
+
+    let rel_str = rel.to_string_lossy().to_string();
+    push_unique(&mut out, rel_str.clone());
+    push_unique(&mut out, format!("./{}", rel_str));
+
+    let abs_from_root = abs_root.join(&rel);
+    push_unique(&mut out, abs_from_root.to_string_lossy().to_string());
+    if let Ok(canon) = abs_from_root.canonicalize() {
+        push_unique(&mut out, canon.to_string_lossy().to_string());
+    }
+
+    let abs_from_crate = crate_abs_dir.join(span_path);
+    push_unique(&mut out, abs_from_crate.to_string_lossy().to_string());
+    if let Ok(canon) = abs_from_crate.canonicalize() {
+        push_unique(&mut out, canon.to_string_lossy().to_string());
+    }
+
+    out
+}
+
+fn lookup_node_id(
+    node_map: &HashMap<(String, i64), i64>,
+    file_keys: &[String],
+    range_start: i64,
+) -> Option<i64> {
+    file_keys
+        .iter()
+        .find_map(|k| node_map.get(&(k.clone(), range_start)).copied())
+}
+
+fn push_unique(out: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !out.contains(&value) {
+        out.push(value);
+    }
 }
 
 // ── Helper: build item_id -> trait_name for methods inside trait impl blocks ─
@@ -493,9 +588,12 @@ fn emit_impl_trait_edges(
             let begin_line = span["begin"].as_array()
                 .and_then(|a| a[0].as_u64())
                 .unwrap_or(0);
-            let db_file = span_to_db_path(abs_root, crate_abs_dir, filename);
             let range_start = begin_line as i64;
-            if let Some(&nid) = node_map.get(&(db_file, range_start)) {
+            if let Some(nid) = lookup_node_id(
+                node_map,
+                &span_file_match_keys(abs_root, crate_abs_dir, filename),
+                range_start,
+            ) {
                 if let Some(name) = item["name"].as_str() {
                     m.insert(name, nid);
                 }
@@ -527,11 +625,9 @@ fn emit_impl_trait_edges(
             Some(s) => s,
             None => continue,
         };
-        let filename = span["filename"].as_str().unwrap_or("");
         let begin_line = span["begin"].as_array()
             .and_then(|a| a[0].as_u64())
             .unwrap_or(0);
-        let db_file = span_to_db_path(abs_root, crate_abs_dir, filename);
         let range_start = begin_line as i64;
 
         // The impl item itself may not be a node; look for the type by name.
@@ -548,25 +644,9 @@ fn emit_impl_trait_edges(
                 let _ = stmt.execute(rusqlite::params![type_id, trait_node_id]);
             }
         }
-        let _ = (db_file, range_start); // suppress unused warnings for now
+        let _ = range_start; // suppress unused warnings for now
     }
     Ok(())
-}
-
-// ── Helper: convert rustdoc span filename to DB path format ─────────────────
-
-fn span_to_db_path(abs_root: &Path, crate_abs_dir: &Path, span_filename: &str) -> String {
-    // span_filename is relative to the crate directory.
-    // DB paths are stored as "./relative/from/discover/root".
-    let rel_crate = crate_abs_dir
-        .strip_prefix(abs_root)
-        .unwrap_or(crate_abs_dir);
-
-    if rel_crate == Path::new("") || rel_crate == Path::new(".") {
-        format!("./{}", span_filename)
-    } else {
-        format!("./{}/{}", rel_crate.display(), span_filename)
-    }
 }
 
 // ── Helper: render visibility to a canonical string ──────────────────────────
@@ -601,7 +681,7 @@ fn extract_rustdoc_signature(item: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::pick_rustdoc_json_candidate;
+    use super::{pick_rustdoc_json_candidate, span_file_match_keys};
     use std::path::PathBuf;
 
     #[test]
@@ -619,5 +699,14 @@ mod tests {
         let files = vec![PathBuf::from("/tmp/doc/bin_main.json")];
         let picked = pick_rustdoc_json_candidate("tools", &files).expect("candidate");
         assert_eq!(picked, PathBuf::from("/tmp/doc/bin_main.json"));
+    }
+
+    #[test]
+    fn span_keys_include_relative_and_absolute_forms() {
+        let root = PathBuf::from("/repo");
+        let crate_dir = PathBuf::from("/repo/tools");
+        let keys = span_file_match_keys(&root, &crate_dir, "src/lib.rs");
+        assert!(keys.contains(&"./tools/src/lib.rs".to_string()));
+        assert!(keys.contains(&"/repo/tools/src/lib.rs".to_string()));
     }
 }
