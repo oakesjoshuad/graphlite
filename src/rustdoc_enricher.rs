@@ -213,7 +213,7 @@ fn apply_json(
     let empty_map = serde_json::Map::new();
     let paths = doc["paths"].as_object().unwrap_or(&empty_map);
 
-    // Build node lookup: (db_file_path, range_start_0indexed) -> node_id
+    // Build node lookup: (db_file_path, range_start_1indexed) -> node_id
     let node_map = build_node_map(conn)?;
 
     // Build impl-to-trait map: item_id -> trait_name for items that are methods
@@ -246,7 +246,7 @@ fn apply_json(
         };
 
         let db_file = span_to_db_path(abs_root, crate_abs_dir, filename);
-        let range_start = (begin_line as i64) - 1; // rustdoc is 1-indexed
+        let range_start = begin_line as i64; // parser stores 1-indexed lines
 
         let node_id = match node_map.get(&(db_file, range_start)) {
             Some(id) => *id,
@@ -425,7 +425,7 @@ fn emit_impl_trait_edges(
                 .and_then(|a| a[0].as_u64())
                 .unwrap_or(0);
             let db_file = span_to_db_path(abs_root, crate_abs_dir, filename);
-            let range_start = (begin_line as i64) - 1;
+            let range_start = begin_line as i64;
             if let Some(&nid) = node_map.get(&(db_file, range_start)) {
                 if let Some(name) = item["name"].as_str() {
                     m.insert(name, nid);
@@ -463,7 +463,7 @@ fn emit_impl_trait_edges(
             .and_then(|a| a[0].as_u64())
             .unwrap_or(0);
         let db_file = span_to_db_path(abs_root, crate_abs_dir, filename);
-        let range_start = (begin_line as i64) - 1;
+        let range_start = begin_line as i64;
 
         // The impl item itself may not be a node; look for the type by name.
         if let Some(type_name) = for_type_path {
