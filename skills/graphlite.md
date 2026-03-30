@@ -24,7 +24,7 @@ ls .graphlite/codegraph.db 2>/dev/null && echo "indexed" || echo "not indexed"
 If not indexed and the user wants to work on this project:
 
 ```bash
-graphlite init .      # first-time setup: detects LSP, indexes everything
+graphlite init .      # first-time setup: writes config, indexes everything
 graphlite discover .  # re-index after code changes
 ```
 
@@ -105,7 +105,7 @@ Annotations in the output (when present) are curated human or LLM notes:
 ```xml
 <annotation source="manual" confidence="0.9" stale="false">
   <intent>Entry point for incremental indexing</intent>
-  <behavior>Walks source tree, diffs hashes, bulk-inserts, optionally runs LSP</behavior>
+  <behavior>Walks source tree, diffs hashes, bulk-inserts, runs rustdoc+resolver enrichment</behavior>
 </annotation>
 ```
 

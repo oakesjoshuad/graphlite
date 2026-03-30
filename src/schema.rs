@@ -20,7 +20,10 @@ CREATE TABLE nodes (
     doc TEXT,
     role TEXT NOT NULL DEFAULT 'unknown',
     role_confidence REAL NOT NULL DEFAULT 0.0,
-    stable_id TEXT NOT NULL DEFAULT ''
+    complexity INTEGER,
+    stable_id TEXT NOT NULL DEFAULT '',
+    qualified_name TEXT NOT NULL DEFAULT '',
+    trait_impl TEXT
 );
 
 CREATE TABLE edges (
@@ -30,6 +33,7 @@ CREATE TABLE edges (
     edge_type TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'tree-sitter',
     confidence REAL NOT NULL DEFAULT 0.8,
+    confidence_tier TEXT,
     FOREIGN KEY(from_id) REFERENCES nodes(id) ON DELETE CASCADE,
     FOREIGN KEY(to_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
@@ -52,20 +56,28 @@ CREATE TABLE annotations (
     content_hash_at_annotation TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE crate_advisories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    advisory_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    cvss TEXT,
+    severity TEXT,
+    category TEXT,
+    kind TEXT NOT NULL,
+    date TEXT,
+    UNIQUE(package_name, version, advisory_id)
+);
+
 CREATE VIRTUAL TABLE fts_symbols USING fts5(
     name,
+    qualified_name,
     signature,
     file,
     language,
     node_id UNINDEXED,
     tokenize='porter unicode61'
-);
-
-CREATE TABLE role_overrides (
-    stable_id TEXT NOT NULL UNIQUE,
-    role TEXT NOT NULL,
-    reason TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX idx_edges_from ON edges(from_id);
@@ -117,6 +129,7 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
         "ALTER TABLE nodes ADD COLUMN role_confidence REAL NOT NULL DEFAULT 0.0",
         [],
     );
+    let _ = conn.execute("ALTER TABLE nodes ADD COLUMN complexity INTEGER", []);
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_edges_to_source ON edges(to_id, source)",
         [],
@@ -125,15 +138,77 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
         "ALTER TABLE nodes ADD COLUMN stable_id TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // Add qualified_name column if not present
     let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS role_overrides (
-            stable_id TEXT NOT NULL UNIQUE,
-            role TEXT NOT NULL,
-            reason TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )",
+        "ALTER TABLE nodes ADD COLUMN qualified_name TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // Add trait_impl column if not present
+    let _ = conn.execute(
+        "ALTER TABLE nodes ADD COLUMN trait_impl TEXT",
+        [],
+    );
+    // Add confidence_tier column to edges if not present
+    let _ = conn.execute(
+        "ALTER TABLE edges ADD COLUMN confidence_tier TEXT",
+        [],
+    );
+    // Add node_diagnostics table if not present (cargo clippy enrichment)
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS node_diagnostics (
+            id        INTEGER PRIMARY KEY,
+            node_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            code      TEXT NOT NULL,
+            level     TEXT NOT NULL,
+            message   TEXT NOT NULL,
+            suggestion TEXT,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_node_diagnostics_node
+            ON node_diagnostics(node_id);
+        CREATE INDEX IF NOT EXISTS idx_node_diagnostics_code
+            ON node_diagnostics(code);",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS crate_advisories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            advisory_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            cvss TEXT,
+            severity TEXT,
+            category TEXT,
+            kind TEXT NOT NULL,
+            date TEXT,
+            UNIQUE(package_name, version, advisory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_crate_advisories_package
+            ON crate_advisories(package_name);
+        CREATE INDEX IF NOT EXISTS idx_crate_advisories_kind
+            ON crate_advisories(kind);",
+    )?;
+    // Rebuild FTS to include qualified_name column if it was added after initial creation
+    let needs_fts_rebuild: bool = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_symbols'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|sql| !sql.contains("qualified_name"))
+        .unwrap_or(true);
+    if needs_fts_rebuild {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS fts_symbols;
+             CREATE VIRTUAL TABLE fts_symbols USING fts5(
+                 name, qualified_name, signature, file, language,
+                 node_id UNINDEXED,
+                 tokenize='porter unicode61'
+             );
+             INSERT INTO fts_symbols (name, qualified_name, signature, file, language, node_id)
+             SELECT name, qualified_name, signature, file, language, id FROM nodes;",
+        )?;
+    }
     Ok(conn)
 }
 

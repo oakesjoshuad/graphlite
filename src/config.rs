@@ -1,40 +1,10 @@
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::Deserialize;
 
-pub const DEFAULT_CONFIG_TOML: &str = r#"# graphlite configuration
-
-# Additional directories to ignore during indexing.
-# Extends built-in defaults: node_modules, target, build, dist, .svelte-kit, .git, .cache, .next, .nuxt, __pycache__
-ignore = []
-
-# LSP languages for semantic enrichment (auto-detected on init).
-# lsp = ["rust"]
-
-# Default traversal depth for graph and blast-radius commands.
-depth = 2
-
-# Forbidden context coupling rules for `graphlite viz`.
-# Each rule flags edges where a node in `from_context` calls into `to_context`.
-# Complements the built-in role-layer heuristic.
-# Example:
-# [[violations]]
-# from_context = "presentation"
-# to_context   = "persistence"
-# reason       = "presentation must not access persistence directly"
-
-# Suppression rules for known-acceptable violation patterns.
-# All specified fields must match; omitted fields are wildcards.
-# Example:
-# [[exceptions]]
-# from_context = "runtime"
-# to_role      = "utility"
-# reason       = "runtime infrastructure may use shared utilities"
-"#;
-
 /// A forbidden context coupling rule. Edges from `from_context` to `to_context`
 /// are flagged as violations in `graphlite viz`, regardless of edge source.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct ViolationRule {
     pub from_context: String,
     pub to_context: String,
@@ -44,7 +14,7 @@ pub struct ViolationRule {
 
 /// A suppression rule for known-acceptable violation patterns.
 /// All specified fields must match for suppression to fire; omitted fields are wildcards.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct ViolationException {
     #[serde(default)]
     pub from_context: Option<String>,
@@ -55,14 +25,57 @@ pub struct ViolationException {
     #[serde(default)]
     pub to_role: Option<String>,
     #[serde(default)]
+    pub stable_id: Option<String>,
+    #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Layer visibility policy.
+/// Symbols in `layer` must not exceed `max_visibility`.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct VisibilityRule {
+    pub layer: String,
+    pub max_visibility: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A layer-to-layer violation rule for workspace crates.
+/// Any `Cargo.toml` dependency edge from a crate assigned `from_layer` to a
+/// crate assigned `to_layer` is reported as a violation.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct WorkspaceViolationRule {
+    pub from_layer: String,
+    pub to_layer: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Workspace layer assignments and violation rules.
+/// Each key in `layers` is a crate name; the value is a free-form layer name
+/// (`shared`, `domain`, `port`, `application`, `infra`, `adapter`,
+/// `composition`, etc.) or `"?"` while still being assigned.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct WorkspaceConfig {
+    #[serde(default)]
+    pub layers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub violations: Vec<WorkspaceViolationRule>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct PolicyConfig {
+    #[serde(default)]
+    pub pack: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// Kept for backwards-compat TOML parsing; no longer drives enrichment.
     #[serde(default)]
+    #[allow(dead_code)]
     pub lsp: Vec<String>,
     #[serde(default = "default_depth")]
     pub depth: usize,
@@ -72,6 +85,14 @@ pub struct Config {
     /// Suppression rules for known-acceptable violation patterns.
     #[serde(default)]
     pub exceptions: Vec<ViolationException>,
+    /// Visibility policy by architectural layer.
+    #[serde(default)]
+    pub visibility_rules: Vec<VisibilityRule>,
+    /// Workspace layer mapping (present only in Cargo workspace projects).
+    pub workspace: Option<WorkspaceConfig>,
+    /// Optional built-in policy pack selection.
+    #[serde(default)]
+    pub policy: Option<PolicyConfig>,
 }
 
 fn default_depth() -> usize {
@@ -86,6 +107,9 @@ impl Default for Config {
             depth: default_depth(),
             violations: vec![],
             exceptions: vec![],
+            visibility_rules: vec![],
+            workspace: None,
+            policy: None,
         }
     }
 }

@@ -19,23 +19,14 @@ pub struct Symbol {
     pub visibility: String,
     pub doc: Option<String>,
     pub stable_id: String,
+    pub qualified_name: String,
     /// True when the symbol has a `#[test]` attribute or lives inside a `#[cfg(test)]` module.
     /// Only set for Rust symbols; always false for other languages.
     pub is_test_fn: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct RawEdge {
-    pub from_name: String,
-    pub to_name: String,
-    pub edge_type: String,
-    #[allow(dead_code)]
-    pub file: String,
-}
-
 pub struct ParseResult {
     pub symbols: Vec<Symbol>,
-    pub edges: Vec<RawEdge>,
     pub file_doc: Option<String>,
 }
 
@@ -61,18 +52,15 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
     if effective_src == 0 {
         return Ok(ParseResult {
             symbols: vec![],
-            edges: vec![],
             file_doc,
         });
     }
 
     let mut symbols = extract_symbols(&tree, &source, path, &language, &ts_lang, query_src)?;
-    let mut edges = extract_edges(&tree, &source, path, &ts_lang, query_src)?;
 
     if matches!(language, Language::Svelte) {
-        let (script_symbols, script_edges) = extract_svelte_script_symbols(&tree, &source, path)?;
+        let script_symbols = extract_svelte_script_symbols(&tree, &source, path)?;
         symbols.extend(script_symbols);
-        edges.extend(script_edges);
     }
 
     // Same AST node can be captured by multiple query patterns (e.g. an impl method
@@ -84,7 +72,6 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
 
     Ok(ParseResult {
         symbols,
-        edges,
         file_doc,
     })
 }
@@ -405,6 +392,10 @@ fn extract_symbols(
                 Some(impl_n) => format!("{}::{}::{}::{}", normalized_file, kind, impl_n, name),
                 None => format!("{}::{}::{}", normalized_file, kind, name),
             };
+            let qualified_name = match &impl_name {
+                Some(impl_n) => format!("{}::{}", impl_n, name),
+                None => name.clone(),
+            };
 
             let source_bytes = source.as_bytes();
             let is_test_fn = matches!(*language, Language::Rust)
@@ -423,6 +414,7 @@ fn extract_symbols(
                 visibility,
                 doc,
                 stable_id,
+                qualified_name,
                 is_test_fn,
             });
         }
@@ -434,38 +426,6 @@ fn extract_symbols(
     symbols.retain(|s| seen.insert((s.file.clone(), s.range_start)));
 
     Ok(symbols)
-}
-
-fn enclosing_function_name<'a>(node: Node<'a>, source: &'a str) -> Option<String> {
-    let fn_kinds = [
-        "function_item",
-        "function_signature_item",
-        "function_declaration",
-        "function_expression",
-        "arrow_function",
-        "method_definition",
-        "generator_function",
-        "generator_function_declaration",
-    ];
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if fn_kinds.contains(&n.kind()) {
-            let mut cursor = n.walk();
-            for child in n.children(&mut cursor) {
-                if child.kind() == "identifier"
-                    || child.kind() == "property_identifier"
-                    || child.kind() == "type_identifier"
-                {
-                    if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                        return Some(text.to_string());
-                    }
-                }
-            }
-            return None;
-        }
-        current = n.parent();
-    }
-    None
 }
 
 fn enclosing_impl_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -505,12 +465,12 @@ fn extract_svelte_script_symbols(
     svelte_tree: &tree_sitter::Tree,
     source: &str,
     path: &Path,
-) -> Result<(Vec<Symbol>, Vec<RawEdge>)> {
+) -> Result<Vec<Symbol>> {
     let mut raw_text_nodes: Vec<Node<'_>> = Vec::new();
     find_script_raw_texts(svelte_tree.root_node(), &mut raw_text_nodes);
 
     if raw_text_nodes.is_empty() {
-        return Ok((vec![], vec![]));
+        return Ok(vec![]);
     }
 
     let ts_language = Language::TypeScript;
@@ -520,7 +480,6 @@ fn extract_svelte_script_symbols(
     ts_parser.set_language(&ts_ts_lang)?;
 
     let mut all_symbols = Vec::new();
-    let mut all_edges = Vec::new();
 
     for raw_text_node in raw_text_nodes {
         let script_start_row = raw_text_node.start_position().row as u32;
@@ -545,76 +504,8 @@ fn extract_svelte_script_symbols(
             sym.language = "svelte".to_string();
         }
         all_symbols.extend(script_symbols);
-
-        let script_edges = extract_edges(&ts_tree, raw_text, path, &ts_ts_lang, ts_query_src)?;
-        all_edges.extend(script_edges);
     }
 
-    Ok((all_symbols, all_edges))
+    Ok(all_symbols)
 }
 
-fn extract_edges(
-    tree: &tree_sitter::Tree,
-    source: &str,
-    path: &Path,
-    ts_lang: &tree_sitter::Language,
-    query_src: &str,
-) -> Result<Vec<RawEdge>> {
-    let query = Query::new(ts_lang, query_src)?;
-    let mut cursor = QueryCursor::new();
-
-    // Only CALLS edges. reference.class and reference.implementation are skipped.
-    let ref_call_indices: Vec<u32> = query
-        .capture_names()
-        .iter()
-        .enumerate()
-        .filter(|(_, name)| **name == "reference.call")
-        .map(|(i, _)| i as u32)
-        .collect();
-
-    let name_idx = match query.capture_index_for_name("name") {
-        Some(i) => i,
-        None => return Ok(vec![]),
-    };
-
-    if ref_call_indices.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-    let file_str = path.to_string_lossy().to_string();
-    let mut edges = Vec::new();
-
-    while let Some(m) = matches.next() {
-        let has_ref_call = m
-            .captures
-            .iter()
-            .any(|c| ref_call_indices.contains(&c.index));
-        if !has_ref_call {
-            continue;
-        }
-
-        if let Some(name_cap) = m.captures.iter().find(|c| c.index == name_idx) {
-            let callee_text = name_cap
-                .node
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .to_string();
-            if callee_text.is_empty() {
-                continue;
-            }
-
-            let caller = enclosing_function_name(name_cap.node, source)
-                .unwrap_or_else(|| "<module>".to_string());
-
-            edges.push(RawEdge {
-                from_name: caller,
-                to_name: callee_text,
-                edge_type: "CALLS".to_string(),
-                file: file_str.clone(),
-            });
-        }
-    }
-
-    Ok(edges)
-}

@@ -5,6 +5,7 @@ use crate::{
     config,
     ipc::{self, WatchMsg},
     query::{open_db, resolve_symbol_id},
+    xml as vxml,
 };
 
 /// Write or update an annotation using an already-open connection.
@@ -120,7 +121,8 @@ pub fn list_annotations(stale_only: bool) -> Result<()> {
 
     let mut stmt = conn.prepare(sql)?;
     let mut count = 0usize;
-    let mut out = String::from("<annotations>\n");
+    let mut w = vxml::new_stream_writer();
+    vxml::open(&mut w, "annotations")?;
 
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -139,38 +141,37 @@ pub fn list_annotations(stale_only: bool) -> Result<()> {
 
     for row in rows {
         let (id, name, kind, file, intent, behavior, tags, source, confidence, stale) = row?;
-        out.push_str(&format!(
-            "  <annotation id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
-            id,
-            xml_escape(&name),
-            xml_escape(&kind),
-            xml_escape(&file),
-            xml_escape(&source),
-            confidence,
-            stale,
-        ));
+        let id_s = id.to_string();
+        let conf_s = format!("{:.1}", confidence);
+        let stale_s = stale.to_string();
+        vxml::open_attrs(
+            &mut w,
+            "annotation",
+            &[
+                ("id", &id_s),
+                ("name", &name),
+                ("kind", &kind),
+                ("file", &file),
+                ("source", &source),
+                ("confidence", &conf_s),
+                ("stale", &stale_s),
+            ],
+        )?;
         if let Some(i) = &intent {
-            out.push_str(&format!("    <intent>{}</intent>\n", xml_escape(i)));
+            vxml::text_tag(&mut w, "intent", i)?;
         }
         if let Some(b) = &behavior {
-            out.push_str(&format!("    <behavior>{}</behavior>\n", xml_escape(b)));
+            vxml::text_tag(&mut w, "behavior", b)?;
         }
         if let Some(t) = &tags {
-            out.push_str(&format!("    <tags>{}</tags>\n", xml_escape(t)));
+            vxml::text_tag(&mut w, "tags", t)?;
         }
-        out.push_str("  </annotation>\n");
+        vxml::close(&mut w, "annotation")?;
         count += 1;
     }
 
-    out.push_str("</annotations>\n");
+    vxml::close(&mut w, "annotations")?;
+    vxml::finish_stream(w)?;
     eprintln!("{} annotation(s)", count);
-    print!("{}", out);
     Ok(())
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }

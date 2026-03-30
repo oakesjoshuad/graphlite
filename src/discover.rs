@@ -1,17 +1,20 @@
 use anyhow::Result;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::thread;
 use walkdir::WalkDir;
 
 use crate::{
+    audit,
+    clippy_enricher,
     config,
-    insert::{bulk_insert_edges, bulk_insert_symbols, upsert_file_hash},
+    insert::{bulk_insert_symbols, upsert_file_hash},
     language::detect_language,
-    lsp,
-    parser::{parse_file, ParseResult, RawEdge, Symbol},
+    parser::{parse_file, ParseResult, Symbol},
+    resolver,
     roles,
+    rustdoc_enricher,
     schema::open_or_init_db,
+    workspace,
 };
 
 const IGNORED_DIRS: &[&str] = &[
@@ -70,37 +73,34 @@ fn collect_source_files(root: &str, extra_ignore: &[String]) -> Result<Vec<PathB
     Ok(files)
 }
 
-/// Languages excluded from auto-detection on init.
-/// TypeScript, JavaScript, and Svelte servers are slow to start and often add
-/// little value over tree-sitter alone. Users opt-in by editing config.toml.
-const LSP_AUTODETECT_EXCLUDE: &[&str] = &["typescript", "javascript", "svelte"];
-
-fn detect_lsp_from_files(files: &[PathBuf]) -> Vec<String> {
-    use std::collections::HashSet;
-    // Collect the set of languages that have files in this project
-    let present: HashSet<String> = files
-        .iter()
-        .filter_map(|p| detect_language(p))
-        .filter_map(|lang| lang.lsp_server_cmd().map(|_| lang.as_str().to_string()))
-        .filter(|lang_str| !LSP_AUTODETECT_EXCLUDE.contains(&lang_str.as_str()))
-        .collect();
-    // For each present language, check if server is in PATH
-    present
-        .into_iter()
-        .filter(|lang_str| lsp::which_server_for_language(lang_str).is_some())
-        .collect()
-}
-
-/// Detect languages in `root` and return their LSP language strings
-/// if suitable servers are available in PATH. Used by `init` before the index
-/// is built so it can write the result into config.toml.
-pub(crate) fn detect_lsp(root: &str) -> Vec<String> {
-    let files = collect_source_files(root, &[]).unwrap_or_default();
-    detect_lsp_from_files(&files)
-}
-
-pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
+pub fn run(root: &str) -> Result<()> {
     let config = config::load(root);
+    if !config.lsp.is_empty() {
+        eprintln!(
+            "config: lsp field is deprecated, LSP enrichment replaced by rustdoc (ignoring: {:?})",
+            config.lsp
+        );
+    }
+
+    // Refuse to index if any workspace layer is still unassigned.
+    if let Some(ws) = &config.workspace {
+        let mut unassigned: Vec<&str> = ws
+            .layers
+            .iter()
+            .filter(|(_, v)| v.as_str() == "?")
+            .map(|(k, _)| k.as_str())
+            .collect();
+        unassigned.sort_unstable();
+        if !unassigned.is_empty() {
+            anyhow::bail!(
+                "workspace layers not assigned in .graphlite/config.toml: {}\n\
+                 Edit [workspace.layers] and set each to one of: \
+                 shared | domain | port | application | infra | adapter | composition\n\
+                 Then re-run: graphlite discover .",
+                unassigned.join(", ")
+            );
+        }
+    }
 
     let graphlite_dir = format!("{}/.graphlite", root.trim_end_matches('/'));
     std::fs::create_dir_all(&graphlite_dir)?;
@@ -131,29 +131,10 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
 
     if changed.is_empty() {
         eprintln!("No files changed, index is up to date");
+        run_optional_enrichers(root, &conn);
         return Ok(());
     }
     eprintln!("{} file(s) changed, re-indexing", changed.len());
-
-    // Determine LSP languages now (files is available) and start warming in background
-    // so LSP server indexes the workspace while tree-sitter parses.
-    let effective_lsp: Vec<String> = if let Some(lang) = lsp_lang {
-        vec![lang.to_string()]
-    } else if !config.lsp.is_empty() {
-        config.lsp.clone()
-    } else {
-        detect_lsp_from_files(&files)
-    };
-    let root_owned = root.to_string();
-    let warm_handles: Vec<(String, thread::JoinHandle<Option<lsp::LspClient>>)> = effective_lsp
-        .iter()
-        .map(|lang| {
-            let lang_clone = lang.clone();
-            let root_clone = root_owned.clone();
-            let h = thread::spawn(move || lsp::warm_client(&lang_clone, &root_clone).ok());
-            (lang.clone(), h)
-        })
-        .collect();
 
     // Delete old edges and nodes for changed files, preserving annotations for re-linking.
     // Edges are deleted explicitly first because older db instances may lack ON DELETE CASCADE.
@@ -189,13 +170,8 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
         .iter()
         .flat_map(|(_, r)| r.symbols.iter().cloned())
         .collect();
-    let edges: Vec<RawEdge> = results
-        .iter()
-        .flat_map(|(_, r)| r.edges.iter().cloned())
-        .collect();
 
-    let name_to_id = bulk_insert_symbols(&conn, &symbols)?;
-    bulk_insert_edges(&conn, &edges, &name_to_id)?;
+    bulk_insert_symbols(&conn, &symbols)?;
     restore_annotations(&conn, &saved_annotations)?;
 
     // Build a lookup so each file's parsed doc can be passed to the upsert
@@ -212,92 +188,95 @@ pub fn run(root: &str, lsp_lang: Option<&str>) -> Result<()> {
         upsert_file_hash(&conn, path_str.as_ref(), &hash, doc)?;
     }
 
-    eprintln!(
-        "Inserted {} symbols, {} edges -> {}",
-        symbols.len(),
-        edges.len(),
-        db_path
-    );
+    // Sync workspace crate nodes and crate-level dependency edges from cargo metadata.
+    sync_workspace_crate_graph(&conn, root)?;
 
-    // Spawn one enricher thread per language; they run in parallel.
-    // Edges are funneled through a channel to a single writer in the main thread.
-    let (edge_tx, edge_rx) = crossbeam_channel::unbounded::<lsp::EdgeMsg>();
+    eprintln!("Inserted {} symbols -> {}", symbols.len(), db_path);
 
-    let enricher_handles: Vec<(
-        String,
-        thread::JoinHandle<anyhow::Result<lsp::EnrichReport>>,
-    )> = warm_handles
-        .into_iter()
-        .map(|(lang, warm_handle)| {
-            let db_path_clone = db_path.clone();
-            let root_clone = root_owned.clone();
-            let tx_clone = edge_tx.clone();
-            let lang_clone = lang.clone();
-            let h = thread::spawn(move || {
-                let pre_warmed = warm_handle.join().ok().flatten();
-                lsp::enrich_parallel(
-                    &db_path_clone,
-                    &root_clone,
-                    &lang_clone,
-                    pre_warmed,
-                    tx_clone,
-                )
-            });
-            (lang, h)
-        })
-        .collect();
-
-    // Drop our sender so the channel closes when all enricher threads finish.
-    drop(edge_tx);
-
-    // Drain the channel and write to the DB on the main thread (owns conn).
-    {
-        let mut edges: Vec<(i64, i64, &'static str, &'static str)> = Vec::new();
-        let mut sigs: Vec<(i64, String)> = Vec::new();
-        while let Ok(msg) = edge_rx.recv() {
-            match msg {
-                lsp::EdgeMsg::Edge {
-                    from_id,
-                    to_id,
-                    edge_type,
-                    source,
-                } => {
-                    edges.push((from_id, to_id, edge_type, source));
-                }
-                lsp::EdgeMsg::SigUpdate { node_id, sig } => {
-                    sigs.push((node_id, sig));
-                }
-            }
-        }
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO edges (from_id, to_id, edge_type, source, confidence)
-                 VALUES (?1, ?2, ?3, ?4, 1.0)",
-            )?;
-            for (from_id, to_id, edge_type, source) in &edges {
-                stmt.execute(rusqlite::params![from_id, to_id, edge_type, source])?;
-            }
-        }
-        if !sigs.is_empty() {
-            let mut stmt = tx.prepare_cached("UPDATE nodes SET signature = ?1 WHERE id = ?2")?;
-            for (node_id, sig) in &sigs {
-                stmt.execute(rusqlite::params![sig, node_id])?;
-            }
-        }
-        tx.commit()?;
+    // Enrich graph with qualified names, visibility, and trait impls from rustdoc JSON.
+    match rustdoc_enricher::enrich(root, &changed, &conn) {
+        Ok(n) => eprintln!("[rustdoc] {} node(s) enriched", n),
+        Err(e) => eprintln!("[rustdoc] warning: enrichment skipped: {}", e),
     }
 
-    for (lang, handle) in enricher_handles {
-        match handle.join() {
-            Ok(Ok(report)) => eprintln!("{}", report),
-            Ok(Err(e)) => eprintln!("LSP[{}]: enrichment failed: {}", lang, e),
-            Err(_) => eprintln!("LSP[{}]: enricher thread panicked", lang),
-        }
+    // Resolve call expressions into CALLS_RESOLVED edges using use-statement scope maps.
+    match resolver::resolve(&conn) {
+        Ok(n) => eprintln!("[resolver] {} edge(s) written", n),
+        Err(e) => eprintln!("[resolver] warning: {}", e),
     }
+
+    // Enrich node diagnostics / complexity from cargo clippy.
+    run_optional_enrichers(root, &conn);
 
     roles::infer_roles(&conn)?;
 
+    Ok(())
+}
+
+fn run_optional_enrichers(root: &str, conn: &rusqlite::Connection) {
+    match clippy_enricher::enrich(root, conn) {
+        Ok(n) => eprintln!("[check] {} diagnostic row(s) upserted", n),
+        Err(e) => eprintln!("[check] warning: {}", e),
+    }
+
+    match audit::enrich(root, conn) {
+        Ok(n) => eprintln!("[audit] {} advisory row(s) upserted", n),
+        Err(e) => eprintln!("[audit] warning: {}", e),
+    }
+}
+
+fn sync_workspace_crate_graph(conn: &rusqlite::Connection, root: &str) -> Result<()> {
+    let ws = match workspace::detect(root) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+
+    // Replace only workspace-derived crate topology on each run.
+    conn.execute("DELETE FROM edges WHERE source = 'cargo-metadata' AND edge_type = 'CRATE_DEP'", [])?;
+    conn.execute("DELETE FROM nodes WHERE kind = 'crate' AND language = 'workspace'", [])?;
+    conn.execute("DELETE FROM fts_symbols WHERE language = 'workspace'", [])?;
+
+    let tx = conn.unchecked_transaction()?;
+    let mut name_to_id: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    {
+        let mut node_stmt = tx.prepare_cached(
+            "INSERT INTO nodes
+             (file, language, kind, name, range_start, range_end, signature, content_hash, visibility, doc, stable_id, qualified_name, role, role_confidence)
+             VALUES (?1, 'workspace', 'crate', ?2, 1, 1, ?3, '', 'public', NULL, ?4, ?5, 'model', 1.0)",
+        )?;
+        let mut fts_stmt = tx.prepare_cached(
+            "INSERT INTO fts_symbols (name, qualified_name, signature, file, language, node_id)
+             VALUES (?1, ?2, ?3, ?4, 'workspace', ?5)",
+        )?;
+
+        for m in &ws.members {
+            let file = if m.entry_file.starts_with("./") {
+                m.entry_file.clone()
+            } else {
+                format!("./{}", m.entry_file)
+            };
+            let sig = format!("crate {}", m.name);
+            let stable_id = format!("crate::{}", m.name);
+            let qualified_name = m.name.clone();
+            node_stmt.execute(rusqlite::params![file, m.name, sig, stable_id, qualified_name])?;
+            let node_id = tx.last_insert_rowid();
+            fts_stmt.execute(rusqlite::params![m.name, m.name, sig, file, node_id])?;
+            name_to_id.insert(m.name.clone(), node_id);
+        }
+    }
+    {
+        let mut edge_stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO edges (from_id, to_id, edge_type, source, confidence)
+             VALUES (?1, ?2, 'CRATE_DEP', 'cargo-metadata', 1.0)",
+        )?;
+        for (from, to) in &ws.deps {
+            let (Some(from_id), Some(to_id)) = (name_to_id.get(from), name_to_id.get(to)) else {
+                continue;
+            };
+            edge_stmt.execute(rusqlite::params![from_id, to_id])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -362,95 +341,4 @@ fn restore_annotations(conn: &rusqlite::Connection, saved: &[SavedAnnotation]) -
         ])?;
     }
     Ok(())
-}
-
-// ─── Fast re-index (tree-sitter only, no LSP) ─────────────────────────────────
-
-/// Re-index changed files using tree-sitter only (no LSP enrichment).
-/// Returns the list of changed paths for callers that need to drive incremental LSP enrichment.
-pub fn run_fast(root: &str, conn: &rusqlite::Connection) -> Result<Vec<PathBuf>> {
-    let config = config::load(root);
-    let files = collect_source_files(root, &config.ignore)?;
-
-    let changed: Vec<PathBuf> = files
-        .iter()
-        .filter(|path| {
-            let path_str = path.to_string_lossy();
-            let new_hash = compute_file_hash(path);
-            let stored: Option<String> = conn
-                .query_row(
-                    "SELECT file_hash FROM files WHERE path = ?1",
-                    rusqlite::params![path_str.as_ref()],
-                    |r| r.get(0),
-                )
-                .ok();
-            stored.as_deref() != Some(&new_hash)
-        })
-        .cloned()
-        .collect();
-
-    if changed.is_empty() {
-        return Ok(vec![]);
-    }
-    eprintln!(
-        "[watch] {} file(s) changed, re-indexing (fast)",
-        changed.len()
-    );
-
-    let saved_annotations = save_annotations_for_files(conn, &changed)?;
-
-    for path in &changed {
-        let path_str = path.to_string_lossy();
-        conn.execute(
-            "DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE file = ?1)
-                                  OR to_id   IN (SELECT id FROM nodes WHERE file = ?1)",
-            rusqlite::params![path_str.as_ref()],
-        )?;
-        conn.execute(
-            "DELETE FROM nodes WHERE file = ?1",
-            rusqlite::params![path_str.as_ref()],
-        )?;
-    }
-
-    let results: Vec<(PathBuf, crate::parser::ParseResult)> = changed
-        .par_iter()
-        .filter_map(|path| {
-            crate::parser::parse_file(path)
-                .map_err(|e| {
-                    eprintln!("Warning: {}: {}", path.display(), e);
-                    e
-                })
-                .ok()
-                .map(|r| (path.clone(), r))
-        })
-        .collect();
-
-    let symbols: Vec<crate::parser::Symbol> = results
-        .iter()
-        .flat_map(|(_, r)| r.symbols.iter().cloned())
-        .collect();
-    let edges: Vec<crate::parser::RawEdge> = results
-        .iter()
-        .flat_map(|(_, r)| r.edges.iter().cloned())
-        .collect();
-
-    let name_to_id = bulk_insert_symbols(conn, &symbols)?;
-    bulk_insert_edges(conn, &edges, &name_to_id)?;
-    restore_annotations(conn, &saved_annotations)?;
-
-    let file_docs: std::collections::HashMap<&PathBuf, Option<&str>> = results
-        .iter()
-        .map(|(p, r)| (p, r.file_doc.as_deref()))
-        .collect();
-
-    for path in &changed {
-        let path_str = path.to_string_lossy();
-        let hash = compute_file_hash(path);
-        let doc = file_docs.get(path).copied().flatten();
-        upsert_file_hash(conn, path_str.as_ref(), &hash, doc)?;
-    }
-
-    roles::infer_roles(conn)?;
-    eprintln!("[watch] re-index complete: {} symbols", symbols.len());
-    Ok(changed)
 }

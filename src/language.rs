@@ -45,15 +45,6 @@ impl Language {
         }
     }
 
-    pub fn lsp_server_cmd(&self) -> Option<&'static str> {
-        match self {
-            Language::Rust => Some("rust-analyzer"),
-            Language::TypeScript | Language::JavaScript => Some("typescript-language-server"),
-            Language::Svelte => Some("svelteserver"),
-            Language::Html | Language::Css => None,
-        }
-    }
-
     pub fn query_source(&self) -> &'static str {
         match self {
             Language::Rust => include_str!("../queries/rust.scm"),

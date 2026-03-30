@@ -3,17 +3,30 @@ use std::{fs, path::Path};
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 
+use crate::xml as vxml;
+
 pub(crate) fn open_db() -> Result<Connection> {
     let conn = Connection::open(".graphlite/codegraph.db")
         .map_err(|_| anyhow!(".graphlite/codegraph.db not found - run `graphlite init` first"))?;
     Ok(conn)
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+fn is_trusted_source(source: &str) -> bool {
+    matches!(source, "resolver" | "rustdoc")
+}
+
+fn write_wrapper_start(tag: &'static str, attrs: &[(&str, &str)]) -> Result<()> {
+    let mut w = vxml::new_stream_writer();
+    vxml::open_attrs(&mut w, tag, attrs)?;
+    vxml::finish_stream(w)?;
+    Ok(())
+}
+
+fn write_wrapper_end(tag: &'static str) -> Result<()> {
+    let mut w = vxml::new_stream_writer();
+    vxml::close(&mut w, tag)?;
+    vxml::finish_stream(w)?;
+    Ok(())
 }
 
 pub(crate) fn resolve_symbol_id(conn: &Connection, arg: &str) -> Result<i64> {
@@ -33,7 +46,15 @@ pub(crate) fn resolve_symbol_id(conn: &Connection, arg: &str) -> Result<i64> {
     }
     let id: i64 = conn
         .query_row(
-            "SELECT id FROM nodes WHERE name = ?1 LIMIT 1",
+            "SELECT n.id
+             FROM nodes n
+             WHERE n.name = ?1
+             ORDER BY
+                CASE WHEN n.role = 'test' THEN 1 ELSE 0 END,
+                (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) DESC,
+                n.file ASC,
+                n.id ASC
+             LIMIT 1",
             rusqlite::params![key],
             |r| r.get(0),
         )
@@ -41,15 +62,381 @@ pub(crate) fn resolve_symbol_id(conn: &Connection, arg: &str) -> Result<i64> {
     Ok(id)
 }
 
-pub fn symbols(fts_query: &str, language: Option<&str>) -> Result<()> {
+type SymbolSearchRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+);
+
+struct ResolveCandidate {
+    id: i64,
+    name: String,
+    qualified_name: String,
+    kind: String,
+    role: String,
+    file: String,
+    signature: Option<String>,
+    stable_id: String,
+    fan_in: i64,
+}
+
+pub fn resolve(query: &str, language: Option<&str>, md: bool) -> Result<()> {
     let conn = open_db()?;
+    let (strategy, mut candidates) = resolve_candidates(&conn, query, language)?;
+    if candidates.is_empty() {
+        anyhow::bail!("no symbol matched query '{}'", query);
+    }
 
-    let mut out = String::from("<symbols>\n");
-    let mut count = 0usize;
+    candidates.sort_by(|a, b| {
+        b.fan_in
+            .cmp(&a.fan_in)
+            .then_with(|| (a.role == "test").cmp(&(b.role == "test")))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
-    if let Some(lang) = language {
+    let selected = &candidates[0];
+
+    if md {
+        println!(
+            "Resolved `{}` using strategy `{}` ({} candidate(s))",
+            query,
+            strategy,
+            candidates.len()
+        );
+        println!(
+            "Selected: `sym:{}` (`{}` in `{}`)",
+            selected.stable_id, selected.name, selected.file
+        );
+        println!("| id | name | qualified_name | kind | role | fan_in | file | stable_id |");
+        println!("|---:|---|---|---|---|---:|---|---|");
+        for c in candidates.iter().take(10) {
+            println!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                c.id,
+                c.name.replace('|', "\\|"),
+                c.qualified_name.replace('|', "\\|"),
+                c.kind.replace('|', "\\|"),
+                c.role.replace('|', "\\|"),
+                c.fan_in,
+                c.file.replace('|', "\\|"),
+                c.stable_id.replace('|', "\\|"),
+            );
+        }
+        return Ok(());
+    }
+
+    let mut w = vxml::new_stream_writer();
+    let candidates_s = candidates.len().to_string();
+    let selected_id_s = selected.id.to_string();
+    vxml::open_attrs(
+        &mut w,
+        "resolution",
+        &[
+            ("query", query),
+            ("strategy", &strategy),
+            ("candidates", &candidates_s),
+            ("selected_id", &selected_id_s),
+        ],
+    )?;
+    append_symbol_xml(
+        &mut w,
+        selected.id,
+        &selected.name,
+        &selected.qualified_name,
+        &selected.kind,
+        &selected.role,
+        &selected.file,
+        selected.signature.as_deref(),
+        &selected.stable_id,
+    );
+    if candidates.len() > 1 {
+        vxml::open(&mut w, "alternatives")?;
+        for c in candidates.iter().skip(1).take(9) {
+            append_symbol_xml(
+                &mut w,
+                c.id,
+                &c.name,
+                &c.qualified_name,
+                &c.kind,
+                &c.role,
+                &c.file,
+                c.signature.as_deref(),
+                &c.stable_id,
+            );
+        }
+        vxml::close(&mut w, "alternatives")?;
+    }
+    vxml::close(&mut w, "resolution")?;
+    vxml::finish_stream(w)?;
+    Ok(())
+}
+
+pub fn deps(md: bool) -> Result<()> {
+    let conn = open_db()?;
+    let mut crates_stmt = conn.prepare(
+        "SELECT name
+         FROM nodes
+         WHERE kind = 'crate' AND language = 'workspace'
+         ORDER BY name",
+    )?;
+    let crates: Vec<String> = crates_stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut edges_stmt = conn.prepare(
+        "SELECT nf.name, nt.name
+         FROM edges e
+         JOIN nodes nf ON nf.id = e.from_id
+         JOIN nodes nt ON nt.id = e.to_id
+         WHERE e.edge_type = 'CRATE_DEP'
+           AND e.source = 'cargo-metadata'
+         ORDER BY nf.name, nt.name",
+    )?;
+    let edges: Vec<(String, String)> = edges_stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if md {
+        println!("Workspace crates: {}", crates.len());
+        println!("Crate dependency edges: {}", edges.len());
+        if !crates.is_empty() {
+            println!("| crate |");
+            println!("|---|");
+            for c in &crates {
+                println!("| {} |", c.replace('|', "\\|"));
+            }
+        }
+        if !edges.is_empty() {
+            println!("| from_crate | to_crate |");
+            println!("|---|---|");
+            for (from, to) in &edges {
+                println!("| {} | {} |", from.replace('|', "\\|"), to.replace('|', "\\|"));
+            }
+        }
+        return Ok(());
+    }
+
+    let mut w = vxml::new_stream_writer();
+    let crates_s = crates.len().to_string();
+    let edges_s = edges.len().to_string();
+    vxml::open_attrs(
+        &mut w,
+        "deps",
+        &[("crates", &crates_s), ("edges", &edges_s), ("tokens", "streaming")],
+    )?;
+    if !crates.is_empty() {
+        vxml::open(&mut w, "crates")?;
+        for c in &crates {
+            vxml::empty(&mut w, "crate", &[("name", c)])?;
+        }
+        vxml::close(&mut w, "crates")?;
+    }
+    if !edges.is_empty() {
+        vxml::open(&mut w, "edges")?;
+        for (from, to) in &edges {
+            vxml::empty(&mut w, "edge", &[("from_crate", from), ("to_crate", to)])?;
+        }
+        vxml::close(&mut w, "edges")?;
+    }
+    vxml::close(&mut w, "deps")?;
+    vxml::finish_stream(w)?;
+    Ok(())
+}
+
+fn resolve_candidates(
+    conn: &Connection,
+    query: &str,
+    language: Option<&str>,
+) -> Result<(String, Vec<ResolveCandidate>)> {
+    let key = query.strip_prefix("sym:").unwrap_or(query).trim();
+    if key.is_empty() {
+        return Ok(("empty".to_string(), Vec::new()));
+    }
+
+    if let Ok(id) = key.parse::<i64>() {
+        let rows = fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.id = ?1",
+            rusqlite::params![id],
+        )?;
+        return Ok(("id-exact".to_string(), rows));
+    }
+
+    if key.contains("::") {
+        let stable = fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.stable_id = ?1",
+            rusqlite::params![key],
+        )?;
+        if !stable.is_empty() {
+            return Ok(("stable-id-exact".to_string(), stable));
+        }
+        let qualified = fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.qualified_name = ?1",
+            rusqlite::params![key],
+        )?;
+        if !qualified.is_empty() {
+            return Ok(("qualified-name-exact".to_string(), qualified));
+        }
+        let ns_like = format!("%{}%", key.replace("::", "%"));
+        let ns_rows = fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.stable_id LIKE ?1 OR n.qualified_name LIKE ?1",
+            rusqlite::params![ns_like],
+        )?;
+        if !ns_rows.is_empty() {
+            return Ok(("namespace-shortcut-ranked".to_string(), ns_rows));
+        }
+    }
+
+    let name_exact = if let Some(lang) = language {
+        fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.name = ?1 AND n.language = ?2",
+            rusqlite::params![key, lang],
+        )?
+    } else {
+        fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.name = ?1",
+            rusqlite::params![key],
+        )?
+    };
+    if !name_exact.is_empty() {
+        return Ok(("name-exact-ranked".to_string(), name_exact));
+    }
+
+    let like_term = if key.contains("::") {
+        format!("%{}%", key.replace("::", "%"))
+    } else {
+        format!("%{}%", key)
+    };
+    let like_hits = if let Some(lang) = language {
+        fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.language = ?2
+               AND (n.stable_id LIKE ?1 OR n.qualified_name LIKE ?1 OR n.name LIKE ?1)",
+            rusqlite::params![like_term, lang],
+        )?
+    } else {
+        fetch_candidates(
+            conn,
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id,
+                    (SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS fan_in
+             FROM nodes n
+             WHERE n.stable_id LIKE ?1 OR n.qualified_name LIKE ?1 OR n.name LIKE ?1",
+            rusqlite::params![like_term],
+        )?
+    };
+    Ok(("substring-ranked".to_string(), like_hits))
+}
+
+fn fetch_candidates<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<ResolveCandidate>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, |r| {
+        Ok(ResolveCandidate {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            qualified_name: r.get(2)?,
+            kind: r.get(3)?,
+            role: r.get(4)?,
+            file: r.get(5)?,
+            signature: r.get(6)?,
+            stable_id: r.get(7)?,
+            fan_in: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn symbols(fts_query: &str, language: Option<&str>, md: bool) -> Result<()> {
+    let conn = open_db()?;
+    let key = fts_query.strip_prefix("sym:").unwrap_or(fts_query);
+    let use_namespace_fallback = key.contains("::") || fts_query.starts_with("sym:");
+
+    let rows_data: Vec<SymbolSearchRow> = if use_namespace_fallback {
+        let like_term = if key.contains("::") {
+            format!("%{}%", key.replace("::", "%"))
+        } else {
+            format!("%{}%", key)
+        };
+        if let Some(lang) = language {
+            let mut stmt = conn.prepare(
+                "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
+                 FROM nodes n
+                 WHERE n.language = ?2
+                   AND (n.stable_id LIKE ?1 OR n.qualified_name LIKE ?1 OR n.name LIKE ?1)
+                 ORDER BY n.file, n.name, n.id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![like_term, lang], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
+                 FROM nodes n
+                 WHERE n.stable_id LIKE ?1 OR n.qualified_name LIKE ?1 OR n.name LIKE ?1
+                 ORDER BY n.file, n.name, n.id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![like_term], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+    } else if let Some(lang) = language {
         let mut stmt = conn.prepare(
-            "SELECT n.id, n.name, n.kind, n.file, n.signature
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
              FROM fts_symbols f
              JOIN nodes n ON n.id = f.node_id
              WHERE fts_symbols MATCH ?1 AND n.language = ?2
@@ -61,17 +448,16 @@ pub fn symbols(fts_query: &str, language: Option<&str>) -> Result<()> {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })?;
-        for row in rows {
-            let (id, name, kind, file, sig) = row?;
-            append_symbol_xml(&mut out, id, &name, &kind, &file, sig.as_deref());
-            count += 1;
-        }
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT n.id, n.name, n.kind, n.file, n.signature
+            "SELECT n.id, n.name, n.qualified_name, n.kind, n.role, n.file, n.signature, n.stable_id
              FROM fts_symbols f
              JOIN nodes n ON n.id = f.node_id
              WHERE fts_symbols MATCH ?1
@@ -83,41 +469,82 @@ pub fn symbols(fts_query: &str, language: Option<&str>) -> Result<()> {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })?;
-        for row in rows {
-            let (id, name, kind, file, sig) = row?;
-            append_symbol_xml(&mut out, id, &name, &kind, &file, sig.as_deref());
-            count += 1;
-        }
-    }
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
-    out.push_str("</symbols>\n");
+    let count = rows_data.len();
     eprintln!("{} match(es)", count);
-    print!("{}", out);
+    if md {
+        println!("| id | name | qualified_name | kind | role | file | signature | stable_id |");
+        println!("|---:|---|---|---|---|---|---|---|");
+        for (id, name, qualified_name, kind, role, file, sig, stable_id) in &rows_data {
+            let sig = sig.as_deref().unwrap_or("").replace('|', "\\|");
+            println!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                id,
+                name.replace('|', "\\|"),
+                qualified_name.replace('|', "\\|"),
+                kind.replace('|', "\\|"),
+                role.replace('|', "\\|"),
+                file.replace('|', "\\|"),
+                sig,
+                stable_id.replace('|', "\\|"),
+            );
+        }
+    } else {
+        let mut w = vxml::new_stream_writer();
+        vxml::open(&mut w, "symbols")?;
+        for (id, name, qualified_name, kind, role, file, sig, stable_id) in &rows_data {
+            append_symbol_xml(
+                &mut w,
+                *id,
+                name,
+                qualified_name,
+                kind,
+                role,
+                file,
+                sig.as_deref(),
+                stable_id,
+            );
+        }
+        vxml::close(&mut w, "symbols")?;
+        vxml::finish_stream(w)?;
+    }
     Ok(())
 }
 
-fn append_symbol_xml(
-    out: &mut String,
+#[allow(clippy::too_many_arguments)]
+fn append_symbol_xml<W: std::io::Write>(
+    w: &mut quick_xml::Writer<W>,
     id: i64,
     name: &str,
+    qualified_name: &str,
     kind: &str,
+    role: &str,
     file: &str,
     sig: Option<&str>,
+    stable_id: &str,
 ) {
-    out.push_str(&format!(
-        "  <symbol id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\"",
-        id,
-        xml_escape(name),
-        xml_escape(kind),
-        xml_escape(file)
-    ));
+    let id_s = id.to_string();
+    let mut attrs = vec![
+        ("id", id_s.as_str()),
+        ("name", name),
+        ("qualified_name", qualified_name),
+        ("kind", kind),
+        ("role", role),
+        ("file", file),
+        ("stable_id", stable_id),
+    ];
     if let Some(s) = sig {
-        out.push_str(&format!(" signature=\"{}\"", xml_escape(s)));
+        attrs.push(("signature", s));
     }
-    out.push_str("/>\n");
+    vxml::empty(w, "symbol", &attrs).expect("xml");
 }
 
 struct NodeRow {
@@ -160,15 +587,103 @@ struct NeighborRow {
     stable_id: String,
 }
 
-fn role_attrs(role: &str, confidence: f64) -> String {
-    if confidence < 0.6 {
-        format!(
-            " role=\"{}\" role_confidence=\"{:.2}\" role_uncertain=\"true\"",
-            role, confidence
-        )
-    } else {
-        format!(" role=\"{}\" role_confidence=\"{:.2}\"", role, confidence)
+#[derive(Clone, Copy)]
+pub struct OutputControl {
+    pub budget_lines: Option<usize>,
+    pub budget_tokens: Option<usize>,
+    pub offset: usize,
+    pub compact: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WindowMeta {
+    total_items: usize,
+    offset: usize,
+    shown_items: usize,
+    truncated: bool,
+    next_offset: Option<usize>,
+    budget_lines: Option<usize>,
+    budget_tokens: Option<usize>,
+}
+
+fn apply_window<T>(
+    rows: &[T],
+    offset: usize,
+    budget_lines: Option<usize>,
+    budget_tokens: Option<usize>,
+    token_cost: impl Fn(&T) -> usize,
+) -> (std::ops::Range<usize>, WindowMeta) {
+    let total = rows.len();
+    let start = offset.min(total);
+    let mut end = total;
+
+    if let Some(max_lines) = budget_lines {
+        end = end.min(start.saturating_add(max_lines));
     }
+    if let Some(max_tokens) = budget_tokens {
+        let mut used = 0usize;
+        let mut idx = start;
+        while idx < end {
+            let cost = token_cost(&rows[idx]);
+            if idx > start && used.saturating_add(cost) > max_tokens {
+                break;
+            }
+            used = used.saturating_add(cost);
+            idx += 1;
+        }
+        end = idx;
+    }
+
+    let shown = end.saturating_sub(start);
+    let truncated = end < total;
+    let next_offset = if truncated { Some(end) } else { None };
+    (
+        start..end,
+        WindowMeta {
+            total_items: total,
+            offset: start,
+            shown_items: shown,
+            truncated,
+            next_offset,
+            budget_lines,
+            budget_tokens,
+        },
+    )
+}
+
+fn estimate_neighbor_tokens(n: &NeighborRow) -> usize {
+    // Deterministic approximation (4 chars/token) from stable fields.
+    let mut chars = n.name.len()
+        + n.kind.len()
+        + n.file.len()
+        + n.visibility.len()
+        + n.role.len()
+        + n.stable_id.len()
+        + 24;
+    if let Some(sig) = &n.signature {
+        chars += sig.len();
+    }
+    if let Some(doc) = &n.doc {
+        chars += doc.len().min(256);
+    }
+    (chars / 4).max(1)
+}
+
+fn estimate_node_tokens(n: &NodeRow) -> usize {
+    let mut chars = n.name.len()
+        + n.kind.len()
+        + n.file.len()
+        + n.visibility.len()
+        + n.role.len()
+        + n.stable_id.len()
+        + 24;
+    if let Some(sig) = &n.signature {
+        chars += sig.len();
+    }
+    if let Some(doc) = &n.doc {
+        chars += doc.len().min(256);
+    }
+    (chars / 4).max(1)
 }
 
 struct AnnotationRow {
@@ -180,6 +695,31 @@ struct AnnotationRow {
     stale: bool,
 }
 
+fn write_annotation_xml<W: std::io::Write>(w: &mut quick_xml::Writer<W>, ann: &AnnotationRow) {
+    let conf_s = format!("{:.1}", ann.confidence);
+    let stale_s = ann.stale.to_string();
+    vxml::open_attrs(
+        w,
+        "annotation",
+        &[
+            ("source", &ann.source),
+            ("confidence", &conf_s),
+            ("stale", &stale_s),
+        ],
+    )
+    .expect("xml");
+    if let Some(intent) = &ann.intent {
+        vxml::text_tag(w, "intent", intent).expect("xml");
+    }
+    if let Some(behavior) = &ann.behavior {
+        vxml::text_tag(w, "behavior", behavior).expect("xml");
+    }
+    if let Some(tags) = &ann.tags {
+        vxml::text_tag(w, "tags", tags).expect("xml");
+    }
+    vxml::close(w, "annotation").expect("xml");
+}
+
 struct EdgeInfo {
     edge_type: String,
     from_id: i64,
@@ -189,6 +729,13 @@ struct EdgeInfo {
     source: String,
     #[allow(dead_code)]
     confidence: f64,
+}
+
+struct NodeDiagnostic {
+    code: String,
+    level: String,
+    message: String,
+    suggestion: Option<String>,
 }
 
 fn fetch_annotations(
@@ -233,6 +780,48 @@ fn fetch_annotations(
         }
     }
     map
+}
+
+fn fetch_node_diagnostics(conn: &Connection, node_id: i64) -> Vec<NodeDiagnostic> {
+    let mut stmt = match conn.prepare_cached(
+        "SELECT code, level, message, suggestion
+         FROM node_diagnostics
+         WHERE node_id = ?1
+         ORDER BY id ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(rusqlite::params![node_id], |r| {
+        Ok(NodeDiagnostic {
+            code: r.get(0)?,
+            level: r.get(1)?,
+            message: r.get(2)?,
+            suggestion: r.get(3)?,
+        })
+    })
+    .ok()
+    .into_iter()
+    .flat_map(|rows| rows.filter_map(|r| r.ok()))
+    .collect()
+}
+
+fn write_diagnostics_xml<W: std::io::Write>(w: &mut quick_xml::Writer<W>, rows: &[NodeDiagnostic]) {
+    if rows.is_empty() {
+        return;
+    }
+    let count_s = rows.len().to_string();
+    vxml::open_attrs(w, "diagnostics", &[("count", &count_s)]).expect("xml");
+    for d in rows {
+        let mut attrs = vec![("code", d.code.as_str()), ("level", d.level.as_str())];
+        if let Some(s) = &d.suggestion {
+            attrs.push(("suggestion", s.as_str()));
+        }
+        vxml::open_attrs(w, "diagnostic", &attrs).expect("xml");
+        vxml::text_tag(w, "message", &d.message).expect("xml");
+        vxml::close(w, "diagnostic").expect("xml");
+    }
+    vxml::close(w, "diagnostics").expect("xml");
 }
 
 fn read_snippet(
@@ -298,12 +887,43 @@ fn read_call_site_snippet(
 }
 
 pub fn graph(
-    symbol: &str,
+    symbols: &[String],
     depth: usize,
     _format: &str,
     show_trust: bool,
     snippets: bool,
     max_snippet_lines: Option<usize>,
+    control: OutputControl,
+) -> Result<()> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    if symbols.len() > 1 {
+        let count_s = symbols.len().to_string();
+        write_wrapper_start("graphs", &[("count", &count_s)])?;
+        for symbol in symbols {
+            graph_one(symbol, depth, show_trust, snippets, max_snippet_lines, control)?;
+        }
+        write_wrapper_end("graphs")?;
+        return Ok(());
+    }
+    graph_one(
+        &symbols[0],
+        depth,
+        show_trust,
+        snippets,
+        max_snippet_lines,
+        control,
+    )
+}
+
+fn graph_one(
+    symbol: &str,
+    depth: usize,
+    show_trust: bool,
+    snippets: bool,
+    max_snippet_lines: Option<usize>,
+    control: OutputControl,
 ) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
@@ -361,7 +981,7 @@ pub fn graph(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        print_xml_trust_split(&focus, &edges);
+        print_xml_trust_split(&focus, &edges)?;
     } else {
         let mut stmt = conn.prepare(
             "WITH RECURSIVE neighborhood(id, depth) AS (
@@ -416,24 +1036,35 @@ pub fn graph(
             |r| r.get(0),
         )?;
 
-        print!(
-            "{}",
-            render_graph_xml(
-                &conn,
-                &focus,
-                &neighbors,
-                edge_count,
-                snippets,
-                snippets,
-                max_snippet_lines
-            )
+        let mut w = vxml::new_stream_writer();
+        let (window, meta) = apply_window(
+            &neighbors,
+            control.offset,
+            control.budget_lines,
+            control.budget_tokens,
+            estimate_neighbor_tokens,
         );
+        write_graph_xml(
+            &mut w,
+            &conn,
+            &focus,
+            &neighbors[window],
+            edge_count,
+            snippets,
+            snippets,
+            max_snippet_lines,
+            Some(meta),
+            control.compact,
+        )?;
+        vxml::finish_stream(w)?;
     }
 
     Ok(())
 }
 
-fn render_graph_xml(
+#[allow(clippy::too_many_arguments)]
+fn write_graph_xml<W: std::io::Write>(
+    w: &mut quick_xml::Writer<W>,
     conn: &Connection,
     focus: &NodeRow,
     neighbors: &[NeighborRow],
@@ -441,8 +1072,10 @@ fn render_graph_xml(
     snippets: bool,
     show_focus_snippet: bool,
     max_snippet_lines: Option<usize>,
-) -> String {
-    let snippet = if show_focus_snippet {
+    meta: Option<WindowMeta>,
+    compact: bool,
+) -> Result<()> {
+    let snippet = if show_focus_snippet && !compact {
         read_snippet(
             &focus.file,
             focus.range_start,
@@ -455,237 +1088,320 @@ fn render_graph_xml(
 
     let mut all_ids: Vec<i64> = vec![focus.id];
     all_ids.extend(neighbors.iter().map(|n| n.id));
-    let annotations = fetch_annotations(conn, &all_ids);
+    let annotations = if compact {
+        std::collections::HashMap::new()
+    } else {
+        fetch_annotations(conn, &all_ids)
+    };
+    let focus_diagnostics = if compact {
+        Vec::new()
+    } else {
+        fetch_node_diagnostics(conn, focus.id)
+    };
 
-    let mut body = String::new();
+    let root_id_s = focus.id.to_string();
+    let nodes_s = (1 + neighbors.len()).to_string();
+    let edges_s = edge_count.to_string();
+    let mut root_attrs = vec![
+        ("root_id", root_id_s.as_str()),
+        ("tokens", "streaming"),
+        ("nodes", nodes_s.as_str()),
+        ("edges", edges_s.as_str()),
+    ];
+    let compact_s = compact.to_string();
+    if compact {
+        root_attrs.push(("compact", compact_s.as_str()));
+    }
+    let mut total_items_s = None::<String>;
+    let mut offset_s = None::<String>;
+    let mut shown_items_s = None::<String>;
+    let mut truncated_s = None::<String>;
+    let mut next_offset_s = None::<String>;
+    let mut budget_lines_s = None::<String>;
+    let mut budget_tokens_s = None::<String>;
+    if let Some(m) = meta {
+        total_items_s = Some(m.total_items.to_string());
+        offset_s = Some(m.offset.to_string());
+        shown_items_s = Some(m.shown_items.to_string());
+        truncated_s = Some(m.truncated.to_string());
+        if let Some(next) = m.next_offset {
+            next_offset_s = Some(next.to_string());
+        }
+        if let Some(b) = m.budget_lines {
+            budget_lines_s = Some(b.to_string());
+        }
+        if let Some(b) = m.budget_tokens {
+            budget_tokens_s = Some(b.to_string());
+        }
+    }
+    if let Some(s) = total_items_s.as_ref() {
+        root_attrs.push(("total_items", s.as_str()));
+    }
+    if let Some(s) = offset_s.as_ref() {
+        root_attrs.push(("offset", s.as_str()));
+    }
+    if let Some(s) = shown_items_s.as_ref() {
+        root_attrs.push(("shown_items", s.as_str()));
+    }
+    if let Some(s) = truncated_s.as_ref() {
+        root_attrs.push(("truncated", s.as_str()));
+    }
+    if let Some(s) = next_offset_s.as_ref() {
+        root_attrs.push(("next_offset", s.as_str()));
+    }
+    if let Some(s) = budget_lines_s.as_ref() {
+        root_attrs.push(("budget_lines", s.as_str()));
+    }
+    if let Some(s) = budget_tokens_s.as_ref() {
+        root_attrs.push(("budget_tokens", s.as_str()));
+    }
+    vxml::open_attrs(w, "graph", &root_attrs).expect("xml");
 
-    body.push_str("  <focus>\n");
-    body.push_str(&format!(
-        "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
-        focus.id,
-        xml_escape(&focus.stable_id),
-        xml_escape(&focus.name),
-        xml_escape(&focus.kind),
-        xml_escape(&focus.file),
-        focus.range_start,
-        focus.range_end,
-        xml_escape(&focus.visibility),
-        focus.fan_in,
-        focus.fan_out,
-        role_attrs(&focus.role, focus.role_confidence),
-    ));
-    if let Some(sig) = &focus.signature {
-        body.push_str(&format!(
-            "      <signature>{}</signature>\n",
-            xml_escape(sig)
-        ));
+    vxml::open(w, "focus").expect("xml");
+    let id_s = focus.id.to_string();
+    let range_s = format!("L{}-L{}", focus.range_start, focus.range_end);
+    let fan_in_s = focus.fan_in.to_string();
+    let fan_out_s = focus.fan_out.to_string();
+    let role_conf_s = format!("{:.2}", focus.role_confidence);
+    let role_uncertain_s = (focus.role_confidence < 0.6).to_string();
+    let mut attrs = vec![
+        ("id", id_s.as_str()),
+        ("stable_id", focus.stable_id.as_str()),
+        ("name", focus.name.as_str()),
+        ("kind", focus.kind.as_str()),
+        ("file", focus.file.as_str()),
+        ("range", range_s.as_str()),
+        ("visibility", focus.visibility.as_str()),
+        ("fan_in", fan_in_s.as_str()),
+        ("fan_out", fan_out_s.as_str()),
+        ("role", focus.role.as_str()),
+        ("role_confidence", role_conf_s.as_str()),
+    ];
+    if focus.role_confidence < 0.6 {
+        attrs.push(("role_uncertain", role_uncertain_s.as_str()));
     }
-    if let Some(doc) = &focus.doc {
-        if !doc.is_empty() {
-            body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
+    vxml::open_attrs(w, "node", &attrs).expect("xml");
+    if !compact {
+        if let Some(sig) = &focus.signature {
+            vxml::text_tag(w, "signature", sig).expect("xml");
         }
     }
-    if let Some(ann) = annotations.get(&focus.id) {
-        body.push_str(&format!(
-            "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
-            xml_escape(&ann.source),
-            ann.confidence,
-            ann.stale
-        ));
-        if let Some(intent) = &ann.intent {
-            body.push_str(&format!(
-                "        <intent>{}</intent>\n",
-                xml_escape(intent)
-            ));
+    if !compact {
+        if let Some(doc) = &focus.doc {
+            if !doc.is_empty() {
+                vxml::text_tag(w, "doc", doc).expect("xml");
+            }
         }
-        if let Some(behavior) = &ann.behavior {
-            body.push_str(&format!(
-                "        <behavior>{}</behavior>\n",
-                xml_escape(behavior)
-            ));
-        }
-        if let Some(tags) = &ann.tags {
-            body.push_str(&format!("        <tags>{}</tags>\n", xml_escape(tags)));
-        }
-        body.push_str("      </annotation>\n");
     }
-    if let Some(snip) = snippet {
-        body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+    if !compact {
+        if let Some(ann) = annotations.get(&focus.id) {
+            write_annotation_xml(w, ann);
+        }
     }
-    body.push_str("    </node>\n");
-    body.push_str("  </focus>\n");
+    if !compact {
+        write_diagnostics_xml(w, &focus_diagnostics);
+    }
+    if !compact {
+        if let Some(snip) = snippet {
+            vxml::text_tag(w, "snippet", &snip).expect("xml");
+        }
+    }
+    vxml::close(w, "node").expect("xml");
+    vxml::close(w, "focus").expect("xml");
 
     let max_depth = neighbors.iter().map(|n| n.depth).max().unwrap_or(0);
     for d in 1..=max_depth {
-        body.push_str(&format!("  <neighbors depth=\"{}\">\n", d));
+        let depth_s = d.to_string();
+        vxml::open_attrs(w, "neighbors", &[("depth", &depth_s)]).expect("xml");
         for n in neighbors.iter().filter(|n| n.depth == d) {
-            body.push_str(&format!(
-                "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
-                n.id,
-                xml_escape(&n.stable_id),
-                xml_escape(&n.name),
-                xml_escape(&n.kind),
-                xml_escape(&n.file),
-                n.range_start,
-                n.range_end,
-                xml_escape(&n.visibility),
-                n.fan_in,
-                n.fan_out,
-                role_attrs(&n.role, n.role_confidence),
-            ));
+            let id_s = n.id.to_string();
+            let range_s = format!("L{}-L{}", n.range_start, n.range_end);
+            let fan_in_s = n.fan_in.to_string();
+            let fan_out_s = n.fan_out.to_string();
+            let role_conf_s = format!("{:.2}", n.role_confidence);
+            let role_uncertain_s = (n.role_confidence < 0.6).to_string();
+            let mut attrs = vec![
+                ("id", id_s.as_str()),
+                ("stable_id", n.stable_id.as_str()),
+                ("name", n.name.as_str()),
+                ("kind", n.kind.as_str()),
+                ("file", n.file.as_str()),
+                ("range", range_s.as_str()),
+                ("visibility", n.visibility.as_str()),
+                ("fan_in", fan_in_s.as_str()),
+                ("fan_out", fan_out_s.as_str()),
+                ("role", n.role.as_str()),
+                ("role_confidence", role_conf_s.as_str()),
+            ];
+            if n.role_confidence < 0.6 {
+                attrs.push(("role_uncertain", role_uncertain_s.as_str()));
+            }
             if let Some(et) = &n.edge_type {
-                body.push_str(&format!(" edge_type=\"{}\"", xml_escape(et)));
+                attrs.push(("edge_type", et.as_str()));
             }
-            if let Some(sig) = &n.signature {
-                body.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
+            if !compact {
+                if let Some(sig) = &n.signature {
+                    attrs.push(("signature", sig.as_str()));
+                }
             }
-            let has_doc = n.doc.as_ref().is_some_and(|d| !d.is_empty());
-            let neighbor_snippet = if snippets {
+            let has_doc = !compact && n.doc.as_ref().is_some_and(|d| !d.is_empty());
+            let neighbor_snippet = if snippets && !compact {
                 read_snippet(&n.file, n.range_start, n.range_end, max_snippet_lines)
             } else {
                 None
             };
-            let neighbor_annotation = annotations.get(&n.id);
+            let neighbor_annotation = if compact { None } else { annotations.get(&n.id) };
             if has_doc || neighbor_snippet.is_some() || neighbor_annotation.is_some() {
-                body.push_str(">\n");
+                vxml::open_attrs(w, "node", &attrs).expect("xml");
                 if let Some(doc) = &n.doc {
                     if !doc.is_empty() {
-                        body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
+                        vxml::text_tag(w, "doc", doc).expect("xml");
                     }
                 }
                 if let Some(ann) = neighbor_annotation {
-                    body.push_str(&format!(
-                        "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
-                        xml_escape(&ann.source),
-                        ann.confidence,
-                        ann.stale
-                    ));
-                    if let Some(intent) = &ann.intent {
-                        body.push_str(&format!(
-                            "        <intent>{}</intent>\n",
-                            xml_escape(intent)
-                        ));
-                    }
-                    if let Some(behavior) = &ann.behavior {
-                        body.push_str(&format!(
-                            "        <behavior>{}</behavior>\n",
-                            xml_escape(behavior)
-                        ));
-                    }
-                    if let Some(tags) = &ann.tags {
-                        body.push_str(&format!("        <tags>{}</tags>\n", xml_escape(tags)));
-                    }
-                    body.push_str("      </annotation>\n");
+                    write_annotation_xml(w, ann);
                 }
                 if let Some(snip) = neighbor_snippet {
-                    body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+                    vxml::text_tag(w, "snippet", &snip).expect("xml");
                 }
-                body.push_str("    </node>\n");
+                vxml::close(w, "node").expect("xml");
             } else {
-                body.push_str("/>\n");
+                vxml::empty(w, "node", &attrs).expect("xml");
             }
         }
-        body.push_str("  </neighbors>\n");
+        vxml::close(w, "neighbors").expect("xml");
     }
+    vxml::close(w, "graph").expect("xml");
 
-    body.push_str("</graph>\n");
-
-    let tokens = body.len() / 4;
-    let header = format!(
-        "<graph root_id=\"{}\" tokens=\"{}\" nodes=\"{}\" edges=\"{}\">\n",
-        focus.id,
-        tokens,
-        1 + neighbors.len(),
-        edge_count,
-    );
-
-    format!("{}{}", header, body)
+    Ok(())
 }
 
-fn print_xml_trust_split(focus: &NodeRow, edges: &[EdgeInfo]) {
+fn print_xml_trust_split(focus: &NodeRow, edges: &[EdgeInfo]) -> Result<()> {
     let snippet = read_snippet(&focus.file, focus.range_start, focus.range_end, None);
 
     let trusted: Vec<&EdgeInfo> = edges
         .iter()
-        .filter(|e| e.source == "rust-analyzer")
+        .filter(|e| is_trusted_source(&e.source))
         .collect();
-    let syntax: Vec<&EdgeInfo> = edges.iter().filter(|e| e.source == "tree-sitter").collect();
+    let syntax: Vec<&EdgeInfo> = edges.iter().filter(|e| !is_trusted_source(&e.source)).collect();
 
-    let mut body = String::new();
+    let mut w = vxml::new_stream_writer();
+    let root_id_s = focus.id.to_string();
+    let trusted_len_s = trusted.len().to_string();
+    let syntax_len_s = syntax.len().to_string();
+    vxml::open_attrs(
+        &mut w,
+        "graph",
+        &[
+            ("root_id", &root_id_s),
+            ("tokens", "streaming"),
+            ("trusted_edges", &trusted_len_s),
+            ("syntax_edges", &syntax_len_s),
+        ],
+    )
+    .expect("xml");
 
-    body.push_str("  <focus>\n");
-    body.push_str(&format!(
-        "    <node id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\">\n",
-        focus.id,
-        xml_escape(&focus.name),
-        xml_escape(&focus.kind),
-        xml_escape(&focus.file),
-        focus.range_start,
-        focus.range_end,
-    ));
+    vxml::open(&mut w, "focus").expect("xml");
+    let id_s = focus.id.to_string();
+    let range_s = format!("L{}-L{}", focus.range_start, focus.range_end);
+    vxml::open_attrs(
+        &mut w,
+        "node",
+        &[
+            ("id", &id_s),
+            ("name", &focus.name),
+            ("kind", &focus.kind),
+            ("file", &focus.file),
+            ("range", &range_s),
+        ],
+    )
+    .expect("xml");
     if let Some(sig) = &focus.signature {
-        body.push_str(&format!(
-            "      <signature>{}</signature>\n",
-            xml_escape(sig)
-        ));
+        vxml::text_tag(&mut w, "signature", sig).expect("xml");
     }
     if let Some(snip) = snippet {
-        body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+        vxml::text_tag(&mut w, "snippet", &snip).expect("xml");
     }
-    body.push_str("    </node>\n");
-    body.push_str("  </focus>\n");
+    vxml::close(&mut w, "node").expect("xml");
+    vxml::close(&mut w, "focus").expect("xml");
 
     if !trusted.is_empty() {
-        body.push_str("  <trusted_edges confidence=\"1.0\">\n");
+        vxml::open_attrs(&mut w, "trusted_edges", &[("confidence", "1.0")]).expect("xml");
         for e in &trusted {
-            body.push_str(&format!(
-                "    <edge type=\"{}\" from_id=\"{}\" to_id=\"{}\" from_name=\"{}\" to_name=\"{}\" source=\"{}\"/>\n",
-                xml_escape(&e.edge_type),
-                e.from_id,
-                e.to_id,
-                xml_escape(&e.from_name),
-                xml_escape(&e.to_name),
-                xml_escape(&e.source),
-            ));
+            let from_id_s = e.from_id.to_string();
+            let to_id_s = e.to_id.to_string();
+            vxml::empty(
+                &mut w,
+                "edge",
+                &[
+                    ("type", &e.edge_type),
+                    ("from_id", &from_id_s),
+                    ("to_id", &to_id_s),
+                    ("from_name", &e.from_name),
+                    ("to_name", &e.to_name),
+                    ("source", &e.source),
+                ],
+            )
+            .expect("xml");
         }
-        body.push_str("  </trusted_edges>\n");
+        vxml::close(&mut w, "trusted_edges").expect("xml");
     }
 
     if !syntax.is_empty() {
-        body.push_str("  <syntax_edges confidence=\"0.8\">\n");
+        vxml::open_attrs(&mut w, "syntax_edges", &[("confidence", "0.8")]).expect("xml");
         for e in &syntax {
-            body.push_str(&format!(
-                "    <edge type=\"{}\" from_id=\"{}\" to_id=\"{}\" from_name=\"{}\" to_name=\"{}\" source=\"{}\"/>\n",
-                xml_escape(&e.edge_type),
-                e.from_id,
-                e.to_id,
-                xml_escape(&e.from_name),
-                xml_escape(&e.to_name),
-                xml_escape(&e.source),
-            ));
+            let from_id_s = e.from_id.to_string();
+            let to_id_s = e.to_id.to_string();
+            vxml::empty(
+                &mut w,
+                "edge",
+                &[
+                    ("type", &e.edge_type),
+                    ("from_id", &from_id_s),
+                    ("to_id", &to_id_s),
+                    ("from_name", &e.from_name),
+                    ("to_name", &e.to_name),
+                    ("source", &e.source),
+                ],
+            )
+            .expect("xml");
         }
-        body.push_str("  </syntax_edges>\n");
+        vxml::close(&mut w, "syntax_edges").expect("xml");
     }
+    vxml::close(&mut w, "graph").expect("xml");
 
-    body.push_str("</graph>\n");
-
-    let tokens = body.len() / 4;
-    let header = format!(
-        "<graph root_id=\"{}\" tokens=\"{}\" trusted_edges=\"{}\" syntax_edges=\"{}\">\n",
-        focus.id,
-        tokens,
-        trusted.len(),
-        syntax.len(),
-    );
-
-    print!("{}{}", header, body);
+    vxml::finish_stream(w)?;
+    Ok(())
 }
 
 pub fn blast_radius(
+    symbols: &[String],
+    depth: usize,
+    snippets: bool,
+    max_snippet_lines: Option<usize>,
+    control: OutputControl,
+) -> Result<()> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    if symbols.len() > 1 {
+        let count_s = symbols.len().to_string();
+        write_wrapper_start("blast_radii", &[("count", &count_s)])?;
+        for symbol in symbols {
+            blast_radius_one(symbol, depth, snippets, max_snippet_lines, control)?;
+        }
+        write_wrapper_end("blast_radii")?;
+        return Ok(());
+    }
+    blast_radius_one(&symbols[0], depth, snippets, max_snippet_lines, control)
+}
+
+fn blast_radius_one(
     symbol: &str,
     depth: usize,
     snippets: bool,
     max_snippet_lines: Option<usize>,
+    control: OutputControl,
 ) -> Result<()> {
     let conn = open_db()?;
     let root_id = resolve_symbol_id(&conn, symbol)?;
@@ -766,20 +1482,77 @@ pub fn blast_radius(
         )
         .map_err(|_| anyhow!("node id {} not found", root_id))?;
 
-    print!(
-        "{}",
-        render_blast_radius_xml(&conn, &focus, &rows, snippets, snippets, max_snippet_lines)
+    let mut w = vxml::new_stream_writer();
+    let (window, meta) = apply_window(
+        &rows,
+        control.offset,
+        control.budget_lines,
+        control.budget_tokens,
+        |(n, _)| estimate_node_tokens(n),
     );
+    write_blast_radius_xml(
+        &mut w,
+        &conn,
+        &focus,
+        &rows[window],
+        snippets,
+        snippets,
+        max_snippet_lines,
+        Some(meta),
+        control.compact,
+    )?;
+    vxml::finish_stream(w)?;
     Ok(())
 }
 
 pub fn context(
+    symbols: &[String],
+    depth: usize,
+    blast_depth: usize,
+    snippets: bool,
+    edit_mode: bool,
+    max_snippet_lines: Option<usize>,
+    control: OutputControl,
+) -> Result<()> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    if symbols.len() > 1 {
+        let count_s = symbols.len().to_string();
+        write_wrapper_start("contexts", &[("count", &count_s)])?;
+        for symbol in symbols {
+            context_one(
+                symbol,
+                depth,
+                blast_depth,
+                snippets,
+                edit_mode,
+                max_snippet_lines,
+                control,
+            )?;
+        }
+        write_wrapper_end("contexts")?;
+        return Ok(());
+    }
+    context_one(
+        &symbols[0],
+        depth,
+        blast_depth,
+        snippets,
+        edit_mode,
+        max_snippet_lines,
+        control,
+    )
+}
+
+fn context_one(
     symbol: &str,
     depth: usize,
     blast_depth: usize,
     snippets: bool,
     edit_mode: bool,
     max_snippet_lines: Option<usize>,
+    control: OutputControl,
 ) -> Result<()> {
     // edit_mode: signature+doc+annotation only on focus, no neighbor snippets, depth=1 each side
     let (snippets, depth, blast_depth, show_focus_snippet) = if edit_mode {
@@ -871,16 +1644,6 @@ pub fn context(
         rusqlite::params![root_id],
         |r| r.get(0),
     )?;
-    let graph_xml = render_graph_xml(
-        &conn,
-        &focus,
-        &neighbors,
-        edge_count,
-        snippets,
-        show_focus_snippet,
-        max_snippet_lines,
-    );
-
     // --- blast radius (callers) ---
     let blast_limit = if blast_depth == 0 {
         50_i64
@@ -929,38 +1692,74 @@ pub fn context(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let blast_xml = render_blast_radius_xml(
+    // --- unified context document (streaming) ---
+    let mut w = vxml::new_stream_writer();
+    let root_id_s = root_id.to_string();
+    vxml::open_attrs(
+        &mut w,
+        "context",
+        &[
+            ("symbol", &focus.name),
+            ("root_id", &root_id_s),
+            ("total_tokens", "streaming"),
+        ],
+    )?;
+    let (graph_window, graph_meta) = apply_window(
+        &neighbors,
+        control.offset,
+        control.budget_lines,
+        control.budget_tokens,
+        estimate_neighbor_tokens,
+    );
+    write_graph_xml(
+        &mut w,
         &conn,
         &focus,
-        &dep_rows,
+        &neighbors[graph_window],
+        edge_count,
         snippets,
         show_focus_snippet,
         max_snippet_lines,
+        Some(graph_meta),
+        control.compact,
+    )?;
+    let (blast_window, blast_meta) = apply_window(
+        &dep_rows,
+        control.offset,
+        control.budget_lines,
+        control.budget_tokens,
+        |(n, _)| estimate_node_tokens(n),
     );
-
-    // --- unified context document ---
-    let total_tokens = (graph_xml.len() + blast_xml.len()) / 4;
-    println!(
-        "<context symbol=\"{}\" root_id=\"{}\" total_tokens=\"{}\">\n{}{}</context>",
-        xml_escape(&focus.name),
-        root_id,
-        total_tokens,
-        graph_xml,
-        blast_xml,
-    );
+    write_blast_radius_xml(
+        &mut w,
+        &conn,
+        &focus,
+        &dep_rows[blast_window],
+        snippets,
+        show_focus_snippet,
+        max_snippet_lines,
+        Some(blast_meta),
+        control.compact,
+    )?;
+    vxml::close(&mut w, "context")?;
+    vxml::finish_stream(w)?;
 
     Ok(())
 }
 
-fn render_blast_radius_xml(
+#[allow(clippy::too_many_arguments)]
+fn write_blast_radius_xml<W: std::io::Write>(
+    w: &mut quick_xml::Writer<W>,
     conn: &Connection,
     focus: &NodeRow,
     dependents: &[(NodeRow, i64)],
     snippets: bool,
     show_focus_snippet: bool,
     max_snippet_lines: Option<usize>,
-) -> String {
-    let snippet = if show_focus_snippet {
+    meta: Option<WindowMeta>,
+    compact: bool,
+) -> Result<()> {
+    let snippet = if show_focus_snippet && !compact {
         read_snippet(
             &focus.file,
             focus.range_start,
@@ -973,148 +1772,180 @@ fn render_blast_radius_xml(
 
     let mut all_ids: Vec<i64> = vec![focus.id];
     all_ids.extend(dependents.iter().map(|(n, _)| n.id));
-    let annotations = fetch_annotations(conn, &all_ids);
+    let annotations = if compact {
+        std::collections::HashMap::new()
+    } else {
+        fetch_annotations(conn, &all_ids)
+    };
+    let focus_diagnostics = if compact {
+        Vec::new()
+    } else {
+        fetch_node_diagnostics(conn, focus.id)
+    };
 
-    let mut body = String::new();
-
-    body.push_str("  <focus>\n");
-    body.push_str(&format!(
-        "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}>\n",
-        focus.id,
-        xml_escape(&focus.stable_id),
-        xml_escape(&focus.name),
-        xml_escape(&focus.kind),
-        xml_escape(&focus.file),
-        focus.range_start,
-        focus.range_end,
-        xml_escape(&focus.visibility),
-        focus.fan_in,
-        focus.fan_out,
-        role_attrs(&focus.role, focus.role_confidence),
-    ));
-    if let Some(sig) = &focus.signature {
-        body.push_str(&format!(
-            "      <signature>{}</signature>\n",
-            xml_escape(sig)
-        ));
+    let root_id_s = focus.id.to_string();
+    let dep_count_s = dependents.len().to_string();
+    let mut root_attrs = vec![
+        ("root_id", root_id_s.as_str()),
+        ("root_name", focus.name.as_str()),
+        ("tokens", "streaming"),
+        ("dependent_count", dep_count_s.as_str()),
+    ];
+    let compact_s = compact.to_string();
+    if compact {
+        root_attrs.push(("compact", compact_s.as_str()));
     }
-    if let Some(doc) = &focus.doc {
-        if !doc.is_empty() {
-            body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
+    let mut total_items_s = None::<String>;
+    let mut offset_s = None::<String>;
+    let mut shown_items_s = None::<String>;
+    let mut truncated_s = None::<String>;
+    let mut next_offset_s = None::<String>;
+    let mut budget_lines_s = None::<String>;
+    let mut budget_tokens_s = None::<String>;
+    if let Some(m) = meta {
+        total_items_s = Some(m.total_items.to_string());
+        offset_s = Some(m.offset.to_string());
+        shown_items_s = Some(m.shown_items.to_string());
+        truncated_s = Some(m.truncated.to_string());
+        if let Some(next) = m.next_offset {
+            next_offset_s = Some(next.to_string());
+        }
+        if let Some(b) = m.budget_lines {
+            budget_lines_s = Some(b.to_string());
+        }
+        if let Some(b) = m.budget_tokens {
+            budget_tokens_s = Some(b.to_string());
         }
     }
-    if let Some(ann) = annotations.get(&focus.id) {
-        body.push_str(&format!(
-            "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
-            xml_escape(&ann.source),
-            ann.confidence,
-            ann.stale
-        ));
-        if let Some(intent) = &ann.intent {
-            body.push_str(&format!(
-                "        <intent>{}</intent>\n",
-                xml_escape(intent)
-            ));
-        }
-        if let Some(behavior) = &ann.behavior {
-            body.push_str(&format!(
-                "        <behavior>{}</behavior>\n",
-                xml_escape(behavior)
-            ));
-        }
-        if let Some(tags) = &ann.tags {
-            body.push_str(&format!("        <tags>{}</tags>\n", xml_escape(tags)));
-        }
-        body.push_str("      </annotation>\n");
+    if let Some(s) = total_items_s.as_ref() {
+        root_attrs.push(("total_items", s.as_str()));
     }
-    if let Some(snip) = snippet {
-        body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+    if let Some(s) = offset_s.as_ref() {
+        root_attrs.push(("offset", s.as_str()));
     }
-    body.push_str("    </node>\n");
-    body.push_str("  </focus>\n");
+    if let Some(s) = shown_items_s.as_ref() {
+        root_attrs.push(("shown_items", s.as_str()));
+    }
+    if let Some(s) = truncated_s.as_ref() {
+        root_attrs.push(("truncated", s.as_str()));
+    }
+    if let Some(s) = next_offset_s.as_ref() {
+        root_attrs.push(("next_offset", s.as_str()));
+    }
+    if let Some(s) = budget_lines_s.as_ref() {
+        root_attrs.push(("budget_lines", s.as_str()));
+    }
+    if let Some(s) = budget_tokens_s.as_ref() {
+        root_attrs.push(("budget_tokens", s.as_str()));
+    }
+    vxml::open_attrs(w, "blast_radius", &root_attrs)?;
+    // Keep existing structure by reusing graph writer logic on this writer below.
+    // Focus
+    vxml::open(w, "focus")?;
+    let id_s = focus.id.to_string();
+    let range_s = format!("L{}-L{}", focus.range_start, focus.range_end);
+    let fan_in_s = focus.fan_in.to_string();
+    let fan_out_s = focus.fan_out.to_string();
+    let role_conf_s = format!("{:.2}", focus.role_confidence);
+    let role_uncertain_s = (focus.role_confidence < 0.6).to_string();
+    let mut attrs = vec![
+        ("id", id_s.as_str()),
+        ("stable_id", focus.stable_id.as_str()),
+        ("name", focus.name.as_str()),
+        ("kind", focus.kind.as_str()),
+        ("file", focus.file.as_str()),
+        ("range", range_s.as_str()),
+        ("visibility", focus.visibility.as_str()),
+        ("fan_in", fan_in_s.as_str()),
+        ("fan_out", fan_out_s.as_str()),
+        ("role", focus.role.as_str()),
+        ("role_confidence", role_conf_s.as_str()),
+    ];
+    if focus.role_confidence < 0.6 {
+        attrs.push(("role_uncertain", role_uncertain_s.as_str()));
+    }
+    vxml::open_attrs(w, "node", &attrs)?;
+    if !compact {
+        if let Some(sig) = &focus.signature {
+            vxml::text_tag(w, "signature", sig)?;
+        }
+        if let Some(doc) = &focus.doc {
+            if !doc.is_empty() {
+                vxml::text_tag(w, "doc", doc)?;
+            }
+        }
+        if let Some(ann) = annotations.get(&focus.id) {
+            write_annotation_xml(w, ann);
+        }
+        write_diagnostics_xml(w, &focus_diagnostics);
+        if let Some(snip) = snippet {
+            vxml::text_tag(w, "snippet", &snip)?;
+        }
+    }
+    vxml::close(w, "node")?;
+    vxml::close(w, "focus")?;
 
     let max_depth = dependents.iter().map(|(_, d)| *d).max().unwrap_or(0);
     for d in 1..=max_depth {
-        body.push_str(&format!("  <dependents depth=\"{}\">\n", d));
+        let depth_s = d.to_string();
+        vxml::open_attrs(w, "dependents", &[("depth", &depth_s)])?;
         for (n, _) in dependents.iter().filter(|(_, dep)| *dep == d) {
-            body.push_str(&format!(
-                "    <node id=\"{}\" stable_id=\"{}\" name=\"{}\" kind=\"{}\" file=\"{}\" range=\"L{}-L{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
-                n.id,
-                xml_escape(&n.stable_id),
-                xml_escape(&n.name),
-                xml_escape(&n.kind),
-                xml_escape(&n.file),
-                n.range_start,
-                n.range_end,
-                xml_escape(&n.visibility),
-                n.fan_in,
-                n.fan_out,
-                role_attrs(&n.role, n.role_confidence),
-            ));
-            if let Some(sig) = &n.signature {
-                body.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
+            let id_s = n.id.to_string();
+            let range_s = format!("L{}-L{}", n.range_start, n.range_end);
+            let fan_in_s = n.fan_in.to_string();
+            let fan_out_s = n.fan_out.to_string();
+            let role_conf_s = format!("{:.2}", n.role_confidence);
+            let role_uncertain_s = (n.role_confidence < 0.6).to_string();
+            let mut attrs = vec![
+                ("id", id_s.as_str()),
+                ("stable_id", n.stable_id.as_str()),
+                ("name", n.name.as_str()),
+                ("kind", n.kind.as_str()),
+                ("file", n.file.as_str()),
+                ("range", range_s.as_str()),
+                ("visibility", n.visibility.as_str()),
+                ("fan_in", fan_in_s.as_str()),
+                ("fan_out", fan_out_s.as_str()),
+                ("role", n.role.as_str()),
+                ("role_confidence", role_conf_s.as_str()),
+            ];
+            if n.role_confidence < 0.6 {
+                attrs.push(("role_uncertain", role_uncertain_s.as_str()));
             }
-            let has_doc = n.doc.as_ref().is_some_and(|d| !d.is_empty());
-            let call_snippet = if snippets {
+            if !compact {
+                if let Some(sig) = &n.signature {
+                    attrs.push(("signature", sig.as_str()));
+                }
+            }
+            let has_doc = !compact && n.doc.as_ref().is_some_and(|d| !d.is_empty());
+            let call_snippet = if snippets && !compact {
                 read_call_site_snippet(&n.file, n.range_start, n.range_end, &focus.name)
             } else {
                 None
             };
-            let dep_annotation = annotations.get(&n.id);
+            let dep_annotation = if compact { None } else { annotations.get(&n.id) };
             if has_doc || call_snippet.is_some() || dep_annotation.is_some() {
-                body.push_str(">\n");
+                vxml::open_attrs(w, "node", &attrs)?;
                 if let Some(doc) = &n.doc {
                     if !doc.is_empty() {
-                        body.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
+                        vxml::text_tag(w, "doc", doc)?;
                     }
                 }
                 if let Some(ann) = dep_annotation {
-                    body.push_str(&format!(
-                        "      <annotation source=\"{}\" confidence=\"{:.1}\" stale=\"{}\">\n",
-                        xml_escape(&ann.source),
-                        ann.confidence,
-                        ann.stale
-                    ));
-                    if let Some(intent) = &ann.intent {
-                        body.push_str(&format!(
-                            "        <intent>{}</intent>\n",
-                            xml_escape(intent)
-                        ));
-                    }
-                    if let Some(behavior) = &ann.behavior {
-                        body.push_str(&format!(
-                            "        <behavior>{}</behavior>\n",
-                            xml_escape(behavior)
-                        ));
-                    }
-                    if let Some(tags) = &ann.tags {
-                        body.push_str(&format!("        <tags>{}</tags>\n", xml_escape(tags)));
-                    }
-                    body.push_str("      </annotation>\n");
+                    write_annotation_xml(w, ann);
                 }
                 if let Some(snip) = call_snippet {
-                    body.push_str(&format!("      <snippet>{}</snippet>\n", xml_escape(&snip)));
+                    vxml::text_tag(w, "snippet", &snip)?;
                 }
-                body.push_str("    </node>\n");
+                vxml::close(w, "node")?;
             } else {
-                body.push_str("/>\n");
+                vxml::empty(w, "node", &attrs)?;
             }
         }
-        body.push_str("  </dependents>\n");
+        vxml::close(w, "dependents")?;
     }
-
-    body.push_str("</blast_radius>\n");
-
-    let tokens = body.len() / 4;
-    let header = format!(
-        "<blast_radius root_id=\"{}\" root_name=\"{}\" tokens=\"{}\" dependent_count=\"{}\">\n",
-        focus.id,
-        xml_escape(&focus.name),
-        tokens,
-        dependents.len(),
-    );
-
-    format!("{}{}", header, body)
+    vxml::close(w, "blast_radius")?;
+    Ok(())
 }
 
 fn file_to_module(path: &str) -> String {
@@ -1126,6 +1957,7 @@ fn file_to_module(path: &str) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn map(
     include_private: bool,
     top: usize,
@@ -1134,6 +1966,7 @@ pub fn map(
     all_edges: bool,
     role: Option<&str>,
     by_file: bool,
+    md: bool,
 ) -> Result<()> {
     let conn = open_db()?;
 
@@ -1143,6 +1976,7 @@ pub fn map(
         kind: String,
         visibility: String,
         signature: Option<String>,
+        complexity: Option<i64>,
         hotspot_fan_in: i64,
         fan_in: i64,
         fan_out: i64,
@@ -1154,13 +1988,13 @@ pub fn map(
     let hotspot_subquery = if all_edges {
         "SELECT COUNT(*) FROM edges WHERE to_id = n.id"
     } else {
-        "SELECT COUNT(*) FROM edges WHERE to_id = n.id AND source = 'rust-analyzer'"
+        "SELECT COUNT(*) FROM edges WHERE to_id = n.id AND source IN ('resolver', 'rustdoc')"
     };
 
     let visibility_filter = if include_private {
         String::new()
     } else {
-        "WHERE n.visibility != 'private'".to_string()
+        "WHERE n.visibility NOT IN ('private', 'default')".to_string()
     };
 
     let role_filter = match role {
@@ -1179,7 +2013,7 @@ pub fn map(
     };
 
     let sql = format!(
-        "SELECT n.file, n.name, n.kind, n.visibility, n.signature,
+        "SELECT n.file, n.name, n.kind, n.visibility, n.signature, n.complexity,
                 ({hotspot_subquery}) AS hotspot_fan_in,
                 (SELECT COUNT(*) FROM edges WHERE to_id = n.id) AS fan_in,
                 (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out,
@@ -1198,12 +2032,13 @@ pub fn map(
                 kind: r.get(2)?,
                 visibility: r.get(3)?,
                 signature: r.get(4)?,
-                hotspot_fan_in: r.get(5)?,
-                fan_in: r.get(6)?,
-                fan_out: r.get(7)?,
-                doc: r.get(8)?,
-                role: r.get(9)?,
-                role_confidence: r.get(10)?,
+                complexity: r.get(5)?,
+                hotspot_fan_in: r.get(6)?,
+                fan_in: r.get(7)?,
+                fan_out: r.get(8)?,
+                doc: r.get(9)?,
+                role: r.get(10)?,
+                role_confidence: r.get(11)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1234,26 +2069,64 @@ pub fn map(
     // Drop zero-count entries — no trusted edges means no signal
     ranked.retain(|&i| rows[i].hotspot_fan_in > 0);
 
-    let mut out = String::new();
+    if md {
+        println!("| file | symbol | kind | visibility | complexity | role | fan_in | fan_out |");
+        println!("|---|---|---|---|---:|---|---:|---:|");
+        for row in &rows {
+            let complexity_s = row
+                .complexity
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "".to_string());
+            println!(
+                "| {} | {} | {} | {} | {} | {} ({:.2}) | {} | {} |",
+                row.file.replace('|', "\\|"),
+                row.name.replace('|', "\\|"),
+                row.kind.replace('|', "\\|"),
+                row.visibility.replace('|', "\\|"),
+                complexity_s,
+                row.role.replace('|', "\\|"),
+                row.role_confidence,
+                row.fan_in,
+                row.fan_out
+            );
+        }
+        return Ok(());
+    }
+
+    let total_symbols: usize = by_path.values().map(|v| v.len()).sum();
+    let mut w = vxml::new_stream_writer();
+    let files_s = by_path.len().to_string();
+    let symbols_s = total_symbols.to_string();
+    vxml::open_attrs(
+        &mut w,
+        "map",
+        &[("files", &files_s), ("symbols", &symbols_s), ("tokens", "streaming")],
+    )?;
 
     let hotspot_source = if all_edges { "all" } else { "trusted" };
-    out.push_str(&format!(
-        "  <hotspots top=\"{}\" fan_in_source=\"{}\">\n",
-        ranked.len(),
-        hotspot_source,
-    ));
+    let top_s = ranked.len().to_string();
+    vxml::open_attrs(
+        &mut w,
+        "hotspots",
+        &[("top", &top_s), ("fan_in_source", hotspot_source)],
+    )?;
     for &i in &ranked {
         let s = &rows[i];
-        out.push_str(&format!(
-            "    <symbol name=\"{}\" kind=\"{}\" file=\"{}\" fan_in=\"{}\" fan_out=\"{}\"/>\n",
-            xml_escape(&s.name),
-            xml_escape(&s.kind),
-            xml_escape(&s.file),
-            s.hotspot_fan_in,
-            s.fan_out,
-        ));
+        let fan_in_s = s.hotspot_fan_in.to_string();
+        let fan_out_s = s.fan_out.to_string();
+        vxml::empty(
+            &mut w,
+            "symbol",
+            &[
+                ("name", &s.name),
+                ("kind", &s.kind),
+                ("file", &s.file),
+                ("fan_in", &fan_in_s),
+                ("fan_out", &fan_out_s),
+            ],
+        )?;
     }
-    out.push_str("  </hotspots>\n");
+    vxml::close(&mut w, "hotspots")?;
 
     for (file, indices) in &by_path {
         let file_doc = if with_file_docs {
@@ -1261,55 +2134,50 @@ pub fn map(
         } else {
             None
         };
+        let symbols_count_s = indices.len().to_string();
         if by_file {
-            // --by-file mode: original <file path="..."> element
-            if let Some(fd) = file_doc {
-                out.push_str(&format!(
-                    "  <file path=\"{}\" symbols=\"{}\">\n    <doc>{}</doc>\n",
-                    xml_escape(file),
-                    indices.len(),
-                    xml_escape(fd),
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  <file path=\"{}\" symbols=\"{}\">\n",
-                    xml_escape(file),
-                    indices.len(),
-                ));
-            }
+            vxml::open_attrs(
+                &mut w,
+                "file",
+                &[("path", file), ("symbols", &symbols_count_s)],
+            )?;
         } else {
-            // default: <module name="lsp" path="./src/lsp.rs"> element
             let module_name = file_to_module(file);
-            if let Some(fd) = file_doc {
-                out.push_str(&format!(
-                    "  <module name=\"{}\" path=\"{}\" symbols=\"{}\">\n    <doc>{}</doc>\n",
-                    xml_escape(&module_name),
-                    xml_escape(file),
-                    indices.len(),
-                    xml_escape(fd),
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  <module name=\"{}\" path=\"{}\" symbols=\"{}\">\n",
-                    xml_escape(&module_name),
-                    xml_escape(file),
-                    indices.len(),
-                ));
-            }
+            vxml::open_attrs(
+                &mut w,
+                "module",
+                &[("name", &module_name), ("path", file), ("symbols", &symbols_count_s)],
+            )?;
         }
+
+        if let Some(fd) = file_doc {
+            vxml::text_tag(&mut w, "doc", fd)?;
+        }
+
         for &i in indices {
             let s = &rows[i];
-            out.push_str(&format!(
-                "    <symbol name=\"{}\" kind=\"{}\" visibility=\"{}\" fan_in=\"{}\" fan_out=\"{}\"{}",
-                xml_escape(&s.name),
-                xml_escape(&s.kind),
-                xml_escape(&s.visibility),
-                s.fan_in,
-                s.fan_out,
-                role_attrs(&s.role, s.role_confidence),
-            ));
+            let fan_in_s = s.fan_in.to_string();
+            let fan_out_s = s.fan_out.to_string();
+            let role_conf_s = format!("{:.2}", s.role_confidence);
+            let role_uncertain_s = (s.role_confidence < 0.6).to_string();
+            let mut attrs = vec![
+                ("name", s.name.as_str()),
+                ("kind", s.kind.as_str()),
+                ("visibility", s.visibility.as_str()),
+                ("fan_in", fan_in_s.as_str()),
+                ("fan_out", fan_out_s.as_str()),
+                ("role", s.role.as_str()),
+                ("role_confidence", role_conf_s.as_str()),
+            ];
+            if s.role_confidence < 0.6 {
+                attrs.push(("role_uncertain", role_uncertain_s.as_str()));
+            }
+            let complexity_s = s.complexity.map(|c| c.to_string());
+            if let Some(c) = &complexity_s {
+                attrs.push(("complexity", c.as_str()));
+            }
             if let Some(sig) = &s.signature {
-                out.push_str(&format!(" signature=\"{}\"", xml_escape(sig)));
+                attrs.push(("signature", sig.as_str()));
             }
             let sym_doc = if with_docs {
                 s.doc.as_deref().filter(|d| !d.is_empty())
@@ -1317,31 +2185,294 @@ pub fn map(
                 None
             };
             if let Some(doc) = sym_doc {
-                out.push_str(">\n");
-                out.push_str(&format!("      <doc>{}</doc>\n", xml_escape(doc)));
-                out.push_str("    </symbol>\n");
+                vxml::open_attrs(&mut w, "symbol", &attrs)?;
+                vxml::text_tag(&mut w, "doc", doc)?;
+                vxml::close(&mut w, "symbol")?;
             } else {
-                out.push_str("/>\n");
+                vxml::empty(&mut w, "symbol", &attrs)?;
             }
         }
         if by_file {
-            out.push_str("  </file>\n");
+            vxml::close(&mut w, "file")?;
         } else {
-            out.push_str("  </module>\n");
+            vxml::close(&mut w, "module")?;
+        }
+    }
+    vxml::close(&mut w, "map")?;
+    vxml::finish_stream(w)?;
+
+    Ok(())
+}
+
+pub fn trace_path(
+    symbol: &str,
+    to: Option<&str>,
+    direction: &str,
+    max_depth: usize,
+    max_paths: usize,
+    with_async_boundaries: bool,
+    with_channels: bool,
+) -> Result<()> {
+    let conn = open_db()?;
+    let start_id = resolve_symbol_id(&conn, symbol)?;
+    let target_id = match to {
+        Some(t) => Some(resolve_symbol_id(&conn, t)?),
+        None => None,
+    };
+
+    #[derive(Clone)]
+    struct NodeLite {
+        name: String,
+        stable_id: String,
+        role: String,
+        signature: Option<String>,
+        fan_out: i64,
+    }
+
+    let mut node_stmt = conn.prepare(
+        "SELECT name, stable_id, role, signature,
+                (SELECT COUNT(*) FROM edges WHERE from_id = n.id) AS fan_out
+         FROM nodes n
+         WHERE id = ?1",
+    )?;
+    let load_node = |id: i64, stmt: &mut rusqlite::Statement<'_>| -> Result<NodeLite> {
+        let n = stmt.query_row(rusqlite::params![id], |r| {
+            Ok(NodeLite {
+                name: r.get(0)?,
+                stable_id: r.get(1)?,
+                role: r.get(2)?,
+                signature: r.get(3)?,
+                fan_out: r.get(4)?,
+            })
+        })?;
+        Ok(n)
+    };
+    let start_node = load_node(start_id, &mut node_stmt)?;
+
+    let mut edges_stmt = conn.prepare(
+        "SELECT from_id, to_id, edge_type, source
+         FROM edges
+         WHERE source IN ('resolver', 'rustdoc')",
+    )?;
+    let edges: Vec<(i64, i64, String, String)> = edges_stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut out_adj: std::collections::HashMap<i64, Vec<(i64, String, String)>> =
+        std::collections::HashMap::new();
+    let mut in_adj: std::collections::HashMap<i64, Vec<(i64, String, String)>> =
+        std::collections::HashMap::new();
+    for (from, to_id, et, src) in &edges {
+        out_adj
+            .entry(*from)
+            .or_default()
+            .push((*to_id, et.clone(), src.clone()));
+        in_adj
+            .entry(*to_id)
+            .or_default()
+            .push((*from, et.clone(), src.clone()));
+    }
+
+    let dir = match direction.to_ascii_lowercase().as_str() {
+        "outgoing" | "write" => "outgoing",
+        "incoming" | "read" => "incoming",
+        "both" => "both",
+        _ => {
+            anyhow::bail!(
+                "invalid direction '{}'; expected outgoing|incoming|both|read|write",
+                direction
+            );
+        }
+    };
+
+    #[derive(Clone)]
+    struct Hop {
+        from: i64,
+        to: i64,
+        edge_type: String,
+        source: String,
+    }
+    #[derive(Clone)]
+    struct PathState {
+        current: i64,
+        hops: Vec<Hop>,
+        visited: std::collections::HashSet<i64>,
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    let mut seen_start = std::collections::HashSet::new();
+    seen_start.insert(start_id);
+    queue.push_back(PathState {
+        current: start_id,
+        hops: Vec::new(),
+        visited: seen_start,
+    });
+
+    let mut emitted: Vec<Vec<Hop>> = Vec::new();
+    while let Some(state) = queue.pop_front() {
+        if emitted.len() >= max_paths {
+            break;
+        }
+        if state.hops.len() >= max_depth {
+            emitted.push(state.hops.clone());
+            if emitted.len() >= max_paths {
+                break;
+            }
+            continue;
+        }
+
+        let outgoing_iter = out_adj.get(&state.current).cloned().unwrap_or_default();
+        let incoming_iter = in_adj.get(&state.current).cloned().unwrap_or_default();
+        let nexts: Vec<(i64, String, String, bool)> = match dir {
+            "incoming" => incoming_iter
+                .into_iter()
+                .map(|(n, et, src)| (n, et, src, false))
+                .collect(),
+            "both" => outgoing_iter
+                .into_iter()
+                .map(|(n, et, src)| (n, et, src, true))
+                .chain(
+                    incoming_iter
+                        .into_iter()
+                        .map(|(n, et, src)| (n, et, src, false)),
+                )
+                .collect(),
+            _ => outgoing_iter
+                .into_iter()
+                .map(|(n, et, src)| (n, et, src, true))
+                .collect(),
+        };
+
+        if nexts.is_empty() {
+            emitted.push(state.hops.clone());
+            if emitted.len() >= max_paths {
+                break;
+            }
+            continue;
+        }
+
+        for (next, et, src, is_forward) in nexts {
+            if emitted.len() >= max_paths {
+                break;
+            }
+            if state.visited.contains(&next) {
+                continue;
+            }
+            let mut next_state = state.clone();
+            next_state.visited.insert(next);
+            next_state.current = next;
+            let (from_id, to_id) = if is_forward {
+                (state.current, next)
+            } else {
+                (next, state.current)
+            };
+            next_state.hops.push(Hop {
+                from: from_id,
+                to: to_id,
+                edge_type: et,
+                source: src,
+            });
+
+            if target_id.is_some_and(|tid| tid == next) {
+                emitted.push(next_state.hops.clone());
+                continue;
+            }
+
+            if target_id.is_none() {
+                let next_node = load_node(next, &mut node_stmt)?;
+                // Completion boundary heuristic: structural leaves and worker boundaries.
+                let completion = next_node.fan_out == 0
+                    || next_node.role == "leaf"
+                    || next_node.role == "infra"
+                    || next_node.role == "entrypoint";
+                if completion {
+                    emitted.push(next_state.hops.clone());
+                    continue;
+                }
+            }
+            queue.push_back(next_state);
         }
     }
 
-    out.push_str("</map>\n");
+    let mut w = vxml::new_stream_writer();
+    let max_depth_s = max_depth.to_string();
+    let max_paths_s = max_paths.to_string();
+    let found_s = emitted.len().to_string();
+    vxml::open_attrs(
+        &mut w,
+        "trace_path",
+        &[
+            ("symbol", symbol),
+            ("root_id", &start_id.to_string()),
+            ("root_name", &start_node.name),
+            ("direction", dir),
+            ("max_depth", &max_depth_s),
+            ("max_paths", &max_paths_s),
+            ("found", &found_s),
+            ("tokens", "streaming"),
+        ],
+    )?;
 
-    let tokens = out.len() / 4;
-    let total_symbols: usize = by_path.values().map(|v| v.len()).sum();
-    print!(
-        "<map files=\"{}\" symbols=\"{}\" tokens=\"{}\">\n{}",
-        by_path.len(),
-        total_symbols,
-        tokens,
-        out,
-    );
+    if let Some(tid) = target_id {
+        if let Ok(tnode) = load_node(tid, &mut node_stmt) {
+            vxml::empty(
+                &mut w,
+                "target",
+                &[("id", &tid.to_string()), ("name", &tnode.name), ("stable_id", &tnode.stable_id)],
+            )?;
+        }
+    }
 
+    for (idx, path) in emitted.iter().enumerate() {
+        let i_s = (idx + 1).to_string();
+        let hops_s = path.len().to_string();
+        vxml::open_attrs(&mut w, "path", &[("index", &i_s), ("hops", &hops_s)])?;
+        for hop in path {
+            let from = load_node(hop.from, &mut node_stmt)?;
+            let to_node = load_node(hop.to, &mut node_stmt)?;
+            let attrs = vec![
+                ("from_id", hop.from.to_string()),
+                ("to_id", hop.to.to_string()),
+                ("from_name", from.name.clone()),
+                ("to_name", to_node.name.clone()),
+                ("edge_type", hop.edge_type.clone()),
+                ("source", hop.source.clone()),
+                ("from_stable_id", from.stable_id.clone()),
+                ("to_stable_id", to_node.stable_id.clone()),
+            ];
+            let mut pairs: Vec<(&str, &str)> = Vec::new();
+            for (k, v) in &attrs {
+                pairs.push((k, v.as_str()));
+            }
+            vxml::open_attrs(&mut w, "hop", &pairs)?;
+
+            if with_async_boundaries
+                && (from.signature.as_deref().is_some_and(|s| s.contains("async "))
+                    || to_node.signature.as_deref().is_some_and(|s| s.contains("async ")))
+            {
+                vxml::empty(&mut w, "boundary", &[("type", "async")])?;
+            }
+
+            if with_channels
+                && (is_channelish(from.name.as_str(), from.signature.as_deref())
+                    || is_channelish(to_node.name.as_str(), to_node.signature.as_deref()))
+            {
+                vxml::empty(&mut w, "boundary", &[("type", "channel_or_actor")])?;
+            }
+
+            vxml::close(&mut w, "hop")?;
+        }
+        vxml::close(&mut w, "path")?;
+    }
+
+    vxml::close(&mut w, "trace_path")?;
+    vxml::finish_stream(w)?;
     Ok(())
+}
+
+fn is_channelish(name: &str, signature: Option<&str>) -> bool {
+    let name = name.to_ascii_lowercase();
+    let sig = signature.unwrap_or("").to_ascii_lowercase();
+    let keys = ["channel", "mpsc", "broadcast", "oneshot", "actor", "mailbox"];
+    keys.iter().any(|k| name.contains(k) || sig.contains(k))
 }

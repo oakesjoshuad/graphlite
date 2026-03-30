@@ -25,7 +25,7 @@ fn percentile_rank(value: i64, sorted: &[i64]) -> f64 {
 
 /// Second-pass role inference over all nodes using graph math.
 ///
-/// Runs after symbols, edges, and LSP enrichment are committed so it sees
+/// Runs after symbols, edges, and rustdoc/resolver enrichment are committed so it sees
 /// the full graph. Pure SQL reads + a single batched UPDATE — no file I/O.
 pub fn infer_roles(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
@@ -114,15 +114,6 @@ pub fn infer_roles(conn: &Connection) -> Result<()> {
         }
     }
     tx.commit()?;
-
-    // Apply stable_id-keyed manual overrides — survive re-index naturally.
-    let _ = conn.execute(
-        "UPDATE nodes
-         SET role = (SELECT role FROM role_overrides WHERE role_overrides.stable_id = nodes.stable_id),
-             role_confidence = 1.0
-         WHERE stable_id != '' AND stable_id IN (SELECT stable_id FROM role_overrides)",
-        [],
-    );
 
     eprintln!("Roles inferred for {} nodes", nodes.len());
     Ok(())

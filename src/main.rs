@@ -1,23 +1,26 @@
 mod annotate;
 mod arch;
+mod audit;
+mod capabilities;
+mod clippy_enricher;
 mod config;
 mod discover;
 mod init_cmd;
 mod insert;
 mod ipc;
 mod language;
-mod lsp;
 mod parser;
+mod policy;
 mod query;
-mod reclassify;
 mod refactor;
+mod resolver;
 mod roles;
+mod rustdoc_enricher;
 mod schema;
-mod serve;
 mod violations;
-mod viz;
+mod workspace;
 mod watch;
-mod watcher_engine;
+mod xml;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -41,27 +44,24 @@ enum Commands {
         /// Project root to initialise
         #[arg(default_value = ".")]
         root: String,
-        /// LSP language for semantic enrichment (overrides config)
-        #[arg(long, value_name = "LANG")]
-        lsp: Option<String>,
     },
     /// Walk a source tree and index all symbols into codegraph.db
     Discover {
         /// Root directory to index
         #[arg(default_value = ".")]
         root: String,
-        /// LSP language to use for semantic enrichment (e.g. "rust")
-        #[arg(long, value_name = "LANG")]
-        lsp: Option<String>,
     },
     /// Show a symbol and its graph neighborhood as XML
     ///
-    /// Cheaper than `context` — no blast radius. Use when you need to understand what a symbol
+    /// Cheaper than `context` -- no blast radius. Use when you need to understand what a symbol
     /// calls without needing to know what depends on it. `--no-snippets` gives pure structural
     /// output (signatures + roles) at significantly lower token cost.
+    ///
+    /// See also: `symbols` command to find stable_id values by name or qualified name (Type::method).
     Graph {
-        /// Symbol id (integer) or name (sym:Name)
-        symbol: String,
+        /// Symbol id (integer) or name (sym:Name); accepts multiple
+        #[arg(required = true)]
+        symbols: Vec<String>,
         /// Traversal depth (overrides config depth; default when unset: config depth or 1)
         #[arg(short, long)]
         depth: Option<usize>,
@@ -77,14 +77,87 @@ enum Commands {
         /// Truncate each snippet to at most N lines (appends a comment with remaining count)
         #[arg(long, value_name = "N")]
         max_snippet_lines: Option<usize>,
+        /// Maximum rows to emit from ordered neighbors/dependents
+        #[arg(long, value_name = "N")]
+        budget_lines: Option<usize>,
+        /// Approximate token budget over emitted rows (4 chars/token estimate)
+        #[arg(long, value_name = "N")]
+        budget_tokens: Option<usize>,
+        /// Resume window at this row offset
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Compact output: suppress doc/snippet/annotation payloads
+        #[arg(long)]
+        compact: bool,
     },
-    /// Full-text search for symbols
+    /// Full-text search for symbols -- the recommended first step when you know a name.
+    ///
+    /// FTS5 query language (porter stemming enabled):
+    ///   require_permission          exact word (stemmed)
+    ///   require*                    prefix match
+    ///   "require permission"        phrase
+    ///   auth* AND handler           boolean AND
+    ///   SqlitePermissionChecker::*  qualified name prefix (Type::method form)
+    ///
+    /// Output: XML `symbol` elements with id, name, qualified_name, kind, role, file,
+    /// signature, and stable_id. Use the stable_id value directly with graph/context/blast-radius.
+    ///
+    /// Tip: qualified names (Type::method) are resolved directly -- no need to know the file.
+    /// Tip: role attribute signals architectural layer; orchestrator/infra carry the most
+    /// structural signal per token.
+    ///
+    /// Next steps after symbols:
+    ///   graphlite context sym:STABLE_ID   -- deep dive on one symbol
+    ///   graphlite graph sym:STABLE_ID     -- cheaper: neighborhood only, no blast-radius
     Symbols {
         /// FTS5 query string (supports *, AND, OR, etc.)
         query: String,
         /// Filter results by language
         #[arg(long, value_name = "LANG")]
         language: Option<String>,
+        /// Output as markdown table instead of XML
+        #[arg(long)]
+        md: bool,
+    },
+    /// Show workspace crate dependency graph (cargo metadata derived)
+    Deps {
+        /// Output as markdown instead of XML
+        #[arg(long)]
+        md: bool,
+    },
+    /// Resolve an ambiguous symbol query to a deterministic top candidate
+    Resolve {
+        /// Symbol selector (id, sym:stable_id, qualified_name, or plain name)
+        query: String,
+        /// Filter candidates by language
+        #[arg(long, value_name = "LANG")]
+        language: Option<String>,
+        /// Output as markdown instead of XML
+        #[arg(long)]
+        md: bool,
+    },
+    /// Trace execution paths from an entrypoint to completion boundaries
+    TracePath {
+        /// Symbol id (integer) or name (sym:Name)
+        symbol: String,
+        /// Optional target selector (id, sym:stable_id, qualified/name)
+        #[arg(long)]
+        to: Option<String>,
+        /// Traversal direction: outgoing|incoming|both (aliases: write|read)
+        #[arg(long, default_value = "outgoing")]
+        direction: String,
+        /// Maximum hop depth
+        #[arg(long, default_value = "6")]
+        max_depth: usize,
+        /// Maximum number of paths to emit
+        #[arg(long, default_value = "20")]
+        max_paths: usize,
+        /// Annotate async boundaries in path hops
+        #[arg(long)]
+        with_async_boundaries: bool,
+        /// Annotate channel/actor boundaries in path hops
+        #[arg(long)]
+        with_channels: bool,
     },
     /// Find all symbols that (transitively) depend on a given symbol
     ///
@@ -92,8 +165,9 @@ enum Commands {
     /// the intent is to show how each caller uses the target, not what the caller does overall.
     /// Use `--no-snippets` if you only need the list of dependent symbol names.
     BlastRadius {
-        /// Symbol id (integer) or name (sym:Name)
-        symbol: String,
+        /// Symbol id (integer) or name (sym:Name); accepts multiple
+        #[arg(required = true)]
+        symbols: Vec<String>,
         /// Traversal depth limit, 0 = unlimited (overrides config depth; default when unset: config depth or 5)
         #[arg(short, long)]
         depth: Option<usize>,
@@ -103,6 +177,18 @@ enum Commands {
         /// Truncate each snippet to at most N lines (appends a comment with remaining count)
         #[arg(long, value_name = "N")]
         max_snippet_lines: Option<usize>,
+        /// Maximum rows to emit from ordered neighbors/dependents
+        #[arg(long, value_name = "N")]
+        budget_lines: Option<usize>,
+        /// Approximate token budget over emitted rows (4 chars/token estimate)
+        #[arg(long, value_name = "N")]
+        budget_tokens: Option<usize>,
+        /// Resume window at this row offset
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Compact output: suppress doc/snippet/annotation payloads
+        #[arg(long)]
+        compact: bool,
     },
     /// Show full context for a symbol: graph neighborhood + blast radius in one document
     ///
@@ -115,8 +201,9 @@ enum Commands {
     /// architectural significance: `orchestrator` and `infra` nodes yield the most structural
     /// insight per token.
     Context {
-        /// Symbol id (integer) or name (sym:Name)
-        symbol: String,
+        /// Symbol id (integer) or name (sym:Name); accepts multiple
+        #[arg(required = true)]
+        symbols: Vec<String>,
         /// Traversal depth for graph neighborhood (overrides config depth)
         #[arg(long)]
         depth: Option<usize>,
@@ -133,14 +220,26 @@ enum Commands {
         /// Truncate each snippet to at most N lines (appends a comment with remaining count)
         #[arg(long, value_name = "N")]
         max_snippet_lines: Option<usize>,
+        /// Maximum rows to emit from ordered neighbors/dependents
+        #[arg(long, value_name = "N")]
+        budget_lines: Option<usize>,
+        /// Approximate token budget over emitted rows (4 chars/token estimate)
+        #[arg(long, value_name = "N")]
+        budget_tokens: Option<usize>,
+        /// Resume window at this row offset
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Compact output: suppress doc/snippet/annotation payloads
+        #[arg(long)]
+        compact: bool,
     },
-    /// Rename a symbol via rust-analyzer and write edits to edits.json
+    /// Rename helper (deprecated): CLI rename is removed; use editor LSP rename
     Rename {
         /// Symbol id (integer) or name (sym:Name)
         symbol: String,
         /// New name for the symbol
         new_name: String,
-        /// Project root for LSP
+        /// Project root
         #[arg(long, default_value = ".")]
         root: String,
     },
@@ -185,47 +284,16 @@ enum Commands {
     /// Watch a source tree for changes and re-index automatically
     ///
     /// Runs as a long-lived process. Listens on `.graphlite/watcher.sock` for IPC
-    /// from `graphlite annotate` and other clients. File changes trigger a fast
-    /// tree-sitter-only re-index (no LSP). Use `--lsp` to enable full LSP re-index
-    /// on demand via the socket `reindex` message.
+    /// from `graphlite annotate` and other clients. File changes trigger a
+    /// full re-index (parser + enrichers); `reindex` socket messages do the same.
     Watch {
         /// Root directory to watch (default: .)
         #[arg(default_value = ".")]
         root: String,
-        /// Enable full LSP re-index on Reindex messages (slow)
-        #[arg(long)]
-        lsp: bool,
     },
-    /// Serve the viz as a live-reloading web page
+    /// Show workspace and context violations: forbidden cross-context couplings
     ///
-    /// Starts a local HTTP server and watches for source-file changes. On each
-    /// change the graph is re-indexed (tree-sitter only, or with LSP when
-    /// --lsp is passed) and the browser automatically reloads.
-    Serve {
-        /// Project root to watch
-        #[arg(default_value = ".")]
-        root: String,
-        /// Port to listen on
-        #[arg(long, default_value = "7765")]
-        port: u16,
-        /// Enable persistent LSP enrichment on file changes
-        #[arg(long)]
-        lsp: bool,
-    },
-    /// Export the code graph as JSON or a self-contained HTML visualization
-    ///
-    /// Default: emits JSON (nodes with 3D positions, edges, bounded contexts).
-    /// With --html: emits a single HTML file with embedded data and a three.js
-    /// 3D visualization. Open in any browser, no server required.
-    Viz {
-        /// Emit a self-contained HTML file instead of JSON
-        #[arg(long)]
-        html: bool,
-    },
-    /// Show architectural violations: role-layer inversions and forbidden context couplings
-    ///
-    /// Queries only rust-analyzer trusted edges (tree-sitter structural edges are excluded
-    /// to prevent false positives from unresolved common names). Test nodes are excluded.
+    /// Queries semantic edges (resolver/rustdoc sources). Test nodes are excluded.
     /// Use `[[exceptions]]` in `.graphlite/config.toml` to suppress known-acceptable patterns.
     Violations {
         /// Filter to edges leaving this bounded context
@@ -237,36 +305,53 @@ enum Commands {
         /// Show violations touching this context (from or to)
         #[arg(long, value_name = "CTX")]
         context: Option<String>,
-        /// Role pattern filter: "from_role:to_role" (e.g. "infra:domain")
-        #[arg(long, value_name = "PATTERN")]
-        pattern: Option<String>,
         /// Max violations to show, 0 = unlimited (default: 50)
         #[arg(long, default_value = "50")]
         top: usize,
+        /// Substring filter over symbol/file/context/layer fields
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Group context-coupling findings by owning crate edge
+        #[arg(long)]
+        by_crate: bool,
+        /// Crate-edge selector (e.g. \"from:adapter to:domain\")
+        #[arg(long)]
+        edge: Option<String>,
         /// Suppress caller/callee signatures from output
         #[arg(long)]
         no_snippets: bool,
+        /// Fail when policy has unresolved/ambiguous mappings (e.g. '?' workspace layers)
+        #[arg(long)]
+        strict_policy: bool,
+        /// Include code-quality violations sourced from `graphlite check` diagnostics
+        #[arg(long)]
+        check: bool,
+        /// Include crate advisory findings sourced from `graphlite audit`
+        #[arg(long)]
+        audit: bool,
     },
-    /// Override the inferred role for a symbol (persists across re-index via stable_id)
-    ///
-    /// Overrides are stored in the `role_overrides` table and applied at the end of every
-    /// `discover` / `init` run, so they survive incremental re-indexing. Use `--list` to
-    /// review all active overrides, and `--clear` to remove one.
-    Reclassify {
-        /// Symbol id (integer), name (sym:Name), or stable_id (e.g. sym:src/lsp.rs::fn::run)
-        symbol: Option<String>,
-        /// Role to assign (entrypoint, orchestrator, domain, utility, infra, model, leaf, test)
-        #[arg(long, value_name = "ROLE")]
-        role: Option<String>,
-        /// Optional explanation for this override
-        #[arg(long, value_name = "TEXT")]
-        reason: Option<String>,
-        /// Remove the role override for the symbol
+    /// Run cargo audit advisories ingestion and store crate risk metadata
+    Audit {
+        /// Project root
+        #[arg(default_value = ".")]
+        root: String,
+    },
+    /// Run cargo clippy diagnostics enrichment and store results in codegraph.db
+    Check {
+        /// Project root
+        #[arg(default_value = ".")]
+        root: String,
+    },
+    /// Show supported command/flag surface (for agent/tooling compatibility)
+    Capabilities {
+        /// Emit machine-readable JSON
         #[arg(long)]
-        clear: bool,
-        /// List all active role overrides
-        #[arg(long)]
-        list: bool,
+        json: bool,
+    },
+    /// Manage built-in architecture policy packs and linting
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
     },
     /// Show a high-level map of public symbols grouped by file, with hotspots by fan-in
     ///
@@ -291,10 +376,8 @@ enum Commands {
         /// Include file-level doc comments (//! for Rust, @component for Svelte, JSDoc header for TS/JS)
         #[arg(long)]
         with_file_docs: bool,
-        /// Rank hotspots by all edges including unverified tree-sitter structural edges.
-        /// By default, hotspots are ranked by LSP-trusted edges only, which prevents common
-        /// method names (new, execute, spawn) from appearing as false hotspots due to
-        /// tree-sitter's inability to resolve call targets across files.
+        /// Rank hotspots by all edges.
+        /// By default, hotspots are ranked by semantic trusted edges (resolver/rustdoc).
         #[arg(long)]
         all_edges: bool,
         /// Filter by inferred role (orchestrator, entrypoint, leaf, infra, domain, model)
@@ -303,6 +386,42 @@ enum Commands {
         /// Group output by file path instead of module name (reverts default module grouping)
         #[arg(long)]
         by_file: bool,
+        /// Output as markdown tables instead of XML
+        #[arg(long)]
+        md: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommands {
+    /// Initialize a built-in policy pack in .graphlite/config.toml
+    InitPack {
+        /// Pack name: ddd-hexagonal-rust | cqrs-event-sourced-rust
+        pack: String,
+        /// Project root
+        #[arg(long, default_value = ".")]
+        root: String,
+        /// Replace existing [policy].pack value
+        #[arg(long)]
+        force: bool,
+    },
+    /// Lint policy rules for conflicts and ineffective/dead entries
+    Lint {
+        /// Project root
+        #[arg(long, default_value = ".")]
+        root: String,
+        /// Show only stale suppression findings
+        #[arg(long)]
+        stale: bool,
+        /// Exit non-zero when stale suppressions are found
+        #[arg(long)]
+        fail_on_stale: bool,
+        /// Exit non-zero when overbroad suppressions are found
+        #[arg(long)]
+        fail_on_broad: bool,
+        /// Match-count threshold for broad suppression detection
+        #[arg(long, default_value = "25")]
+        broad_threshold: usize,
     },
 }
 
@@ -311,53 +430,107 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { root, lsp } => init_cmd::run(&root, lsp.as_deref())?,
-        Commands::Discover { root, lsp } => discover::run(&root, lsp.as_deref())?,
+        Commands::Init { root } => init_cmd::run(&root, None)?,
+        Commands::Discover { root } => discover::run(&root)?,
         Commands::Graph {
-            symbol,
+            symbols,
             depth,
             format,
             show_trust,
             no_snippets,
             max_snippet_lines,
+            budget_lines,
+            budget_tokens,
+            offset,
+            compact,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
             query::graph(
-                &symbol,
+                &symbols,
                 depth,
                 &format,
                 show_trust,
                 !no_snippets,
                 max_snippet_lines,
+                query::OutputControl {
+                    budget_lines,
+                    budget_tokens,
+                    offset,
+                    compact,
+                },
             )?
         }
-        Commands::Symbols { query, language } => query::symbols(&query, language.as_deref())?,
-        Commands::BlastRadius {
+        Commands::Symbols { query, language, md } => query::symbols(&query, language.as_deref(), md)?,
+        Commands::Deps { md } => query::deps(md)?,
+        Commands::Resolve { query, language, md } => query::resolve(&query, language.as_deref(), md)?,
+        Commands::TracePath {
             symbol,
+            to,
+            direction,
+            max_depth,
+            max_paths,
+            with_async_boundaries,
+            with_channels,
+        } => query::trace_path(
+            &symbol,
+            to.as_deref(),
+            &direction,
+            max_depth,
+            max_paths,
+            with_async_boundaries,
+            with_channels,
+        )?,
+        Commands::BlastRadius {
+            symbols,
             depth,
             no_snippets,
             max_snippet_lines,
+            budget_lines,
+            budget_tokens,
+            offset,
+            compact,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
-            query::blast_radius(&symbol, depth, !no_snippets, max_snippet_lines)?
+            query::blast_radius(
+                &symbols,
+                depth,
+                !no_snippets,
+                max_snippet_lines,
+                query::OutputControl {
+                    budget_lines,
+                    budget_tokens,
+                    offset,
+                    compact,
+                },
+            )?
         }
         Commands::Context {
-            symbol,
+            symbols,
             depth,
             blast_depth,
             no_snippets,
             edit,
             max_snippet_lines,
+            budget_lines,
+            budget_tokens,
+            offset,
+            compact,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
             let blast_depth = blast_depth.unwrap_or(1);
             query::context(
-                &symbol,
+                &symbols,
                 depth,
                 blast_depth,
                 !no_snippets,
                 edit,
                 max_snippet_lines,
+                query::OutputControl {
+                    budget_lines,
+                    budget_tokens,
+                    offset,
+                    compact,
+                },
             )?
         }
         Commands::Rename {
@@ -383,48 +556,55 @@ fn main() -> Result<()> {
             confidence,
         )?,
         Commands::Annotations { stale } => annotate::list_annotations(stale)?,
-        Commands::Watch { root, lsp } => watch::run(&root, lsp)?,
-        Commands::Serve { root, port, lsp } => serve::run(&root, port, lsp)?,
-        Commands::Viz { html } => viz::run(html)?,
+        Commands::Watch { root } => watch::run(&root)?,
         Commands::Violations {
             from_context,
             to_context,
             context,
-            pattern,
             top,
+            pattern,
+            by_crate,
+            edge,
             no_snippets,
+            strict_policy,
+            check,
+            audit,
         } => violations::run(&violations::Params {
             from_context: from_context.as_deref(),
             to_context: to_context.as_deref(),
             context: context.as_deref(),
-            pattern: pattern.as_deref(),
             top,
+            pattern: pattern.as_deref(),
+            by_crate,
+            edge: edge.as_deref(),
             no_snippets,
+            strict_policy,
+            check,
+            audit,
         })?,
-        Commands::Reclassify {
-            symbol,
-            role,
-            reason,
-            clear,
-            list,
-        } => {
-            if list {
-                reclassify::list()?;
-            } else if clear {
-                let sym = symbol
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--clear requires a symbol argument"))?;
-                reclassify::clear(sym)?;
-            } else if let (Some(sym), Some(r)) = (symbol.as_deref(), role.as_deref()) {
-                reclassify::set(&reclassify::SetParams {
-                    symbol: sym,
-                    role: r,
-                    reason: reason.as_deref(),
-                })?;
-            } else {
-                anyhow::bail!("provide a symbol and --role ROLE, or --clear, or --list");
+        Commands::Check { root } => clippy_enricher::run(&root)?,
+        Commands::Audit { root } => audit::run(&root)?,
+        Commands::Capabilities { json } => capabilities::run(json)?,
+        Commands::Policy { command } => match command {
+            PolicyCommands::InitPack { root, pack, force } => {
+                policy::init_pack(&root, &pack, force)?
             }
-        }
+            PolicyCommands::Lint {
+                root,
+                stale,
+                fail_on_stale,
+                fail_on_broad,
+                broad_threshold,
+            } => policy::lint(
+                &root,
+                policy::LintOptions {
+                    stale_only: stale,
+                    fail_on_stale,
+                    fail_on_broad,
+                    broad_threshold,
+                },
+            )?,
+        },
         Commands::Map {
             all,
             top,
@@ -433,6 +613,7 @@ fn main() -> Result<()> {
             all_edges,
             role,
             by_file,
+            md,
         } => query::map(
             all,
             top,
@@ -441,6 +622,7 @@ fn main() -> Result<()> {
             all_edges,
             role.as_deref(),
             by_file,
+            md,
         )?,
     }
 

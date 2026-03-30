@@ -15,20 +15,6 @@ pub fn file_to_context(path: &str) -> String {
     }
 }
 
-/// Z-layer value for a role. Higher = more abstract / higher in the call chain.
-pub fn role_z(role: &str) -> f64 {
-    match role {
-        "entrypoint" => 20.0,
-        "orchestrator" => 13.0,
-        "domain" => 6.0,
-        "utility" => 0.0,
-        "infra" => -6.0,
-        "model" => -13.0,
-        "leaf" => -20.0,
-        _ => 0.0,
-    }
-}
-
 /// Returns true when a file path belongs to test code.
 /// Matches: `tests/*`, `*/tests/*`, `*_test.rs`, `*_tests.rs`.
 pub fn is_test_file(path: &str) -> bool {
@@ -37,19 +23,6 @@ pub fn is_test_file(path: &str) -> bool {
         || p.contains("/tests/")
         || p.ends_with("_test.rs")
         || p.ends_with("_tests.rs")
-}
-
-/// Role-layer inversion: a lower-abstraction node calling a higher-abstraction node.
-/// Only meaningful on trusted (rust-analyzer) edges. Returns `None` for test nodes.
-pub fn role_violation_reason(from_role: &str, to_role: &str) -> Option<String> {
-    if from_role == "test" || to_role == "test" {
-        return None;
-    }
-    if from_role != to_role && role_z(from_role) < role_z(to_role) {
-        Some(format!("{from_role} \u{2192} {to_role}"))
-    } else {
-        None
-    }
 }
 
 /// Config-defined forbidden context coupling. Applied to all edges (context

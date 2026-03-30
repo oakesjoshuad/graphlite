@@ -3,8 +3,6 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use crate::lsp;
-
 struct TextEdit {
     start_line: u32,
     start_char: u32,
@@ -13,7 +11,7 @@ struct TextEdit {
     new_text: String,
 }
 
-pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
+pub fn rename(symbol: &str, _new_name: &str, _root: &str) -> Result<()> {
     let conn = crate::query::open_db()?;
 
     // Resolve: integer id or sym:Name
@@ -34,25 +32,13 @@ pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
         .map_err(|_| anyhow!("symbol '{}' not found in database", name))?
     };
 
-    let ra =
-        lsp::which_rust_analyzer().ok_or_else(|| anyhow!("rust-analyzer not found in PATH"))?;
-
-    let mut client = lsp::LspClient::spawn(&ra, &[], root)?;
-    client.initialize(None)?;
-    client.wait_for_ready(60)?;
-
-    let abs_path = std::fs::canonicalize(&file)?;
-    let uri = format!("file://{}", abs_path.display());
-    let lsp_line = (range_start - 1).max(0) as u32;
-    let char_offset = lsp::fn_name_char_offset(&file, range_start, &name);
-
-    let workspace_edit = client.rename_symbol(&uri, lsp_line, char_offset, new_name)?;
-    client.shutdown()?;
-
-    let json_str = serde_json::to_string_pretty(&workspace_edit)?;
-    std::fs::write("edits.json", &json_str)?;
-    eprintln!("Wrote edits.json");
-    Ok(())
+    // rust-analyzer has been removed; rename requires an external LSP.
+    // Use your editor's LSP integration (e.g. rust-analyzer via VS Code / neovim).
+    let _ = (file, range_start, name);
+    anyhow::bail!(
+        "The `rename` command required rust-analyzer which has been removed from graphlite.\n\
+         Use your editor's LSP rename (F2 / <leader>rn) instead."
+    )
 }
 
 pub fn diff_rename(edits_file: &str) -> Result<()> {
@@ -150,7 +136,7 @@ fn parse_workspace_edit(edit: &Value) -> Result<Vec<(String, Vec<TextEdit>)>> {
             let uri = doc["textDocument"]["uri"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing uri in documentChanges"))?;
-            let path = lsp::uri_to_path(uri);
+            let path = uri_to_path(uri);
             let edits = parse_text_edits(&doc["edits"])?;
             result.entry(path).or_default().extend(edits);
         }
@@ -158,7 +144,7 @@ fn parse_workspace_edit(edit: &Value) -> Result<Vec<(String, Vec<TextEdit>)>> {
     // Format 2: changes (object keyed by URI) — legacy
     else if let Some(changes) = edit["changes"].as_object() {
         for (uri, edits_val) in changes {
-            let path = lsp::uri_to_path(uri);
+            let path = uri_to_path(uri);
             let edits = parse_text_edits(edits_val)?;
             result.entry(path).or_default().extend(edits);
         }
@@ -199,4 +185,8 @@ fn parse_text_edits(val: &Value) -> Result<Vec<TextEdit>> {
             })
         })
         .collect()
+}
+
+fn uri_to_path(uri: &str) -> String {
+    uri.strip_prefix("file://").unwrap_or(uri).to_string()
 }

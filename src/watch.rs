@@ -17,9 +17,7 @@ use notify::{
 use crate::{
     annotate::annotate_with_conn,
     config,
-    discover::run_fast,
     ipc::{sock_path, WatchMsg, WatchResponse},
-    schema::open_or_init_db,
 };
 
 /// Messages sent from the socket-handler threads to the main loop.
@@ -28,17 +26,14 @@ enum Inbox {
     Client(WatchMsg, Sender<WatchResponse>),
 }
 
-pub fn run(root: &str, lsp: bool) -> Result<()> {
+pub fn run(root: &str) -> Result<()> {
     let root = config::find_root(root).unwrap_or_else(|_| root.to_string());
-    let graphlite_dir = format!("{}/.graphlite", root.trim_end_matches('/'));
-    let db_path = format!("{}/codegraph.db", graphlite_dir);
-
-    // Open (or create) the DB; the watcher owns this connection for all writes.
-    let conn = open_or_init_db(&db_path)?;
-    // Wrap in Arc<Mutex> so socket-handler threads can post work back; but
-    // we keep all actual writes on the main thread via the Inbox channel instead.
-    // (conn is !Send, so we use the channel pattern from Phase B.)
-    let conn = Arc::new(Mutex::new(conn));
+    // Connections are opened per-discover run; watcher only needs them for annotate.
+    let conn: Arc<Mutex<rusqlite::Connection>> = {
+        let graphlite_dir = format!("{}/.graphlite", root.trim_end_matches('/'));
+        let db_path = format!("{}/codegraph.db", graphlite_dir);
+        Arc::new(Mutex::new(crate::schema::open_or_init_db(&db_path)?))
+    };
 
     let sock = sock_path(&root);
     // Remove stale socket if present.
@@ -76,7 +71,7 @@ pub fn run(root: &str, lsp: bool) -> Result<()> {
     })
     .ok();
 
-    eprintln!("[watch] watching {} (lsp={})", root, lsp);
+    eprintln!("[watch] watching {}", root);
     eprintln!("[watch] socket: {}", sock.display());
 
     // ── Main loop (owns conn) ────────────────────────────────────────────────
@@ -102,20 +97,17 @@ pub fn run(root: &str, lsp: bool) -> Result<()> {
 
         match msg {
             None => {
-                // Debounce timer fired — run the fast re-index.
+                // Debounce timer fired — run full re-index (tree-sitter + rustdoc).
                 pending_reindex = false;
-                if let Ok(c) = conn.lock() {
-                    if let Err(e) = run_fast(&root, &c) {
-                        eprintln!("[watch] re-index error: {}", e);
-                    }
-                    // changed files returned but not used here (no persistent LSP in watch mode)
+                if let Err(e) = crate::discover::run(&root) {
+                    eprintln!("[watch] re-index error: {}", e);
                 }
             }
             Some(Inbox::FileChanged) => {
                 pending_reindex = true;
             }
             Some(Inbox::Client(msg, reply_tx)) => {
-                let response = dispatch(&conn, &root, msg, lsp);
+                let response = dispatch(&conn, &root, msg);
                 let _ = reply_tx.send(response);
             }
         }
@@ -129,7 +121,6 @@ fn dispatch(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     root: &str,
     msg: WatchMsg,
-    lsp: bool,
 ) -> WatchResponse {
     match msg {
         WatchMsg::Ping => WatchResponse {
@@ -170,40 +161,10 @@ fn dispatch(
                 error: Some(e.to_string()),
             },
         },
-        WatchMsg::Reindex { file: _ } => {
-            if lsp {
-                // Full re-index with LSP: spawn discover::run in a thread and report async.
-                // For simplicity, run synchronously here (watcher was started with --lsp).
-                let result = crate::discover::run(root, None);
-                match result {
-                    Ok(()) => WatchResponse {
-                        ok: true,
-                        error: None,
-                    },
-                    Err(e) => WatchResponse {
-                        ok: false,
-                        error: Some(e.to_string()),
-                    },
-                }
-            } else {
-                match conn.lock() {
-                    Ok(c) => match run_fast(root, &c) {
-                        Ok(_changed) => WatchResponse {
-                            ok: true,
-                            error: None,
-                        },
-                        Err(e) => WatchResponse {
-                            ok: false,
-                            error: Some(e.to_string()),
-                        },
-                    },
-                    Err(e) => WatchResponse {
-                        ok: false,
-                        error: Some(e.to_string()),
-                    },
-                }
-            }
-        }
+        WatchMsg::Reindex { file: _ } => match crate::discover::run(root) {
+            Ok(()) => WatchResponse { ok: true, error: None },
+            Err(e) => WatchResponse { ok: false, error: Some(e.to_string()) },
+        },
     }
 }
 
