@@ -31,7 +31,7 @@ use clap::{Parser, Subcommand};
     name = "graphlite",
     version,
     about = "Build and query a SQLite code graph",
-    long_about = "Build and query a SQLite code graph.\n\nRecommended workflow: run `map` first to orient across the full symbol set, then use `context` selectively on the 1-2 symbols you cannot understand from signatures and roles alone."
+    long_about = "Build and query a SQLite code graph.\n\nRecommended workflow:\n  1. graphlite deps        — understand the crate architecture and layer assignments first\n  2. graphlite map         — orient across the full symbol set within a crate or the workspace\n  3. graphlite context     — deep-dive into the 1-2 symbols that matter\n\nFor single-crate projects, start at step 2."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -133,6 +133,10 @@ enum Commands {
         md: bool,
     },
     /// Show workspace crate dependency graph (cargo metadata derived)
+    ///
+    /// Start here for any multi-crate workspace. Shows each crate's layer assignment,
+    /// fan-in (how many other crates depend on it), and crate-level doc summary.
+    /// This gives you the architectural skeleton before descending into symbols with `map`.
     Deps {
         /// Output as markdown instead of XML
         #[arg(long)]
@@ -399,14 +403,16 @@ enum Commands {
     },
     /// Show a high-level map of public symbols grouped by file, with hotspots by fan-in
     ///
-    /// Orientation command — run this before any other query. Emits all public symbols grouped
-    /// by file with roles, signatures, fan-in/fan-out, and hotspot ranking. Token count is
-    /// reported in the XML header so you know exactly what you consumed.
+    /// Symbol-level orientation command. In a multi-crate workspace, run `deps` first to
+    /// understand crate structure, then use `map` within a specific crate. For single-crate
+    /// projects, `map` is your starting point. Emits all public symbols grouped by file with
+    /// roles, signatures, fan-in/fan-out, and hotspot ranking. Token count is reported in the
+    /// XML header so you know exactly what you consumed.
     ///
-    /// Recommended starting point: `map --with-docs --with-file-docs` gives maximum signal in
-    /// one pass. From the role and fan-in attributes you can identify which 1-2 symbols warrant
-    /// a deeper `context` query. Use `--all` to include private symbols when you need
-    /// implementation-level detail without pulling full snippets.
+    /// Recommended: `map --with-docs --with-file-docs` gives maximum signal in one pass.
+    /// From the role and fan-in attributes you can identify which 1-2 symbols warrant a deeper
+    /// `context` query. Use `--all` to include private symbols when you need implementation-level
+    /// detail without pulling full snippets.
     Map {
         /// Include private symbols (default: public/exported only)
         #[arg(long)]
