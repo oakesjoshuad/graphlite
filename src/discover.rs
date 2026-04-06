@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -104,7 +104,7 @@ pub fn run(root: &str) -> Result<()> {
     std::fs::create_dir_all(&graphlite_dir)?;
 
     let files = collect_source_files(root, &config.ignore)?;
-    info!(count = files.len(), "source files found");
+    debug!(count = files.len(), "source files found");
 
     let db_path = format!("{}/codegraph.db", graphlite_dir);
     let conn = open_or_init_db(&db_path)?;
@@ -128,7 +128,7 @@ pub fn run(root: &str) -> Result<()> {
         .collect();
 
     if changed.is_empty() {
-        info!("no files changed, index is up to date");
+        debug!("no files changed, index is up to date");
         // Workspace crate graph is always re-synced (cheap, ensures doc/layer metadata is current).
         sync_workspace_crate_graph(&conn, root)?;
         run_optional_enrichers(root, &conn);
@@ -199,7 +199,7 @@ pub fn run(root: &str) -> Result<()> {
     }
 
     match resolver::resolve(&conn) {
-        Ok(n) => info!(count = n, "resolver edges written"),
+        Ok(_) => {}
         Err(e) => warn!(error = %e, "resolver warning"),
     }
 
@@ -213,12 +213,12 @@ pub fn run(root: &str) -> Result<()> {
 
 fn run_optional_enrichers(root: &str, conn: &rusqlite::Connection) {
     match clippy_enricher::enrich(root, conn) {
-        Ok(n) => info!(count = n, "clippy diagnostics upserted"),
+        Ok(n) => debug!(count = n, "clippy diagnostics upserted"),
         Err(e) => warn!(error = %e, "clippy enrichment skipped"),
     }
 
     match audit::enrich(root, conn) {
-        Ok(n) => info!(count = n, "audit advisories upserted"),
+        Ok(n) => debug!(count = n, "audit advisories upserted"),
         Err(e) => warn!(error = %e, "audit enrichment skipped"),
     }
 }

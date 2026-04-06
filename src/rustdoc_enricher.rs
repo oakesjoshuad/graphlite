@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use rusqlite::Connection;
 
 const EXPECTED_FORMAT_VERSION: u32 = 57;
@@ -134,7 +134,7 @@ fn enrich_crates(
     for ci in crates {
         match run_and_apply(root, ci, conn, abs_root) {
             Ok(n) => {
-                info!(crate_name = %ci.name, count = n, "rustdoc nodes enriched");
+                debug!(crate_name = %ci.name, count = n, "rustdoc nodes enriched");
                 total += n;
             }
             Err(e) => warn!(crate_name = %ci.name, error = %e, "rustdoc enrichment skipped"),

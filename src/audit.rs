@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::debug;
 use rusqlite::Connection;
 
 use crate::schema::open_or_init_db;
@@ -86,7 +86,7 @@ pub fn enrich(root: &str, conn: &Connection) -> Result<usize> {
     let vulnerabilities = advisories.iter().filter(|a| a.kind == "vulnerability").count();
     let unmaintained = advisories.iter().filter(|a| a.kind == "unmaintained").count();
     let yanked = advisories.iter().filter(|a| a.kind == "yanked").count();
-    info!(total, vulnerabilities, unmaintained, yanked, "audit complete");
+    debug!(total, vulnerabilities, unmaintained, yanked, "audit complete");
 
     Ok(total)
 }
