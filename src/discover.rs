@@ -1,4 +1,5 @@
 use anyhow::Result;
+use tracing::{info, warn};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -76,10 +77,7 @@ fn collect_source_files(root: &str, extra_ignore: &[String]) -> Result<Vec<PathB
 pub fn run(root: &str) -> Result<()> {
     let config = config::load(root);
     if !config.lsp.is_empty() {
-        eprintln!(
-            "config: lsp field is deprecated, LSP enrichment replaced by rustdoc (ignoring: {:?})",
-            config.lsp
-        );
+        warn!(fields = ?config.lsp, "lsp config field is deprecated; LSP enrichment replaced by rustdoc (ignoring)");
     }
 
     // Refuse to index if any workspace layer is still unassigned.
@@ -106,7 +104,7 @@ pub fn run(root: &str) -> Result<()> {
     std::fs::create_dir_all(&graphlite_dir)?;
 
     let files = collect_source_files(root, &config.ignore)?;
-    eprintln!("Found {} source files", files.len());
+    info!(count = files.len(), "source files found");
 
     let db_path = format!("{}/codegraph.db", graphlite_dir);
     let conn = open_or_init_db(&db_path)?;
@@ -130,13 +128,13 @@ pub fn run(root: &str) -> Result<()> {
         .collect();
 
     if changed.is_empty() {
-        eprintln!("No files changed, index is up to date");
+        info!("no files changed, index is up to date");
         // Workspace crate graph is always re-synced (cheap, ensures doc/layer metadata is current).
         sync_workspace_crate_graph(&conn, root)?;
         run_optional_enrichers(root, &conn);
         return Ok(());
     }
-    eprintln!("{} file(s) changed, re-indexing", changed.len());
+    info!(count = changed.len(), "files changed, re-indexing");
 
     // Delete old edges and nodes for changed files, preserving annotations for re-linking.
     // Edges are deleted explicitly first because older db instances may lack ON DELETE CASCADE.
@@ -160,7 +158,7 @@ pub fn run(root: &str) -> Result<()> {
         .filter_map(|path| {
             parse_file(path)
                 .map_err(|e| {
-                    eprintln!("Warning: {}: {}", path.display(), e);
+                    warn!(path = %path.display(), error = %e, "parse error");
                     e
                 })
                 .ok()
@@ -193,18 +191,16 @@ pub fn run(root: &str) -> Result<()> {
     // Sync workspace crate nodes and crate-level dependency edges from cargo metadata.
     sync_workspace_crate_graph(&conn, root)?;
 
-    eprintln!("Inserted {} symbols -> {}", symbols.len(), db_path);
+    info!(count = symbols.len(), db = %db_path, "symbols inserted");
 
-    // Enrich graph with qualified names, visibility, and trait impls from rustdoc JSON.
     match rustdoc_enricher::enrich(root, &changed, &conn) {
-        Ok(n) => eprintln!("[rustdoc] {} node(s) enriched", n),
-        Err(e) => eprintln!("[rustdoc] warning: enrichment skipped: {}", e),
+        Ok(n) => info!(count = n, "rustdoc nodes enriched"),
+        Err(e) => warn!(error = %e, "rustdoc enrichment skipped"),
     }
 
-    // Resolve call expressions into CALLS_RESOLVED edges using use-statement scope maps.
     match resolver::resolve(&conn) {
-        Ok(n) => eprintln!("[resolver] {} edge(s) written", n),
-        Err(e) => eprintln!("[resolver] warning: {}", e),
+        Ok(n) => info!(count = n, "resolver edges written"),
+        Err(e) => warn!(error = %e, "resolver warning"),
     }
 
     // Enrich node diagnostics / complexity from cargo clippy.
@@ -217,13 +213,13 @@ pub fn run(root: &str) -> Result<()> {
 
 fn run_optional_enrichers(root: &str, conn: &rusqlite::Connection) {
     match clippy_enricher::enrich(root, conn) {
-        Ok(n) => eprintln!("[check] {} diagnostic row(s) upserted", n),
-        Err(e) => eprintln!("[check] warning: {}", e),
+        Ok(n) => info!(count = n, "clippy diagnostics upserted"),
+        Err(e) => warn!(error = %e, "clippy enrichment skipped"),
     }
 
     match audit::enrich(root, conn) {
-        Ok(n) => eprintln!("[audit] {} advisory row(s) upserted", n),
-        Err(e) => eprintln!("[audit] warning: {}", e),
+        Ok(n) => info!(count = n, "audit advisories upserted"),
+        Err(e) => warn!(error = %e, "audit enrichment skipped"),
     }
 }
 

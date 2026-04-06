@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::Result;
+use tracing::{info, warn};
 
 use crate::{config, discover, workspace};
 
@@ -25,9 +26,9 @@ pub fn run(root: &str, lsp_override: Option<&str>) -> Result<()> {
         };
         fs::write(&config_path, &content)?;
         if ws.is_some() {
-            eprintln!("created: {} (Cargo workspace detected)", config_path.display());
+            info!(path = %config_path.display(), "config created (Cargo workspace detected)");
         } else {
-            eprintln!("created: {}", config_path.display());
+            info!(path = %config_path.display(), "config created");
         }
     }
 
@@ -43,10 +44,10 @@ pub fn run(root: &str, lsp_override: Option<&str>) -> Result<()> {
                 format!("\n{}\n", db_entry)
             };
             fs::write(&gitignore_path, format!("{}{}", contents, entry))?;
-            eprintln!("updated: .gitignore (+{})", db_entry);
+            info!(entry = db_entry, "updated .gitignore");
         }
     } else {
-        eprintln!("note: add {} to your .gitignore", db_entry);
+        warn!(entry = db_entry, "no .gitignore found — add this entry manually");
     }
 
     // 3. If workspace layers are still unassigned, print instructions and stop.
@@ -61,10 +62,11 @@ pub fn run(root: &str, lsp_override: Option<&str>) -> Result<()> {
             .collect();
         unassigned.sort_unstable();
         if !unassigned.is_empty() {
-            eprintln!("\nWorkspace layers not yet assigned. Edit:");
-            eprintln!("  {}", config_path.display());
-            eprintln!("\nUnassigned crates: {}", unassigned.join(", "));
-            eprintln!("\nThen run:  graphlite discover .");
+            warn!(
+                config = %config_path.display(),
+                unassigned = %unassigned.join(", "),
+                "workspace layers not yet assigned — edit config then run: graphlite discover ."
+            );
             return Ok(());
         }
     }

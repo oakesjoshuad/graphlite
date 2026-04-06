@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::Connection;
+use tracing::info;
 
 struct NodeMetrics {
     id: i64,
@@ -115,7 +116,7 @@ pub fn infer_roles(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
 
-    eprintln!("Roles inferred for {} nodes", nodes.len());
+    info!(count = nodes.len(), "roles inferred");
     Ok(())
 }
 

@@ -483,7 +483,14 @@ enum PolicyCommands {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("graphlite=info".parse().unwrap()),
+        )
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
 
     match cli.command {

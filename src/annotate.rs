@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use tracing::info;
 use rusqlite::Connection;
 
 use crate::{
@@ -51,7 +52,7 @@ pub fn annotate_with_conn(
         rusqlite::params![node_id],
         |r| r.get(0),
     )?;
-    eprintln!("annotated: {} (node_id={})", node_name, node_id);
+    info!(node = %node_name, node_id, "annotated");
     Ok(())
 }
 
@@ -172,6 +173,6 @@ pub fn list_annotations(stale_only: bool) -> Result<()> {
 
     vxml::close(&mut w, "annotations")?;
     vxml::finish_stream(w)?;
-    eprintln!("{} annotation(s)", count);
+    info!(count, "annotations listed");
     Ok(())
 }

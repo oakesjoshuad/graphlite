@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use tracing::info;
 use serde_json::Value;
 
 struct TextEdit {
@@ -33,8 +34,7 @@ pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
         );
     }
 
-    eprintln!("[rename] requesting rename of '{}' -> '{}'", symbol, new_name);
-    eprintln!("[rename] (first call warms rust-analyzer; subsequent calls are fast)");
+    info!(symbol, new_name, "requesting rename");
 
     let response = crate::ipc::send_msg_timeout(
         root,
@@ -60,13 +60,8 @@ pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
 
     let edit: Value = serde_json::from_str(&edit_json)?;
     let file_count = count_affected_files(&edit);
-    eprintln!(
-        "[rename] '{}' -> '{}': {} file(s) affected",
-        symbol, new_name, file_count
-    );
-    eprintln!("[rename] edits written to edits.json");
-    eprintln!("[rename] review:  graphlite diff-rename");
-    eprintln!("[rename] apply:   graphlite apply-edits");
+    info!(symbol, new_name, files = file_count, "rename complete — edits written to edits.json");
+    info!("review: graphlite diff-rename  |  apply: graphlite apply-edits");
 
     Ok(())
 }
@@ -130,7 +125,7 @@ pub fn apply_edits(edits_file: &str) -> Result<()> {
         let tmp = format!("{}.tmp", path);
         std::fs::write(&tmp, &new_content)?;
         std::fs::rename(&tmp, &path)?;
-        eprintln!("Applied: {}", path);
+        info!(path, "applied");
     }
     Ok(())
 }

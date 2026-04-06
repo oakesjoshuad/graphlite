@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
+use tracing::{debug, error, info, warn};
 use crossbeam_channel::{select, unbounded, Sender};
 use notify::{
     event::{CreateKind, ModifyKind, RemoveKind},
@@ -52,7 +53,7 @@ pub fn run(root: &str) -> Result<()> {
         let root_clone = root.clone();
         thread::spawn(move || {
             if let Err(e) = watch_files(&root_clone, tx) {
-                eprintln!("[watch] file watcher error: {}", e);
+                error!(error = %e, "file watcher error");
             }
         });
     }
@@ -63,7 +64,7 @@ pub fn run(root: &str) -> Result<()> {
         let sock_clone = sock.clone();
         thread::spawn(move || {
             if let Err(e) = serve_socket(&sock_clone, tx) {
-                eprintln!("[watch] socket server error: {}", e);
+                error!(error = %e, "socket server error");
             }
         });
     }
@@ -76,8 +77,8 @@ pub fn run(root: &str) -> Result<()> {
     })
     .ok();
 
-    eprintln!("[watch] watching {}", root);
-    eprintln!("[watch] socket: {}", sock.display());
+    info!(root = %root, "watching");
+    info!(socket = %sock.display(), "IPC socket ready");
 
     // ── Main loop (owns conn) ────────────────────────────────────────────────
     let mut pending_reindex = false;
@@ -105,7 +106,7 @@ pub fn run(root: &str) -> Result<()> {
                 // Debounce timer fired — run full re-index (tree-sitter + rustdoc).
                 pending_reindex = false;
                 if let Err(e) = crate::discover::run(&root) {
-                    eprintln!("[watch] re-index error: {}", e);
+                    error!(error = %e, "re-index failed");
                 }
             }
             Some(Inbox::FileChanged) => {
@@ -188,12 +189,9 @@ fn dispatch_rename(
         Err(e) => return WatchResponse { ok: false, error: Some(e.to_string()), data: None },
     };
     if lsp_guard.is_none() {
-        eprintln!("[watch] initializing rust-analyzer for rename (first-time warm-up)...");
+        info!("warming rust-analyzer for first rename");
         match LspClient::connect(root) {
-            Ok(client) => {
-                eprintln!("[watch] rust-analyzer ready");
-                *lsp_guard = Some(client);
-            }
+            Ok(client) => { *lsp_guard = Some(client); }
             Err(e) => {
                 return WatchResponse {
                     ok: false,
@@ -293,7 +291,7 @@ fn watch_files(root: &str, tx: Sender<Inbox>) -> Result<()> {
                     }
                 }
             }
-            Err(e) => eprintln!("[watch] notify error: {}", e),
+            Err(e) => warn!(error = %e, "notify error"),
         }
     }
     Ok(())
@@ -307,7 +305,7 @@ fn serve_socket(sock: &Path, tx: Sender<Inbox>) -> Result<()> {
                 let tx = tx.clone();
                 thread::spawn(move || handle_client(s, tx));
             }
-            Err(e) => eprintln!("[watch] accept error: {}", e),
+            Err(e) => warn!(error = %e, "accept error"),
         }
     }
     Ok(())

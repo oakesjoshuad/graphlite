@@ -15,6 +15,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Result};
+use tracing::{info, warn};
 use rusqlite::Connection;
 
 const EXPECTED_FORMAT_VERSION: u32 = 57;
@@ -56,14 +57,14 @@ pub fn enrich(root: &str, changed_files: &[PathBuf], conn: &Connection) -> Resul
     if affected.is_empty() {
         // Fall back to running for all crates (e.g. single-crate project where
         // abs path resolution may have failed).
-        eprintln!("[rustdoc] running for all {} crate(s)", crates.len());
+        info!(count = crates.len(), "rustdoc: enriching all crates (no affected filter matched)");
         return enrich_crates(root, &crates.iter().collect::<Vec<_>>(), conn, &abs_root);
     }
 
-    eprintln!(
-        "[rustdoc] enriching {} affected crate(s): {}",
-        affected.len(),
-        affected.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+    info!(
+        count = affected.len(),
+        crates = %affected.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "),
+        "rustdoc: enriching affected crates"
     );
     enrich_crates(root, &affected, conn, &abs_root)
 }
@@ -133,10 +134,10 @@ fn enrich_crates(
     for ci in crates {
         match run_and_apply(root, ci, conn, abs_root) {
             Ok(n) => {
-                eprintln!("[rustdoc] {}: {} node(s) enriched", ci.name, n);
+                info!(crate_name = %ci.name, count = n, "rustdoc nodes enriched");
                 total += n;
             }
-            Err(e) => eprintln!("[rustdoc] {}: warning: {}", ci.name, e),
+            Err(e) => warn!(crate_name = %ci.name, error = %e, "rustdoc enrichment skipped"),
         }
     }
     Ok(total)

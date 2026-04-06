@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
+use tracing::warn;
 use rusqlite::Connection;
 
 use crate::schema::open_or_init_db;
@@ -41,7 +42,7 @@ pub fn enrich(root: &str, conn: &Connection) -> Result<usize> {
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[clippy] warning: could not run cargo clippy: {}", e);
+            warn!(error = %e, "could not run cargo clippy");
             return Ok(0);
         }
     };

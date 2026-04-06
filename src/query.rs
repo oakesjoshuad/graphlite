@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{anyhow, Result};
+use tracing::info;
 use rusqlite::Connection;
 
 use crate::xml as vxml;
@@ -755,7 +756,7 @@ pub fn symbols(
         .collect();
 
     let count = rows_data.len();
-    eprintln!("{} match(es)", count);
+    info!(count, "symbol search matches");
     if md {
         println!("| id | name | qualified_name | kind | role | file | signature | stable_id |");
         println!("|---:|---|---|---|---|---|---|---|");

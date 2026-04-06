@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 
 use anyhow::Result;
+use tracing::info;
 use rusqlite::Connection;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
@@ -143,10 +144,7 @@ pub fn resolve(conn: &Connection) -> Result<usize> {
     }
     tx.commit()?;
 
-    eprintln!(
-        "[resolver] {} call site(s) → {} unique CALLS_RESOLVED edge(s)",
-        site_count, total
-    );
+    info!(call_sites = site_count, edges = total, "CALLS_RESOLVED edges written");
     Ok(total)
 }
 
