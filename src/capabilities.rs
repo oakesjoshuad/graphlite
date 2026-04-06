@@ -161,15 +161,33 @@ pub fn run(json: bool) -> Result<()> {
                     flag("md", false),
                 ],
             ),
-            cmd("annotate", "Attach annotation metadata to a symbol", &[]),
+            cmd(
+                "annotate",
+                "Add or update a semantic annotation on a symbol",
+                &[
+                    flag("intent", true),
+                    flag("behavior", true),
+                    flag("tags", true),
+                    flag("source", true),
+                    flag("confidence", true),
+                ],
+            ),
             cmd("annotations", "List annotations", &[flag("stale", false)]),
             cmd(
                 "rename",
                 "Semantic rename via rust-analyzer; requires graphlite watch to be running",
                 &[flag("root", true)],
             ),
-            cmd("diff-rename", "Preview edits.json as a human-readable diff", &[]),
-            cmd("apply-edits", "Apply edits.json to disk atomically (.tmp + rename)", &[]),
+            cmd(
+                "diff-rename",
+                "Preview edits.json as a human-readable diff (accepts optional [EDITS_FILE] arg)",
+                &[],
+            ),
+            cmd(
+                "apply-edits",
+                "Apply edits.json to disk atomically (accepts optional [EDITS_FILE] arg)",
+                &[],
+            ),
             cmd(
                 "capabilities",
                 "Show supported command and flag surface",
@@ -177,8 +195,27 @@ pub fn run(json: bool) -> Result<()> {
             ),
             cmd(
                 "policy",
-                "Initialize and lint built-in architecture policy packs",
+                "Manage built-in architecture policy packs (subcommands: init-pack, lint)",
                 &[],
+            ),
+            cmd(
+                "policy init-pack",
+                "Initialize a built-in policy pack in .graphlite/config.toml",
+                &[
+                    flag("root", true),
+                    flag("force", false),
+                ],
+            ),
+            cmd(
+                "policy lint",
+                "Lint policy rules for stale/broad suppressions; supports CI gate flags",
+                &[
+                    flag("root", true),
+                    flag("stale", false),
+                    flag("fail-on-stale", false),
+                    flag("fail-on-broad", false),
+                    flag("broad-threshold", true),
+                ],
             ),
         ],
     };
