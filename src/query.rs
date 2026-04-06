@@ -205,14 +205,27 @@ pub fn resolve(
 
 pub fn deps(md: bool) -> Result<()> {
     let conn = open_db()?;
+    let config = crate::config::load(".");
+
+    let layers: std::collections::HashMap<&str, &str> = config
+        .workspace
+        .as_ref()
+        .map(|w| {
+            w.layers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut crates_stmt = conn.prepare(
-        "SELECT name
+        "SELECT name, doc
          FROM nodes
          WHERE kind = 'crate' AND language = 'workspace'
          ORDER BY name",
     )?;
-    let crates: Vec<String> = crates_stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+    let crates: Vec<(String, Option<String>)> = crates_stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
     let mut edges_stmt = conn.prepare(
@@ -228,14 +241,27 @@ pub fn deps(md: bool) -> Result<()> {
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
+    // fan_in: count how many workspace crates depend on each crate.
+    let mut fan_in: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, to) in &edges {
+        *fan_in.entry(to.as_str()).or_insert(0) += 1;
+    }
+
     if md {
         println!("Workspace crates: {}", crates.len());
         println!("Crate dependency edges: {}", edges.len());
         if !crates.is_empty() {
-            println!("| crate |");
-            println!("|---|");
-            for c in &crates {
-                println!("| {} |", c.replace('|', "\\|"));
+            println!("| crate | layer | fan_in | doc |");
+            println!("|---|---|---:|---|");
+            for (name, doc) in &crates {
+                let layer = layers.get(name.as_str()).copied().unwrap_or("-");
+                let fi = fan_in.get(name.as_str()).copied().unwrap_or(0);
+                let doc_cell = doc
+                    .as_deref()
+                    .and_then(|d| d.lines().next())
+                    .unwrap_or("-");
+                println!("| {} | {} | {} | {} |",
+                    name.replace('|', "\\|"), layer, fi, doc_cell.replace('|', "\\|"));
             }
         }
         if !edges.is_empty() {
@@ -258,8 +284,17 @@ pub fn deps(md: bool) -> Result<()> {
     )?;
     if !crates.is_empty() {
         vxml::open(&mut w, "crates")?;
-        for c in &crates {
-            vxml::empty(&mut w, "crate", &[("name", c)])?;
+        for (name, doc) in &crates {
+            let layer = layers.get(name.as_str()).copied().unwrap_or("-");
+            let fi = fan_in.get(name.as_str()).copied().unwrap_or(0);
+            let fi_s = fi.to_string();
+            // Emit only the first sentence of the doc (up to the first period or newline).
+            let doc_first = doc.as_deref().and_then(|d| d.lines().next()).unwrap_or("");
+            if doc_first.is_empty() {
+                vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s)])?;
+            } else {
+                vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s), ("doc", doc_first)])?;
+            }
         }
         vxml::close(&mut w, "crates")?;
     }

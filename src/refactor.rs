@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -11,34 +12,73 @@ struct TextEdit {
     new_text: String,
 }
 
-pub fn rename(symbol: &str, _new_name: &str, _root: &str) -> Result<()> {
-    let conn = crate::query::open_db()?;
+/// Rename a symbol via the running `graphlite watch` daemon.
+///
+/// Sends a `Rename` IPC message to the watcher, which uses its lazily-initialized
+/// rust-analyzer LSP client to produce a `WorkspaceEdit`. The edit is written to
+/// `edits.json` in the current directory. Preview with `graphlite diff-rename`,
+/// apply atomically with `graphlite apply-edits`.
+///
+/// Requires `graphlite watch <root>` to be running — the watcher keeps
+/// rust-analyzer warm so subsequent renames have zero startup cost.
+pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
+    if !crate::ipc::is_watcher_running(root) {
+        anyhow::bail!(
+            "rename requires an active watcher.\n\
+             Start it with:  graphlite watch {}\n\
+             Then retry:     graphlite rename {} {}",
+            root,
+            symbol,
+            new_name
+        );
+    }
 
-    // Resolve: integer id or sym:Name
-    let (file, range_start, name): (String, i64, String) = if let Ok(id) = symbol.parse::<i64>() {
-        conn.query_row(
-            "SELECT file, range_start, name FROM nodes WHERE id = ?1",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|_| anyhow!("node id {} not found", id))?
-    } else {
-        let name = symbol.strip_prefix("sym:").unwrap_or(symbol);
-        conn.query_row(
-            "SELECT file, range_start, name FROM nodes WHERE name = ?1 LIMIT 1",
-            rusqlite::params![name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|_| anyhow!("symbol '{}' not found in database", name))?
-    };
+    eprintln!("[rename] requesting rename of '{}' -> '{}'", symbol, new_name);
+    eprintln!("[rename] (first call warms rust-analyzer; subsequent calls are fast)");
 
-    // rust-analyzer has been removed; rename requires an external LSP.
-    // Use your editor's LSP integration (e.g. rust-analyzer via VS Code / neovim).
-    let _ = (file, range_start, name);
-    anyhow::bail!(
-        "The `rename` command required rust-analyzer which has been removed from graphlite.\n\
-         Use your editor's LSP rename (F2 / <leader>rn) instead."
-    )
+    let response = crate::ipc::send_msg_timeout(
+        root,
+        &crate::ipc::WatchMsg::Rename {
+            symbol: symbol.to_string(),
+            new_name: new_name.to_string(),
+        },
+        Duration::from_secs(120),
+    )?;
+
+    if !response.ok {
+        anyhow::bail!(
+            "{}",
+            response.error.unwrap_or_else(|| "rename failed".into())
+        );
+    }
+
+    let edit_json = response
+        .data
+        .ok_or_else(|| anyhow!("watcher returned no edit data"))?;
+
+    std::fs::write("edits.json", &edit_json)?;
+
+    let edit: Value = serde_json::from_str(&edit_json)?;
+    let file_count = count_affected_files(&edit);
+    eprintln!(
+        "[rename] '{}' -> '{}': {} file(s) affected",
+        symbol, new_name, file_count
+    );
+    eprintln!("[rename] edits written to edits.json");
+    eprintln!("[rename] review:  graphlite diff-rename");
+    eprintln!("[rename] apply:   graphlite apply-edits");
+
+    Ok(())
+}
+
+fn count_affected_files(edit: &Value) -> usize {
+    if let Some(arr) = edit["documentChanges"].as_array() {
+        return arr.len();
+    }
+    if let Some(obj) = edit["changes"].as_object() {
+        return obj.len();
+    }
+    0
 }
 
 pub fn diff_rename(edits_file: &str) -> Result<()> {

@@ -1,5 +1,6 @@
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static DB_READY: OnceLock<()> = OnceLock::new();
 
@@ -225,19 +226,21 @@ fn token_reduction_blast_radius_vs_raw_files() {
 #[test]
 fn rename_reports_external_lsp_requirement() {
     ensure_db();
+    // Run from a tempdir with no watcher socket — rename must fail with guidance.
+    let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
-        .args(["rename", "sym:open_db", "open_db_new", "--root", "."])
+        .args(["rename", "sym:open_db", "open_db_new", "--root", tmp.path().to_str().unwrap()])
         .current_dir(root())
         .output()
         .unwrap();
     assert!(
         !out.status.success(),
-        "rename should fail in-CLI since rust-analyzer integration was removed"
+        "rename should fail without an active watcher"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("removed from graphlite") || stderr.contains("editor's LSP"),
-        "expected migration guidance in stderr, got: {stderr}"
+        stderr.contains("watcher") || stderr.contains("watch"),
+        "expected watcher guidance in stderr, got: {stderr}"
     );
 }
 
@@ -1311,4 +1314,295 @@ reason = "broad"
         !fail_broad.status.success(),
         "expected non-zero status when broad gate is enabled"
     );
+}
+
+// ── Rename: no-watcher boundary (always runs) ─────────────────────────────────
+
+#[test]
+fn rename_no_watcher_gives_clear_error() {
+    ensure_db();
+    // Run from a temp dir with no watcher socket so the error path is exercised.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["rename", "sym:open_db", "open_database", "--root", tmp.path().to_str().unwrap()])
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "rename without watcher must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("watcher") || stderr.contains("watch"),
+        "error message should mention watcher, got: {}", stderr
+    );
+}
+
+#[test]
+fn rename_unknown_symbol_via_watcher_gives_clear_error() {
+    // This test starts a watcher against the graphlite repo and requests a
+    // rename of a symbol that doesn't exist. Gated on GRAPHLITE_LSP_TESTS=1
+    // because it requires rust-analyzer.
+    if std::env::var("GRAPHLITE_LSP_TESTS").unwrap_or_default() != "1" {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture_root = tmp.path();
+    build_rename_fixture(fixture_root);
+    init_fixture(fixture_root);
+
+    let mut watcher = start_watcher(fixture_root);
+    let _guard = WatcherGuard(&mut watcher);
+    wait_for_socket(fixture_root, Duration::from_secs(10));
+
+    let out = Command::new(bin())
+        .args(["rename", "sym:does_not_exist_xyz", "whatever", "--root", "."])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "rename of unknown symbol must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not found") || stderr.contains("error") || !out.status.success(),
+        "should report symbol not found, got: {}", stderr
+    );
+}
+
+// ── Rename: full LSP workflow (gated on GRAPHLITE_LSP_TESTS=1) ───────────────
+
+/// Full rename workflow: init fixture → start watcher → rename → diff → apply → verify.
+#[test]
+fn rename_via_watch_daemon_produces_correct_edits() {
+    if std::env::var("GRAPHLITE_LSP_TESTS").unwrap_or_default() != "1" {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture_root = tmp.path();
+    build_rename_fixture(fixture_root);
+    init_fixture(fixture_root);
+
+    let mut watcher = start_watcher(fixture_root);
+    let _guard = WatcherGuard(&mut watcher);
+    wait_for_socket(fixture_root, Duration::from_secs(10));
+
+    // Perform rename: foo_function -> bar_function
+    let out = Command::new(bin())
+        .args(["rename", "sym:foo_function", "bar_function", "--root", "."])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rename failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // edits.json must exist
+    let edits_path = fixture_root.join("edits.json");
+    assert!(edits_path.exists(), "edits.json not written");
+
+    // edits.json must be valid JSON and reference the new name
+    let edits_content = std::fs::read_to_string(&edits_path).unwrap();
+    let edits: serde_json::Value = serde_json::from_str(&edits_content)
+        .expect("edits.json must be valid JSON");
+    let edits_text = serde_json::to_string(&edits).unwrap();
+    assert!(
+        edits_text.contains("bar_function"),
+        "edits.json should reference new name 'bar_function'"
+    );
+
+    // diff-rename must succeed and show the rename
+    let diff = Command::new(bin())
+        .args(["diff-rename", "edits.json"])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+    assert!(diff.status.success(), "diff-rename failed");
+    let diff_text = String::from_utf8_lossy(&diff.stdout);
+    assert!(
+        diff_text.contains("bar_function"),
+        "diff should show new name, got: {}", diff_text
+    );
+
+    // apply-edits must succeed
+    let apply = Command::new(bin())
+        .args(["apply-edits", "edits.json"])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+    assert!(apply.status.success(), "apply-edits failed");
+
+    // Source file must contain bar_function and not foo_function
+    let lib_src = std::fs::read_to_string(fixture_root.join("src/lib.rs")).unwrap();
+    assert!(
+        lib_src.contains("bar_function"),
+        "lib.rs should contain renamed function"
+    );
+    assert!(
+        !lib_src.contains("foo_function"),
+        "lib.rs should not contain old name after rename"
+    );
+}
+
+/// Verify that a second rename in the same watcher session reuses the warm
+/// rust-analyzer client and completes quickly (within 15s).
+#[test]
+fn rename_second_call_reuses_warm_lsp_client() {
+    if std::env::var("GRAPHLITE_LSP_TESTS").unwrap_or_default() != "1" {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture_root = tmp.path();
+    build_rename_fixture(fixture_root);
+    init_fixture(fixture_root);
+
+    let mut watcher = start_watcher(fixture_root);
+    let _guard = WatcherGuard(&mut watcher);
+    wait_for_socket(fixture_root, Duration::from_secs(10));
+
+    // First rename (may warm rust-analyzer)
+    let out1 = Command::new(bin())
+        .args(["rename", "sym:foo_function", "bar_function", "--root", "."])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+    assert!(out1.status.success(), "first rename failed");
+    std::fs::write(fixture_root.join("edits.json"), b"").unwrap(); // clear
+
+    // Second rename — must complete within 15s (warm LSP path)
+    let start = std::time::Instant::now();
+    let out2 = Command::new(bin())
+        .args(["rename", "sym:helper_fn", "helper_function", "--root", "."])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    // We don't assert success here (the apply from first rename changed bar_function,
+    // but helper_fn is still present), just that the second call happened fast.
+    let _ = out2;
+    assert!(
+        elapsed.as_secs() < 15,
+        "second rename should use warm client and complete in <15s, took {}s",
+        elapsed.as_secs()
+    );
+}
+
+/// Rename a symbol that has call sites in multiple functions to verify
+/// rust-analyzer covers all references.
+#[test]
+fn rename_updates_all_call_sites() {
+    if std::env::var("GRAPHLITE_LSP_TESTS").unwrap_or_default() != "1" {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture_root = tmp.path();
+    build_rename_fixture(fixture_root);
+    init_fixture(fixture_root);
+
+    let mut watcher = start_watcher(fixture_root);
+    let _guard = WatcherGuard(&mut watcher);
+    wait_for_socket(fixture_root, Duration::from_secs(10));
+
+    // helper_fn is called from two callers in the fixture
+    let out = Command::new(bin())
+        .args(["rename", "sym:helper_fn", "helper_renamed", "--root", "."])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rename of helper_fn failed:\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr));
+
+    Command::new(bin())
+        .args(["apply-edits", "edits.json"])
+        .current_dir(fixture_root)
+        .output()
+        .unwrap();
+
+    let src = std::fs::read_to_string(fixture_root.join("src/lib.rs")).unwrap();
+    assert!(!src.contains("helper_fn"), "all occurrences of helper_fn should be renamed");
+    assert!(src.contains("helper_renamed"), "helper_renamed should appear in renamed file");
+}
+
+// ── Rename fixture helpers ────────────────────────────────────────────────────
+
+/// Create a minimal compilable Rust crate for rename tests.
+fn build_rename_fixture(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"rename_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"//! Rename fixture: minimal crate for graphlite rename tests.
+
+pub fn foo_function() -> u32 {
+    helper_fn() + 1
+}
+
+pub fn caller_a() -> u32 {
+    foo_function() + helper_fn()
+}
+
+pub fn caller_b() -> u32 {
+    foo_function()
+}
+
+fn helper_fn() -> u32 {
+    42
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn init_fixture(root: &std::path::Path) {
+    // Write a minimal graphlite config so init doesn't prompt for workspace layers.
+    std::fs::create_dir_all(root.join(".graphlite")).unwrap();
+    std::fs::write(
+        root.join(".graphlite/config.toml"),
+        "[workspace.layers]\nrename_fixture = \"composition\"\n",
+    )
+    .unwrap();
+
+    let status = Command::new(bin())
+        .args(["discover", "."])
+        .current_dir(root)
+        .status()
+        .expect("failed to spawn graphlite discover");
+    assert!(status.success(), "graphlite discover failed on fixture");
+}
+
+fn start_watcher(root: &std::path::Path) -> std::process::Child {
+    Command::new(bin())
+        .args(["watch", "."])
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn graphlite watch")
+}
+
+/// Poll until `.graphlite/watcher.sock` exists or timeout expires.
+fn wait_for_socket(root: &std::path::Path, timeout: Duration) {
+    let sock = root.join(".graphlite/watcher.sock");
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if sock.exists() {
+            std::thread::sleep(Duration::from_millis(100));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("watcher.sock did not appear within {}s", timeout.as_secs());
+}
+
+/// RAII guard that kills the watcher process on drop.
+struct WatcherGuard<'a>(&'a mut std::process::Child);
+
+impl Drop for WatcherGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }

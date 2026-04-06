@@ -163,9 +163,13 @@ pub fn run(json: bool) -> Result<()> {
             ),
             cmd("annotate", "Attach annotation metadata to a symbol", &[]),
             cmd("annotations", "List annotations", &[flag("stale", false)]),
-            cmd("rename", "Resolve symbol and produce edits.json contract", &[]),
-            cmd("diff-rename", "Show diff for edits.json", &[]),
-            cmd("apply-edits", "Apply edits.json to files", &[]),
+            cmd(
+                "rename",
+                "Semantic rename via rust-analyzer; requires graphlite watch to be running",
+                &[flag("root", true)],
+            ),
+            cmd("diff-rename", "Preview edits.json as a human-readable diff", &[]),
+            cmd("apply-edits", "Apply edits.json to disk atomically (.tmp + rename)", &[]),
             cmd(
                 "capabilities",
                 "Show supported command and flag surface",

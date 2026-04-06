@@ -131,6 +131,8 @@ pub fn run(root: &str) -> Result<()> {
 
     if changed.is_empty() {
         eprintln!("No files changed, index is up to date");
+        // Workspace crate graph is always re-synced (cheap, ensures doc/layer metadata is current).
+        sync_workspace_crate_graph(&conn, root)?;
         run_optional_enrichers(root, &conn);
         return Ok(());
     }
@@ -225,6 +227,23 @@ fn run_optional_enrichers(root: &str, conn: &rusqlite::Connection) {
     }
 }
 
+/// Extract the leading `//!` doc block from a crate entry file.
+/// Strips the `//! ` / `//!` prefix and joins lines with `\n`.
+fn extract_crate_doc(root: &str, entry_file: &str) -> Option<String> {
+    let path = std::path::Path::new(root).join(entry_file.trim_start_matches("./"));
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content
+        .lines()
+        .take_while(|l| l.starts_with("//!"))
+        .map(|l| l.trim_start_matches("//!").trim_start_matches(' '))
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn sync_workspace_crate_graph(conn: &rusqlite::Connection, root: &str) -> Result<()> {
     let ws = match workspace::detect(root) {
         Some(w) => w,
@@ -242,7 +261,7 @@ fn sync_workspace_crate_graph(conn: &rusqlite::Connection, root: &str) -> Result
         let mut node_stmt = tx.prepare_cached(
             "INSERT INTO nodes
              (file, language, kind, name, range_start, range_end, signature, content_hash, visibility, doc, stable_id, qualified_name, role, role_confidence)
-             VALUES (?1, 'workspace', 'crate', ?2, 1, 1, ?3, '', 'public', NULL, ?4, ?5, 'model', 1.0)",
+             VALUES (?1, 'workspace', 'crate', ?2, 1, 1, ?3, '', 'public', ?6, ?4, ?5, 'model', 1.0)",
         )?;
         let mut fts_stmt = tx.prepare_cached(
             "INSERT INTO fts_symbols (name, qualified_name, signature, file, language, node_id)
@@ -258,7 +277,8 @@ fn sync_workspace_crate_graph(conn: &rusqlite::Connection, root: &str) -> Result
             let sig = format!("crate {}", m.name);
             let stable_id = format!("crate::{}", m.name);
             let qualified_name = m.name.clone();
-            node_stmt.execute(rusqlite::params![file, m.name, sig, stable_id, qualified_name])?;
+            let doc = extract_crate_doc(root, &m.entry_file);
+            node_stmt.execute(rusqlite::params![file, m.name, sig, stable_id, qualified_name, doc])?;
             let node_id = tx.last_insert_rowid();
             fts_stmt.execute(rusqlite::params![m.name, m.name, sig, file, node_id])?;
             name_to_id.insert(m.name.clone(), node_id);

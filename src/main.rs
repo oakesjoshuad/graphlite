@@ -9,6 +9,7 @@ mod init_cmd;
 mod insert;
 mod ipc;
 mod language;
+mod lsp_client;
 mod parser;
 mod policy;
 mod query;
@@ -263,13 +264,26 @@ enum Commands {
         #[arg(long)]
         compact: bool,
     },
-    /// Rename helper (deprecated): CLI rename is removed; use editor LSP rename
+    /// Semantic rename via rust-analyzer (requires `graphlite watch` to be running)
+    ///
+    /// Asks the watch daemon to rename a symbol using rust-analyzer's LSP rename,
+    /// which handles all call sites, trait impls, re-exports, and macro-generated
+    /// references. The resulting WorkspaceEdit is written to `edits.json`.
+    ///
+    /// Workflow:
+    ///   1. graphlite watch .          (start daemon; keeps rust-analyzer warm)
+    ///   2. graphlite rename sym:X Y   (produces edits.json)
+    ///   3. graphlite diff-rename      (review changes)
+    ///   4. graphlite apply-edits      (commit atomically)
+    ///
+    /// The first rename warms rust-analyzer (~15-60s depending on project size).
+    /// Subsequent renames in the same watch session are fast (reuse warm client).
     Rename {
-        /// Symbol id (integer) or name (sym:Name)
+        /// Symbol id (integer), stable_id, sym:name, or plain name
         symbol: String,
         /// New name for the symbol
         new_name: String,
-        /// Project root
+        /// Project root (must match the root passed to `graphlite watch`)
         #[arg(long, default_value = ".")]
         root: String,
     },
