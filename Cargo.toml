@@ -4,8 +4,8 @@ version = "0.7.0"
 edition = "2021"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+clap = { version = "4.6", features = ["derive"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
@@ -23,7 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 streaming-iterator = "0.1.9"
 crossbeam-channel = "0.5"
-quick-xml = "0.37"
+quick-xml = "0.39"
 notify = { version = "8.2.0", features = ["macos_fsevent"] }
 ctrlc = "3"
 
