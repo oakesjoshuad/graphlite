@@ -203,7 +203,7 @@ pub fn resolve(
     Ok(())
 }
 
-pub fn deps(md: bool) -> Result<()> {
+pub fn deps(md: bool, modules: bool) -> Result<()> {
     let conn = open_db()?;
     let config = crate::config::load(".");
 
@@ -219,13 +219,15 @@ pub fn deps(md: bool) -> Result<()> {
         .unwrap_or_default();
 
     let mut crates_stmt = conn.prepare(
-        "SELECT name, doc
+        "SELECT name, doc, file
          FROM nodes
          WHERE kind = 'crate' AND language = 'workspace'
          ORDER BY name",
     )?;
-    let crates: Vec<(String, Option<String>)> = crates_stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
+    let crates: Vec<(String, Option<String>, String)> = crates_stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
 
     let mut edges_stmt = conn.prepare(
@@ -247,13 +249,21 @@ pub fn deps(md: bool) -> Result<()> {
         *fan_in.entry(to.as_str()).or_insert(0) += 1;
     }
 
+    // Per-crate module data (only loaded when --modules is set).
+    // Map: crate_name -> Vec<ModuleRow> sorted by symbol count desc.
+    let crate_modules: std::collections::HashMap<String, Vec<ModuleRow>> = if modules {
+        build_crate_modules(&conn, &crates)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     if md {
         println!("Workspace crates: {}", crates.len());
         println!("Crate dependency edges: {}", edges.len());
         if !crates.is_empty() {
             println!("| crate | layer | fan_in | doc |");
             println!("|---|---|---:|---|");
-            for (name, doc) in &crates {
+            for (name, doc, _file) in &crates {
                 let layer = layers.get(name.as_str()).copied().unwrap_or("-");
                 let fi = fan_in.get(name.as_str()).copied().unwrap_or(0);
                 let doc_cell = doc
@@ -264,7 +274,27 @@ pub fn deps(md: bool) -> Result<()> {
                     name.replace('|', "\\|"), layer, fi, doc_cell.replace('|', "\\|"));
             }
         }
+        if modules {
+            println!();
+            println!("| crate | module | symbols | role | hotspot | hotspot_fan_in |");
+            println!("|---|---|---:|---|---|---:|");
+            for (name, _, _) in &crates {
+                if let Some(mods) = crate_modules.get(name.as_str()) {
+                    for m in mods {
+                        println!("| {} | {} | {} | {} | {} | {} |",
+                            name.replace('|', "\\|"),
+                            m.module.replace('|', "\\|"),
+                            m.symbols,
+                            m.role.replace('|', "\\|"),
+                            m.hotspot.replace('|', "\\|"),
+                            m.hotspot_fan_in,
+                        );
+                    }
+                }
+            }
+        }
         if !edges.is_empty() {
+            println!();
             println!("| from_crate | to_crate |");
             println!("|---|---|");
             for (from, to) in &edges {
@@ -284,16 +314,36 @@ pub fn deps(md: bool) -> Result<()> {
     )?;
     if !crates.is_empty() {
         vxml::open(&mut w, "crates")?;
-        for (name, doc) in &crates {
+        for (name, doc, _file) in &crates {
             let layer = layers.get(name.as_str()).copied().unwrap_or("-");
             let fi = fan_in.get(name.as_str()).copied().unwrap_or(0);
             let fi_s = fi.to_string();
-            // Emit only the first sentence of the doc (up to the first period or newline).
             let doc_first = doc.as_deref().and_then(|d| d.lines().next()).unwrap_or("");
-            if doc_first.is_empty() {
-                vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s)])?;
+            let mods = if modules { crate_modules.get(name.as_str()) } else { None };
+            if mods.map_or(true, |v| v.is_empty()) {
+                if doc_first.is_empty() {
+                    vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s)])?;
+                } else {
+                    vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s), ("doc", doc_first)])?;
+                }
             } else {
-                vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s), ("doc", doc_first)])?;
+                if doc_first.is_empty() {
+                    vxml::open_attrs(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s)])?;
+                } else {
+                    vxml::open_attrs(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s), ("doc", doc_first)])?;
+                }
+                for m in mods.unwrap() {
+                    let sym_s = m.symbols.to_string();
+                    let hfi_s = m.hotspot_fan_in.to_string();
+                    vxml::empty(&mut w, "module", &[
+                        ("name", m.module.as_str()),
+                        ("symbols", &sym_s),
+                        ("role", m.role.as_str()),
+                        ("hotspot", m.hotspot.as_str()),
+                        ("hotspot_fan_in", &hfi_s),
+                    ])?;
+                }
+                vxml::close(&mut w, "crate")?;
             }
         }
         vxml::close(&mut w, "crates")?;
@@ -308,6 +358,120 @@ pub fn deps(md: bool) -> Result<()> {
     vxml::close(&mut w, "deps")?;
     vxml::finish_stream(w)?;
     Ok(())
+}
+
+struct ModuleRow {
+    module: String,
+    symbols: usize,
+    role: String,
+    hotspot: String,
+    hotspot_fan_in: usize,
+}
+
+/// Derive the crate root directory prefix from the crate node's entry file.
+/// e.g. `./src/main.rs` → `./src/`  (single-crate)
+///      `./domain/src/lib.rs` → `./domain/src/`  (workspace member)
+fn crate_src_prefix(crate_file: &str) -> String {
+    let path = std::path::Path::new(crate_file);
+    if let Some(parent) = path.parent() {
+        let s = parent.to_string_lossy();
+        if s.is_empty() || s == "." {
+            return "./src/".to_string();
+        }
+        return format!("{}/", s);
+    }
+    "./src/".to_string()
+}
+
+/// Extract the top-level module name from a file path relative to the crate src prefix.
+/// `./src/query.rs`            → Some("query")
+/// `./src/lsp/mod.rs`          → Some("lsp")
+/// `./src/lsp/client.rs`       → Some("lsp")
+/// `./src/lib.rs`              → None  (crate root)
+/// `./src/main.rs`             → None  (crate root)
+fn top_level_module(file: &str, src_prefix: &str) -> Option<String> {
+    let rel = file.strip_prefix(src_prefix)?;
+    let first = rel.split('/').next()?;
+    let module = first.strip_suffix(".rs").unwrap_or(first);
+    if matches!(module, "lib" | "main" | "mod") {
+        return None;
+    }
+    Some(module.to_string())
+}
+
+fn build_crate_modules(
+    conn: &Connection,
+    crates: &[(String, Option<String>, String)],
+) -> Result<std::collections::HashMap<String, Vec<ModuleRow>>> {
+    // Load all non-crate symbol nodes with their incoming edge count (fan_in).
+    // We include all edge types that represent real usage.
+    let mut sym_stmt = conn.prepare(
+        "SELECT n.file, n.name, n.role,
+                COUNT(e.id) as fan_in
+         FROM nodes n
+         LEFT JOIN edges e ON e.to_id = n.id
+              AND e.edge_type IN ('CALLS_RESOLVED','CALLS_TRUSTED','CALLS_INFERRED')
+         WHERE n.kind NOT IN ('crate')
+           AND n.language NOT IN ('workspace')
+         GROUP BY n.id
+         ORDER BY n.file, fan_in DESC",
+    )?;
+
+    struct SymRow { file: String, name: String, role: String, fan_in: usize }
+    let syms: Vec<SymRow> = sym_stmt
+        .query_map([], |r| {
+            Ok(SymRow {
+                file:   r.get::<_, String>(0)?,
+                name:   r.get::<_, String>(1)?,
+                role:   r.get::<_, String>(2)?,
+                fan_in: r.get::<_, i64>(3)? as usize,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut result = std::collections::HashMap::new();
+
+    for (crate_name, _doc, crate_file) in crates {
+        let prefix = crate_src_prefix(crate_file);
+
+        // module -> (symbol_count, role_counts, hotspot_name, hotspot_fan_in)
+        let mut modules: std::collections::HashMap<
+            String,
+            (usize, std::collections::HashMap<String, usize>, String, usize),
+        > = std::collections::HashMap::new();
+
+        for sym in &syms {
+            let Some(module) = top_level_module(&sym.file, &prefix) else { continue };
+            let entry = modules.entry(module).or_insert_with(|| {
+                (0, std::collections::HashMap::new(), String::new(), 0)
+            });
+            entry.0 += 1;
+            *entry.1.entry(sym.role.clone()).or_insert(0) += 1;
+            // First symbol encountered per module (ordered by fan_in desc) is the hotspot.
+            if entry.3 == 0 && entry.2.is_empty() {
+                entry.2 = sym.name.clone();
+                entry.3 = sym.fan_in;
+            }
+        }
+
+        let mut rows: Vec<ModuleRow> = modules
+            .into_iter()
+            .map(|(module, (symbols, role_counts, hotspot, hotspot_fan_in))| {
+                let role = role_counts
+                    .into_iter()
+                    .max_by_key(|(_, c)| *c)
+                    .map(|(r, _)| r)
+                    .unwrap_or_else(|| "unknown".to_string());
+                ModuleRow { module, symbols, role, hotspot, hotspot_fan_in }
+            })
+            .collect();
+
+        // Sort by symbol count descending, then module name for stability.
+        rows.sort_by(|a, b| b.symbols.cmp(&a.symbols).then(a.module.cmp(&b.module)));
+        result.insert(crate_name.clone(), rows);
+    }
+
+    Ok(result)
 }
 
 fn resolve_candidates(

@@ -41,7 +41,7 @@ pub fn run(json: bool) -> Result<()> {
                     flag("md", false),
                 ],
             ),
-            cmd("deps", "Show workspace crate dependency graph", &[flag("md", false)]),
+            cmd("deps", "Show workspace crate dependency graph", &[flag("md", false), flag("modules", false)]),
             cmd(
                 "resolve",
                 "Resolve ambiguous symbol selectors to deterministic top candidates",

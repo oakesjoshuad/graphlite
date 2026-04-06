@@ -141,6 +141,10 @@ enum Commands {
         /// Output as markdown instead of XML
         #[arg(long)]
         md: bool,
+        /// Expand each crate to list its top-level modules with symbol count,
+        /// dominant role, and the single highest-fan-in symbol (hotspot)
+        #[arg(long)]
+        modules: bool,
     },
     /// Resolve an ambiguous symbol query to a deterministic top candidate
     Resolve {
@@ -530,7 +534,7 @@ fn main() -> Result<()> {
             exclude_tests,
             md,
         )?,
-        Commands::Deps { md } => query::deps(md)?,
+        Commands::Deps { md, modules } => query::deps(md, modules)?,
         Commands::Resolve {
             query,
             language,
