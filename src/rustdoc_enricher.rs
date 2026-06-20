@@ -157,10 +157,9 @@ fn run_and_apply(
 
 fn run_cargo_rustdoc(root: &str, manifest_path: &Path, crate_name: &str) -> Result<PathBuf> {
     let safe_name = crate_name.replace('-', "_");
-    let rustdoc_target = Path::new(root)
-        .join(".graphlite")
-        .join("rustdoc-json")
-        .join(&safe_name);
+    // Keep one shared cargo target-dir so rustdoc can reuse compiled deps
+    // across crates instead of rebuilding the same graph into per-crate dirs.
+    let rustdoc_target = Path::new(root).join(".graphlite").join("rustdoc-json");
     std::fs::create_dir_all(&rustdoc_target)?;
 
     let status = Command::new("cargo")
