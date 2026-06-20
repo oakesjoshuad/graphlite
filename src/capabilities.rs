@@ -10,7 +10,6 @@ struct FlagCap {
 #[derive(Serialize)]
 struct CommandCap {
     name: &'static str,
-    stable: bool,
     summary: &'static str,
     flags: Vec<FlagCap>,
 }
@@ -252,7 +251,6 @@ pub fn run(json: bool) -> Result<()> {
 fn cmd(name: &'static str, summary: &'static str, flags: &[FlagCap]) -> CommandCap {
     CommandCap {
         name,
-        stable: true,
         summary,
         flags: flags.to_vec(),
     }

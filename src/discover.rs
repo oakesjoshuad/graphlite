@@ -76,9 +76,6 @@ fn collect_source_files(root: &str, extra_ignore: &[String]) -> Result<Vec<PathB
 
 pub fn run(root: &str) -> Result<()> {
     let config = config::load(root);
-    if !config.lsp.is_empty() {
-        warn!(fields = ?config.lsp, "lsp config field is deprecated; LSP enrichment replaced by rustdoc (ignoring)");
-    }
 
     // Refuse to index if any workspace layer is still unassigned.
     if let Some(ws) = &config.workspace {

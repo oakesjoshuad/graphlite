@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use crate::{config, discover, workspace};
 
-pub fn run(root: &str, lsp_override: Option<&str>) -> Result<()> {
+pub fn run(root: &str) -> Result<()> {
     let graphlite_dir = Path::new(root).join(".graphlite");
     fs::create_dir_all(&graphlite_dir)?;
 
@@ -13,16 +13,9 @@ pub fn run(root: &str, lsp_override: Option<&str>) -> Result<()> {
     let config_path = graphlite_dir.join("config.toml");
     if !config_path.exists() {
         let ws = workspace::detect(root);
-        // LSP enrichment has been replaced by rustdoc JSON; lsp config is kept for
-        // backwards compatibility but no longer drives enrichment at index time.
-        let detected_lsp: Vec<String> = if let Some(lang) = lsp_override {
-            vec![lang.to_string()]
-        } else {
-            vec![]
-        };
         let content = match ws.as_ref() {
-            Some(ws_info) => build_workspace_config(&detected_lsp, ws_info),
-            None => build_default_config(&detected_lsp),
+            Some(ws_info) => build_workspace_config(ws_info),
+            None => build_default_config(),
         };
         fs::write(&config_path, &content)?;
         if ws.is_some() {
@@ -76,18 +69,7 @@ pub fn run(root: &str, lsp_override: Option<&str>) -> Result<()> {
 
 // ── Config file generation ────────────────────────────────────────────────────
 
-fn build_default_config(lsp_langs: &[String]) -> String {
-    let lsp_line = if lsp_langs.is_empty() {
-        "# lsp = [\"rust\"]".to_string()
-    } else {
-        let array = lsp_langs
-            .iter()
-            .map(|l| format!("\"{}\"", l))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("lsp = [{}]", array)
-    };
-
+fn build_default_config() -> String {
     format!(
         r#"# graphlite configuration
 
@@ -95,13 +77,10 @@ fn build_default_config(lsp_langs: &[String]) -> String {
 # Extends built-in defaults: node_modules, target, build, dist, .svelte-kit, .git, .cache, .next, .nuxt, __pycache__
 ignore = []
 
-# Deprecated legacy setting (ignored by discover; rustdoc+resolver are always used).
-{lsp_line}
-
 # Default traversal depth for graph and blast-radius commands.
 depth = 2
 
-# Forbidden context coupling rules for `graphlite viz`.
+# Forbidden context coupling rules for `graphlite violations`.
 # Example:
 # [[violations]]
 # from_context = "presentation"
@@ -130,18 +109,7 @@ depth = 2
     )
 }
 
-fn build_workspace_config(lsp_langs: &[String], ws: &workspace::WorkspaceGraph) -> String {
-    let lsp_line = if lsp_langs.is_empty() {
-        "# lsp = [\"rust\"]".to_string()
-    } else {
-        let array = lsp_langs
-            .iter()
-            .map(|l| format!("\"{}\"", l))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("lsp = [{}]", array)
-    };
-
+fn build_workspace_config(ws: &workspace::WorkspaceGraph) -> String {
     // Build grouped dep graph comment: { from → [to, to, ...] }
     let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (from, to) in &ws.deps {
@@ -171,9 +139,6 @@ fn build_workspace_config(lsp_langs: &[String], ws: &workspace::WorkspaceGraph) 
 # Additional directories to ignore during indexing.
 # Extends built-in defaults: node_modules, target, build, dist, .svelte-kit, .git, .cache, .next, .nuxt, __pycache__
 ignore = []
-
-# Deprecated legacy setting (ignored by discover; rustdoc+resolver are always used).
-{lsp_line}
 
 # Default traversal depth for graph and blast-radius commands.
 depth = 2

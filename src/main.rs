@@ -246,9 +246,6 @@ enum Commands {
         /// Traversal depth for blast radius callers (default: 1)
         #[arg(long)]
         blast_depth: Option<usize>,
-        /// Deprecated alias for --blast-depth (kept for compatibility)
-        #[arg(long, hide = true)]
-        max_depth: Option<usize>,
         /// Suppress source snippets from output
         #[arg(long)]
         no_snippets: bool,
@@ -495,7 +492,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { root } => init_cmd::run(&root, None)?,
+        Commands::Init { root } => init_cmd::run(&root)?,
         Commands::Discover { root } => discover::run(&root)?,
         Commands::Graph {
             symbols,
@@ -604,7 +601,6 @@ fn main() -> Result<()> {
             symbols,
             depth,
             blast_depth,
-            max_depth,
             no_snippets,
             edit,
             max_snippet_lines,
@@ -614,7 +610,7 @@ fn main() -> Result<()> {
             compact,
         } => {
             let depth = depth.unwrap_or_else(|| config::load(".").depth);
-            let blast_depth = blast_depth.or(max_depth).unwrap_or(1);
+            let blast_depth = blast_depth.unwrap_or(1);
             query::context(
                 &symbols,
                 depth,

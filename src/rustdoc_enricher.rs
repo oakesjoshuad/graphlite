@@ -1,7 +1,7 @@
 //! Enrich the symbol graph using `cargo +nightly rustdoc --output-format json`.
 //!
 //! Replaces rust-analyzer for three signals:
-//!   1. Qualified names  (`lsp::warm_client` style module-prefixed names)
+//!   1. Qualified names  (`module::symbol` style module-prefixed names)
 //!   2. Visibility       (`public`, `crate`, `default`, `restricted::path`)
 //!   3. Trait impl links (`trait_impl` column + `IMPL_TRAIT` edges)
 //!

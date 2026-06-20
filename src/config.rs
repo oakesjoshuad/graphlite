@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 use serde::Deserialize;
 
 /// A forbidden context coupling rule. Edges from `from_context` to `to_context`
-/// are flagged as violations in `graphlite viz`, regardless of edge source.
+/// are flagged as violations in `graphlite violations`, regardless of edge source.
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct ViolationRule {
     pub from_context: String,
@@ -73,13 +73,9 @@ pub struct PolicyConfig {
 pub struct Config {
     #[serde(default)]
     pub ignore: Vec<String>,
-    /// Kept for backwards-compat TOML parsing; no longer drives enrichment.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub lsp: Vec<String>,
     #[serde(default = "default_depth")]
     pub depth: usize,
-    /// Forbidden context coupling rules for `graphlite viz`.
+    /// Forbidden context coupling rules for `graphlite violations`.
     #[serde(default)]
     pub violations: Vec<ViolationRule>,
     /// Suppression rules for known-acceptable violation patterns.
@@ -103,7 +99,6 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             ignore: vec![],
-            lsp: vec![],
             depth: default_depth(),
             violations: vec![],
             exceptions: vec![],

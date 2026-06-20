@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use crossbeam_channel::{select, unbounded, Sender};
 use notify::{
     event::{CreateKind, ModifyKind, RemoveKind},

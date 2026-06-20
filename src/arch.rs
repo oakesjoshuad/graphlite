@@ -1,4 +1,4 @@
-//! Shared architectural analysis helpers used by both `viz` and `violations`.
+//! Shared architectural analysis helpers used by `violations` and policy linting.
 
 use crate::config::{ViolationException, ViolationRule};
 
