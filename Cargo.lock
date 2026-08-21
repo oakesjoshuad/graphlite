@@ -343,6 +343,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "rusqlite",
+ "rustdoc-types",
  "serde",
  "serde_json",
  "streaming-iterator",
@@ -776,6 +777,16 @@ dependencies = [
  "libsqlite3-sys",
  "smallvec",
  "sqlite-wasm-rs",
+]
+
+[[package]]
+name = "rustdoc-types"
+version = "0.57.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7be7e9f2ca82c1fcefb69332b82c289051edcd4a3245b1715f7756103918255"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
