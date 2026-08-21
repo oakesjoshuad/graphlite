@@ -631,17 +631,73 @@ fn collect_impl_trait_edges(
             let ItemEnum::Impl(impl_data) = &item.inner else {
                 return None;
             };
+            if impl_data.is_synthetic {
+                return None;
+            }
             let trait_id = impl_data.trait_.as_ref()?.id;
             let type_id = match &impl_data.for_ {
                 Type::ResolvedPath(path) => path.id,
                 _ => return None,
             };
+            let type_label = rustdoc_path_label(doc, type_id);
+            let trait_label = rustdoc_path_label(doc, trait_id);
+            let Some(from_id) = item_nodes.get(&type_id).copied() else {
+                warn!(
+                    crate_dir = %crate_abs_dir.display(),
+                    type_name = %type_label,
+                    trait_name = %trait_label,
+                    "rustdoc IMPL_TRAIT target could not be mapped; edge skipped"
+                );
+                return None;
+            };
+            let Some(to_id) = resolve_rustdoc_node_id(doc, trait_id, &item_nodes, qualified_node_map)
+            else {
+                if is_workspace_rustdoc_path(doc, trait_id, qualified_node_map) {
+                    warn!(
+                        crate_dir = %crate_abs_dir.display(),
+                        type_name = %type_label,
+                        trait_name = %trait_label,
+                        "rustdoc IMPL_TRAIT trait could not be mapped; edge skipped"
+                    );
+                } else {
+                    debug!(
+                        crate_dir = %crate_abs_dir.display(),
+                        type_name = %type_label,
+                        trait_name = %trait_label,
+                        "rustdoc external IMPL_TRAIT trait is not indexed; edge skipped"
+                    );
+                }
+                return None;
+            };
             Some((
-                item_nodes.get(&type_id).copied()?,
-                resolve_rustdoc_node_id(doc, trait_id, &item_nodes, qualified_node_map)?,
+                from_id, to_id,
             ))
         })
         .collect()
+}
+
+fn rustdoc_path_label(doc: &Crate, item_id: Id) -> String {
+    doc.paths
+        .get(&item_id)
+        .map(|path| path.path.join("::"))
+        .unwrap_or_else(|| format!("rustdoc-id-{}", item_id.0))
+}
+
+fn is_workspace_rustdoc_path(
+    doc: &Crate,
+    item_id: Id,
+    qualified_node_map: &HashMap<(String, String), Vec<i64>>,
+) -> bool {
+    let Some(crate_name) = doc
+        .paths
+        .get(&item_id)
+        .and_then(|path| path.path.first())
+    else {
+        return false;
+    };
+    qualified_node_map
+        .keys()
+        .any(|(workspace_crate, _)| workspace_crate == crate_name)
 }
 
 fn resolve_rustdoc_node_id(
