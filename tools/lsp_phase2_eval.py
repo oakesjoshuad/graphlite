@@ -175,26 +175,28 @@ def open_document(rpc: Rpc, path: Path, text: str) -> None:
     )
 
 
-def flatten_symbols(value, out: list[tuple[str, int]]) -> None:
+def flatten_symbols(value, out: list[tuple[str, int, str]], prefix: str = "") -> None:
     if not isinstance(value, dict):
         return
     name = value.get("name")
     start = value.get("range", {}).get("start", {}).get("line")
     if isinstance(name, str) and isinstance(start, int):
-        out.append((name, start + 1))
+        qualified_name = f"{prefix}::{name}" if prefix else name
+        out.append((name, start + 1, qualified_name))
+        prefix = qualified_name
     for child in value.get("children", []) or []:
-        flatten_symbols(child, out)
+        flatten_symbols(child, out, prefix)
 
 
-def symbol_rows(result) -> list[tuple[str, int]]:
-    rows: list[tuple[str, int]] = []
+def symbol_rows(result) -> list[tuple[str, int, str]]:
+    rows: list[tuple[str, int, str]] = []
     for item in result or []:
         flatten_symbols(item, rows)
         if isinstance(item, dict) and "location" in item:
             name = item.get("name")
             start = item.get("location", {}).get("range", {}).get("start", {}).get("line")
             if isinstance(name, str) and isinstance(start, int):
-                rows.append((name, start + 1))
+                rows.append((name, start + 1, name))
     return rows
 
 
@@ -232,7 +234,27 @@ def graph_symbols(db: Path, root: Path) -> dict[tuple[str, int], set[str]]:
     return result
 
 
-def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
+def graph_qualified_names(db: Path, root: Path) -> dict[tuple[str, int], set[str]]:
+    if not db.exists():
+        return {}
+    result: dict[tuple[str, int], set[str]] = {}
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        for name, file, line in conn.execute(
+            "SELECT qualified_name, file, range_start FROM nodes "
+            "WHERE qualified_name IS NOT NULL AND qualified_name != ''"
+        ):
+            path = Path(file)
+            if not path.is_absolute():
+                path = (root / path).resolve()
+            key = (str(path), int(line))
+            result.setdefault(key, set()).add(name)
+    finally:
+        conn.close()
+    return result
+
+
+def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth) -> dict:
     started = time.monotonic()
     rpc = None
     statuses = []
@@ -302,6 +324,9 @@ def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
         ground_truth_names = {}
         for (truth_file, _), names in ground_truth.items():
             ground_truth_names.setdefault(truth_file, set()).update(names)
+        ground_truth_qualified = {}
+        for (truth_file, _), names in qualified_truth.items():
+            ground_truth_qualified.setdefault(truth_file, set()).update(names)
         for path in selected_files:
             text = path.read_text(errors="replace")
             open_document(rpc, path, text)
@@ -312,8 +337,17 @@ def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
                 args.request_timeout,
             )
             rows = symbol_rows(response.get("result"))
-            symbol_results.append({"file": str(path.relative_to(root)), "count": len(rows)})
-            for name, line in rows:
+            symbol_results.append(
+                {
+                    "file": str(path.relative_to(root)),
+                    "count": len(rows),
+                    "symbols": [
+                        {"name": name, "line": line, "qualified_name": qualified_name}
+                        for name, line, qualified_name in rows
+                    ],
+                }
+            )
+            for name, line, qualified_name in rows:
                 key = (str(path.resolve()), line)
                 if ground_truth:
                     symbol_results[-1].setdefault("matched", 0)
@@ -322,6 +356,9 @@ def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
                         symbol_results[-1]["matched"] += 1
                     if name in ground_truth_names.get(str(path.resolve()), set()):
                         symbol_results[-1]["name_matched"] += 1
+                    symbol_results[-1].setdefault("qualified_name_matched", 0)
+                    if qualified_name in ground_truth_qualified.get(str(path.resolve()), set()):
+                        symbol_results[-1]["qualified_name_matched"] += 1
 
         implementation_results = []
         for path, line, character, name in trait_probes(files, args.max_impl_probes):
@@ -334,18 +371,34 @@ def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
                 args.request_timeout,
             )
             value = response.get("result")
+            locations = []
+            for item in value or [] if isinstance(value, list) else []:
+                location = item.get("uri") if isinstance(item, dict) else None
+                range_start = item.get("range", {}).get("start") if isinstance(item, dict) else None
+                if location and isinstance(range_start, dict):
+                    locations.append(
+                        {
+                            "uri": location,
+                            "line": range_start.get("line", 0) + 1,
+                            "character": range_start.get("character", 0),
+                        }
+                    )
             implementation_results.append(
                 {
                     "trait": name,
                     "file": str(path.relative_to(root)),
                     "line": line,
                     "result_count": len(value) if isinstance(value, list) else (0 if value is None else 1),
+                    "locations": locations,
                 }
             )
 
         total_symbols = sum(row["count"] for row in symbol_results)
         matched = sum(row.get("matched", 0) for row in symbol_results)
         name_matched = sum(row.get("name_matched", 0) for row in symbol_results)
+        qualified_name_matched = sum(
+            row.get("qualified_name_matched", 0) for row in symbol_results
+        )
         return {
             "ok": True,
             "elapsed_s": round(time.monotonic() - started, 3),
@@ -361,6 +414,9 @@ def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
                 "symbols_returned": total_symbols,
                 "ground_truth_name_line_matches": matched if ground_truth else None,
                 "ground_truth_name_matches": name_matched if ground_truth else None,
+                "ground_truth_qualified_name_matches": (
+                    qualified_name_matched if qualified_truth else None
+                ),
                 "files": symbol_results,
             },
             "implementation_probes": implementation_results,
@@ -394,7 +450,11 @@ def main() -> int:
     files = rust_files(root)
     db = (args.db or root / ".graphlite" / "codegraph.db").resolve()
     ground_truth = graph_symbols(db, root)
-    runs = [run_once(root, args, files, ground_truth) for _ in range(max(1, args.runs))]
+    qualified_truth = graph_qualified_names(db, root)
+    runs = [
+        run_once(root, args, files, ground_truth, qualified_truth)
+        for _ in range(max(1, args.runs))
+    ]
     try:
         version = subprocess.run(
             [args.server, "--version"], capture_output=True, text=True, check=False
@@ -406,6 +466,7 @@ def main() -> int:
         "rust_analyzer": version,
         "files_discovered": len(files),
         "ground_truth_symbols": sum(len(names) for names in ground_truth.values()),
+        "ground_truth_qualified_names": sum(len(names) for names in qualified_truth.values()),
         "options": vars(args) | {"root": str(root), "db": str(db), "output": str(args.output) if args.output else None},
         "runs": runs,
     }
