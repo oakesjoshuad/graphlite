@@ -184,7 +184,6 @@ struct CrateEnrichment {
 struct NodeUpdate {
     node_id: i64,
     qualified_name: Option<String>,
-    signature: Option<String>,
     trait_impl: Option<String>,
 }
 
@@ -350,11 +349,9 @@ fn parse_crate_enrichment(
 
         let qname = item_to_qname.get(item_id).cloned();
         let trait_impl = method_to_trait.get(item_id).cloned();
-        let rustdoc_sig = extract_rustdoc_signature(item);
         node_updates.push(NodeUpdate {
             node_id,
             qualified_name: qname,
-            signature: rustdoc_sig,
             trait_impl,
         });
     }
@@ -376,16 +373,6 @@ fn apply_enrichment(tx: &rusqlite::Transaction<'_>, enrichment: &CrateEnrichment
             tx.execute(
                 "UPDATE fts_symbols SET qualified_name = ?1 WHERE node_id = ?2",
                 rusqlite::params![qname, update.node_id],
-            )?;
-        }
-        if let Some(signature) = &update.signature {
-            tx.execute(
-                "UPDATE nodes SET signature = ?1 WHERE id = ?2 AND (?1 != '') AND (signature IS NULL OR LENGTH(?1) > LENGTH(signature))",
-                rusqlite::params![signature, update.node_id],
-            )?;
-            tx.execute(
-                "UPDATE fts_symbols SET signature = (SELECT signature FROM nodes WHERE id = ?1) WHERE node_id = ?1",
-                rusqlite::params![update.node_id],
             )?;
         }
         if let Some(trait_impl) = &update.trait_impl {
@@ -595,23 +582,6 @@ fn collect_impl_trait_edges(
             ))
         })
         .collect()
-}
-
-fn extract_rustdoc_signature(item: &rustdoc_types::Item) -> Option<String> {
-    let ItemEnum::Function(function) = &item.inner else {
-        return None;
-    };
-    let signature = format!(
-        "fn({})",
-        function
-            .sig
-            .inputs
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    (!signature.is_empty()).then_some(signature)
 }
 
 #[cfg(test)]

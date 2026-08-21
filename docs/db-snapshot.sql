@@ -118,6 +118,7 @@ better) -- the same treatment (either drop rustdoc as a signature source
 entirely, since tree-sitter already covers it, or properly render
 inputs/output types from the typed rustdoc_types::FunctionSignature) should
 be applied here too, as a follow-up.', NULL);
+INSERT INTO evidence (id, record_id, kind, title, uri, content, metadata) VALUES ('EDR-0001-EV-002', 'EDR-0001', 'measurement', 'Tree-sitter signatures are full-fidelity; rustdoc signature source removed', NULL, 'Independent verification after c1e5b96 checked parser.rs::extract_signature and fresh graph queries. The parser slices each symbol''s raw source from its start through the body/signature boundary, preserving parameter types and return types. Repository samples included parse_file, exception_reason (generic lifetime and reference return), find_enclosing_fn (nested HashMap/tuple type), and send_msg_timeout. A representative temporary Rust crate additionally covered a free function, generic bounds, nested generics with closure parameters, a trait required method, and its implementation; every nodes.signature value retained full source types and return types. The refreshed repository index returned degraded=0 for signatures matching fn(...) without a colon and null_fn_signatures=0. Therefore rustdoc signature enrichment was removed entirely, matching the earlier visibility fix; no fallback or length-based signature UPDATE remains. The known e2e/clippy baseline issues remain unrelated.', NULL);
 INSERT INTO evidence (id, record_id, kind, title, uri, content, metadata) VALUES ('RFC-0002-EV-001', 'RFC-0002', 'experiment', 'LSP fidelity spike vs rustdoc JSON (2026-08-21)', NULL, 'Feasibility spike for RFC-0002 alternative (c) -- replacing rustdoc JSON with
 the LSP client -- run 2026-08-21 against this repo''s own graphlite crate.
 
@@ -205,6 +206,7 @@ independent of this whole question. The real remaining risk for (c) is
 readiness/reliability at bulk-enrichment scale (point 1 and 5), not signal
 fidelity (points 2-4).', NULL);
 
+INSERT INTO code_reference (record_id, relation, path, symbol, line_start, line_end) VALUES ('EDR-0001', 'constrains', 'src/rustdoc_enricher.rs', 'compute_crate_enrichment', 190, 198);
 INSERT INTO code_reference (record_id, relation, path, symbol, line_start, line_end) VALUES ('EDR-0001', 'constrains', 'src/rustdoc_enricher.rs', 'extract_rustdoc_signature', 600, 614);
 INSERT INTO code_reference (record_id, relation, path, symbol, line_start, line_end) VALUES ('RFC-0002', 'constrains', 'src/parser.rs', 'extract_visibility', 184, 198);
 INSERT INTO code_reference (record_id, relation, path, symbol, line_start, line_end) VALUES ('RFC-0002', 'constrains', 'src/rustdoc_enricher.rs', 'apply_json', 351, 354);
