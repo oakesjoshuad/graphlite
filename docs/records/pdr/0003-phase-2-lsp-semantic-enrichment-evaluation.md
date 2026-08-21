@@ -10,6 +10,8 @@ tags: []
 relationships:
   derived-from:
     - "PDR-0002"
+  produces:
+    - "EDR-0003"
 ---
 
 # PDR-0003: Phase 2 LSP semantic-enrichment evaluation
