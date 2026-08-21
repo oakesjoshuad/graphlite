@@ -234,14 +234,14 @@ def graph_symbols(db: Path, root: Path) -> dict[tuple[str, int], set[str]]:
     return result
 
 
-def graph_qualified_names(db: Path, root: Path) -> dict[tuple[str, int], set[str]]:
+def graph_qualified_names(db: Path, root: Path) -> dict[str, list[tuple[int, int, str, str]]]:
     if not db.exists():
         return {}
-    result: dict[tuple[str, int], set[str]] = {}
+    result: dict[str, list[tuple[int, int, str]]] = {}
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        for name, file, line, kind in conn.execute(
-            "SELECT qualified_name, file, range_start, kind FROM nodes "
+        for qualified_name, file, start, end, kind, name in conn.execute(
+            "SELECT qualified_name, file, range_start, range_end, kind, name FROM nodes "
             "WHERE qualified_name IS NOT NULL AND qualified_name != ''"
         ):
             if kind == "crate":
@@ -249,11 +249,26 @@ def graph_qualified_names(db: Path, root: Path) -> dict[tuple[str, int], set[str
             path = Path(file)
             if not path.is_absolute():
                 path = (root / path).resolve()
-            key = (str(path), int(line))
-            result.setdefault(key, set()).add(name)
+            result.setdefault(str(path), []).append(
+                (int(start), int(end), name, qualified_name)
+            )
     finally:
         conn.close()
     return result
+
+
+def qualified_names_at(
+    qualified_truth: dict[str, list[tuple[int, int, str, str]]],
+    path: Path,
+    line: int,
+    symbol_name: str,
+) -> set[str]:
+    """Return graph names matched by an LSP symbol's range or leaf name."""
+    return {
+        qualified_name
+        for start, end, name, qualified_name in qualified_truth.get(str(path.resolve()), [])
+        if (start <= line <= end) or name == symbol_name
+    }
 
 
 def graph_impl_edges(db: Path) -> set[tuple[str, str]]:
@@ -363,7 +378,12 @@ def normalize_lsp_qualified_name(value: str) -> str:
     parts = []
     for part in value.split("::"):
         match = re.match(r"impl\s+.+?\s+for\s+(.+)$", part)
-        parts.append(match.group(1) if match else part)
+        if match:
+            parts.append(match.group(1))
+        elif part.startswith("impl "):
+            parts.append(part.removeprefix("impl "))
+        else:
+            parts.append(part)
     return "::".join(parts)
 
 
@@ -444,7 +464,7 @@ def run_once(
         symbol_results = []
         selected_files = files[: args.max_files]
         selected_file_keys = {str(path.resolve()) for path in selected_files}
-        observed_qualified_names: dict[tuple[str, int], list[str]] = {}
+        observed_qualified_names: dict[tuple[str, int], list[tuple[str, str]]] = {}
         ground_truth_names = {}
         for (truth_file, _), names in ground_truth.items():
             ground_truth_names.setdefault(truth_file, set()).update(names)
@@ -470,7 +490,7 @@ def run_once(
             )
             for name, line, qualified_name in rows:
                 key = (str(path.resolve()), line)
-                observed_qualified_names.setdefault(key, []).append(qualified_name)
+                observed_qualified_names.setdefault(key, []).append((name, qualified_name))
                 if ground_truth:
                     symbol_results[-1].setdefault("matched", 0)
                     symbol_results[-1].setdefault("name_matched", 0)
@@ -479,7 +499,9 @@ def run_once(
                     if name in ground_truth_names.get(str(path.resolve()), set()):
                         symbol_results[-1]["name_matched"] += 1
                     symbol_results[-1].setdefault("qualified_name_matched", 0)
-                    expected_qnames = qualified_truth.get(key, set())
+                    expected_qnames = qualified_names_at(
+                        qualified_truth, path, line, name
+                    )
                     if qualified_name in expected_qnames:
                         symbol_results[-1]["qualified_name_matched"] += 1
                     symbol_results[-1].setdefault("normalized_qualified_name_matched", 0)
@@ -545,17 +567,18 @@ def run_once(
         )
         indexed_qname_total = 0
         indexed_qname_covered = 0
-        for key, expected_qnames in qualified_truth.items():
-            if key[0] not in selected_file_keys:
+        for truth_file, ranges in qualified_truth.items():
+            if truth_file not in selected_file_keys:
                 continue
-            indexed_qname_total += len(expected_qnames)
-            indexed_qname_covered += sum(
-                any(
+            for start, end, node_name, expected in ranges:
+                indexed_qname_total += 1
+                indexed_qname_covered += any(
                     equivalent_qualified_name(observed, expected)
-                    for observed in observed_qualified_names.get(key, [])
+                    for (observed_file, observed_line), observed_names in observed_qualified_names.items()
+                    if observed_file == truth_file
+                    for observed_name, observed in observed_names
+                    if (start <= observed_line <= end) or observed_name == node_name
                 )
-                for expected in expected_qnames
-            )
         mapped_edges = [
             edge
             for result in implementation_results
@@ -649,7 +672,7 @@ def main() -> int:
         "rust_analyzer": version,
         "files_discovered": len(files),
         "ground_truth_symbols": sum(len(names) for names in ground_truth.values()),
-        "ground_truth_qualified_names": sum(len(names) for names in qualified_truth.values()),
+        "ground_truth_qualified_names": sum(len(ranges) for ranges in qualified_truth.values()),
         "rustdoc_json_impl_edges": sorted(rustdoc_edges),
         "rustdoc_json_impl_edge_count": len(rustdoc_edges),
         "options": vars(args) | {"root": str(root), "db": str(db), "output": str(args.output) if args.output else None},
