@@ -12,9 +12,10 @@ Source files
     ├── tree-sitter (parallel parse) ──► symbols + syntactic CALLS edges
     │                                    source="tree-sitter", confidence=0.8
     │
-    ├── rustdoc JSON (cargo +nightly rustdoc) ──► qualified_name, visibility,
+    ├── rustdoc JSON (cargo +nightly rustdoc) ──► qualified_name,
     │                                              trait_impl + IMPL_TRAIT
     │                                              source="rustdoc"
+    │                                              (visibility is tree-sitter-owned)
     │
     └── use-statement resolver ─────────► CALLS_RESOLVED edges
                                          source="resolver", confidence_tier=high|medium|low
@@ -85,7 +86,7 @@ graphlite capabilities --json
 ```
 
 Notes:
-- `map`, `symbols`, `graph`, `blast-radius`, and `context` support `--md` where available.
+- `map`, `symbols`, `deps`, and `resolve` support `--md`; `graph`, `blast-radius`, and `context` do not (XML only).
 - `trace-path --direction` accepts `outgoing|incoming|both` plus aliases `write|read`.
 - `graph`, `blast-radius`, and `context` support deterministic output windows via `--budget-lines`, `--budget-tokens`, and `--offset`; truncated output includes `next_offset` for exact resume.
 - `--compact` on `graph`/`blast-radius`/`context` defers heavy payloads (docs/snippets/annotations) for lower-token passes.
@@ -96,8 +97,7 @@ Notes:
 - `check` and `audit` remain available for on-demand refreshes between discovers.
 - `policy init-pack` sets `[policy].pack` in `.graphlite/config.toml`; custom rules in `[[violations]]`, `[[exceptions]]`, `[[visibility_rules]]`, and `[workspace]` still apply as local overrides.
 - `policy lint --stale` reports unused suppression rules; `--fail-on-stale` / `--fail-on-broad` support CI gating.
-- `rename` is no longer implemented in CLI; use your editor LSP rename.
-- `.graphlite/config.toml` may still contain `lsp = [...]` for backward compatibility, but this field is ignored and emits a deprecation warning when non-empty.
+- `rename` performs semantic rename via rust-analyzer, routed through a running `graphlite watch` daemon (`graphlite watch .` first, then `graphlite rename sym:X new_name`, then `graphlite diff-rename` to preview and `graphlite apply-edits` to apply).
 
 ---
 
@@ -117,7 +117,6 @@ If you already maintain custom policy blocks in `.graphlite/config.toml`, migrat
 
 ```toml
 ignore = []
-# lsp = ["rust"]  # deprecated, ignored
 depth = 2
 ```
 
