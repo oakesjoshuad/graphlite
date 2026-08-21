@@ -2,8 +2,8 @@
 id: "PDR-0002"
 title: "Rust enrichment redesign: parallel rustdoc, typed parsing, phased LSP evaluation"
 record-type: pdr
-status: draft
-revision: 1
+status: approved
+revision: 3
 date: 2026-08-21
 slug: rust-enrichment-redesign-parallel-rustdoc-typed-parsing-phased-l
 tags: []
