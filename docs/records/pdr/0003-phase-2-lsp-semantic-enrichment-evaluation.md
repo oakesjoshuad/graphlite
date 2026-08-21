@@ -2,8 +2,8 @@
 id: "PDR-0003"
 title: "Phase 2 LSP semantic-enrichment evaluation"
 record-type: pdr
-status: review
-revision: 2
+status: approved
+revision: 3
 date: 2026-08-21
 slug: phase-2-lsp-semantic-enrichment-evaluation
 tags: []

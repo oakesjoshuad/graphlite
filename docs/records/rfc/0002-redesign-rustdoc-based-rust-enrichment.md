@@ -2,8 +2,8 @@
 id: "RFC-0002"
 title: "Redesign rustdoc-based Rust enrichment"
 record-type: rfc
-status: draft
-revision: 2
+status: accepted
+revision: 6
 date: 2026-08-21
 slug: redesign-rustdoc-based-rust-enrichment
 tags: []

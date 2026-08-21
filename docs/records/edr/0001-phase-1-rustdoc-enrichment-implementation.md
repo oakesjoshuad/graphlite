@@ -2,8 +2,8 @@
 id: "EDR-0001"
 title: "Phase 1 rustdoc enrichment implementation"
 record-type: edr
-status: draft
-revision: 1
+status: accepted
+revision: 3
 date: 2026-08-21
 slug: phase-1-rustdoc-enrichment-implementation
 tags: []
