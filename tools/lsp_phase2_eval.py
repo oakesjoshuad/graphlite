@@ -271,6 +271,39 @@ def graph_impl_edges(db: Path) -> set[tuple[str, str]]:
         conn.close()
 
 
+def rustdoc_impl_edges(json_dir: Path) -> set[tuple[str, str]]:
+    """Extract local and cross-crate impl pairs from typed rustdoc JSON data."""
+    if not json_dir.exists():
+        return set()
+    edges = set()
+    for path in sorted(json_dir.glob("*.json")):
+        try:
+            document = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        paths = document.get("paths", {})
+
+        def path_name(item_id) -> str | None:
+            entry = paths.get(str(item_id))
+            if not entry or not entry.get("path"):
+                return None
+            return "::".join(entry["path"][1:])
+
+        for item in document.get("index", {}).values():
+            impl = item.get("inner", {}).get("impl")
+            if not impl or item.get("crate_id") != 0 or impl.get("is_synthetic"):
+                continue
+            trait = impl.get("trait")
+            target = impl.get("for", {}).get("resolved_path")
+            if not trait or not target:
+                continue
+            type_name = path_name(target.get("id"))
+            trait_name = path_name(trait.get("id"))
+            if type_name and trait_name:
+                edges.add((type_name, trait_name))
+    return edges
+
+
 def graph_impl_type_at(db: Path, root: Path, file: str, line: int) -> str | None:
     if not db.exists():
         return None
@@ -560,6 +593,7 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--server", default="rust-analyzer")
     parser.add_argument("--db", type=Path, default=None)
+    parser.add_argument("--rustdoc-json-dir", type=Path, default=None)
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--max-files", type=int, default=100)
     parser.add_argument("--max-impl-probes", type=int, default=20)
@@ -573,6 +607,9 @@ def main() -> int:
     ground_truth = graph_symbols(db, root)
     qualified_truth = graph_qualified_names(db, root)
     impl_edges = graph_impl_edges(db)
+    rustdoc_edges = rustdoc_impl_edges(
+        (args.rustdoc_json_dir or root / ".graphlite" / "rustdoc-json" / "doc").resolve()
+    )
     runs = [
         run_once(root, db, args, files, ground_truth, qualified_truth, impl_edges)
         for _ in range(max(1, args.runs))
@@ -589,6 +626,8 @@ def main() -> int:
         "files_discovered": len(files),
         "ground_truth_symbols": sum(len(names) for names in ground_truth.values()),
         "ground_truth_qualified_names": sum(len(names) for names in qualified_truth.values()),
+        "rustdoc_json_impl_edges": sorted(rustdoc_edges),
+        "rustdoc_json_impl_edge_count": len(rustdoc_edges),
         "options": vars(args) | {"root": str(root), "db": str(db), "output": str(args.output) if args.output else None},
         "runs": runs,
     }
