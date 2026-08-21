@@ -321,7 +321,7 @@ pub fn deps(md: bool, modules: bool) -> Result<()> {
             let fi_s = fi.to_string();
             let doc_first = doc.as_deref().and_then(|d| d.lines().next()).unwrap_or("");
             let mods = if modules { crate_modules.get(name.as_str()) } else { None };
-            if mods.map_or(true, |v| v.is_empty()) {
+            if mods.is_none_or(|v| v.is_empty()) {
                 if doc_first.is_empty() {
                     vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s)])?;
                 } else {

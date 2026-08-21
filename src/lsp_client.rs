@@ -208,16 +208,13 @@ impl LspClient {
 
         let reader_thread = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
-            loop {
-                match read_msg(&mut reader) {
-                    Ok(msg) => {
-                        if msg.get("id").is_some() {
-                            if response_tx.send(msg).is_err() { break; }
-                        } else {
-                            if notif_tx.send(msg).is_err() { break; }
-                        }
+            while let Ok(msg) = read_msg(&mut reader) {
+                if msg.get("id").is_some() {
+                    if response_tx.send(msg).is_err() {
+                        break;
                     }
-                    Err(_) => break,
+                } else if notif_tx.send(msg).is_err() {
+                    break;
                 }
             }
         });

@@ -70,8 +70,7 @@ pub fn run(root: &str) -> Result<()> {
 // ── Config file generation ────────────────────────────────────────────────────
 
 fn build_default_config() -> String {
-    format!(
-        r#"# graphlite configuration
+    r#"# graphlite configuration
 
 # Additional directories to ignore during indexing.
 # Extends built-in defaults: node_modules, target, build, dist, .svelte-kit, .git, .cache, .next, .nuxt, __pycache__
@@ -105,8 +104,7 @@ depth = 2
 # layer = "domain"
 # max_visibility = "crate"
 # reason = "domain symbols should stay crate-internal"
-"#
-    )
+"#.to_string()
 }
 
 fn build_workspace_config(ws: &workspace::WorkspaceGraph) -> String {

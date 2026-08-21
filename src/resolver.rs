@@ -252,11 +252,10 @@ fn collect_bindings(
                 }
             }
         }
-        "use_wildcard" => {
-            if !prefix.is_empty() {
+        "use_wildcard"
+            if !prefix.is_empty() => {
                 wildcards.insert(normalize_path(prefix, module_prefix));
             }
-        }
         _ => {}
     }
 }

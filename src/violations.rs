@@ -445,7 +445,7 @@ pub fn run(params: &Params) -> Result<()> {
     }
 
     // Sort by callee fan_in descending (most-depended-on callees first).
-    violations.sort_unstable_by(|a, b| b.to_fan_in.cmp(&a.to_fan_in));
+    violations.sort_unstable_by_key(|v| std::cmp::Reverse(v.to_fan_in));
 
     let total = violations.len();
     let mut visibility_violations = check_visibility_violations(
@@ -471,7 +471,7 @@ pub fn run(params: &Params) -> Result<()> {
             true
         }
     });
-    visibility_violations.sort_by(|a, b| b.line.cmp(&a.line));
+    visibility_violations.sort_by_key(|v| std::cmp::Reverse(v.line));
     let visibility_total = visibility_violations.len();
     let suppressed_total: usize = suppressed_counts.values().sum();
 
