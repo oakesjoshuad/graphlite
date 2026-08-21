@@ -254,6 +254,22 @@ def graph_qualified_names(db: Path, root: Path) -> dict[tuple[str, int], set[str
     return result
 
 
+def normalize_lsp_qualified_name(value: str) -> str:
+    """Remove LSP-only impl-container labels before parity comparison."""
+    parts = []
+    for part in value.split("::"):
+        match = re.match(r"impl\s+.+?\s+for\s+(.+)$", part)
+        parts.append(match.group(1) if match else part)
+    return "::".join(parts)
+
+
+def equivalent_qualified_name(actual: str, expected: str) -> bool:
+    actual = normalize_lsp_qualified_name(actual)
+    return actual == expected or actual.endswith(f"::{expected}") or expected.endswith(
+        f"::{actual}"
+    )
+
+
 def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth) -> dict:
     started = time.monotonic()
     rpc = None
@@ -324,9 +340,6 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
         ground_truth_names = {}
         for (truth_file, _), names in ground_truth.items():
             ground_truth_names.setdefault(truth_file, set()).update(names)
-        ground_truth_qualified = {}
-        for (truth_file, _), names in qualified_truth.items():
-            ground_truth_qualified.setdefault(truth_file, set()).update(names)
         for path in selected_files:
             text = path.read_text(errors="replace")
             open_document(rpc, path, text)
@@ -357,8 +370,15 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
                     if name in ground_truth_names.get(str(path.resolve()), set()):
                         symbol_results[-1]["name_matched"] += 1
                     symbol_results[-1].setdefault("qualified_name_matched", 0)
-                    if qualified_name in ground_truth_qualified.get(str(path.resolve()), set()):
+                    expected_qnames = qualified_truth.get(key, set())
+                    if qualified_name in expected_qnames:
                         symbol_results[-1]["qualified_name_matched"] += 1
+                    symbol_results[-1].setdefault("normalized_qualified_name_matched", 0)
+                    if any(
+                        equivalent_qualified_name(qualified_name, expected)
+                        for expected in expected_qnames
+                    ):
+                        symbol_results[-1]["normalized_qualified_name_matched"] += 1
 
         implementation_results = []
         for path, line, character, name in trait_probes(files, args.max_impl_probes):
@@ -399,6 +419,9 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
         qualified_name_matched = sum(
             row.get("qualified_name_matched", 0) for row in symbol_results
         )
+        normalized_qualified_name_matched = sum(
+            row.get("normalized_qualified_name_matched", 0) for row in symbol_results
+        )
         return {
             "ok": True,
             "elapsed_s": round(time.monotonic() - started, 3),
@@ -416,6 +439,9 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
                 "ground_truth_name_matches": name_matched if ground_truth else None,
                 "ground_truth_qualified_name_matches": (
                     qualified_name_matched if qualified_truth else None
+                ),
+                "ground_truth_normalized_qualified_name_matches": (
+                    normalized_qualified_name_matched if qualified_truth else None
                 ),
                 "files": symbol_results,
             },
