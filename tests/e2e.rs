@@ -333,6 +333,100 @@ b = "domain"
 }
 
 #[test]
+fn workspace_discover_emits_cross_crate_impl_trait_edge() {
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    let td = tempdir().unwrap();
+    let p = td.path();
+    std::fs::write(
+        p.join("Cargo.toml"),
+        r#"[workspace]
+members = ["app", "traits"]
+resolver = "2"
+"#,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(p.join("traits/src")).unwrap();
+    std::fs::write(
+        p.join("traits/Cargo.toml"),
+        r#"[package]
+name = "traits"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("traits/src/lib.rs"),
+        "pub trait Render { fn render(&self) -> String; }\n",
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(p.join("app/src")).unwrap();
+    std::fs::write(
+        p.join("app/Cargo.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+traits = { path = "../traits" }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("app/src/lib.rs"),
+        "struct AppType;\nimpl traits::Render for AppType { fn render(&self) -> String { \"app\".into() } }\n",
+    )
+    .unwrap();
+
+    let init = Command::new(bin())
+        .args(["init", "."])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "init should succeed in workspace");
+
+    std::fs::write(
+        p.join(".graphlite/config.toml"),
+        r#"depth = 1
+
+[workspace.layers]
+app = "composition"
+traits = "domain"
+"#,
+    )
+    .unwrap();
+
+    let discover = Command::new(bin())
+        .args(["discover", "."])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(
+        discover.status.success(),
+        "discover should succeed: {}",
+        String::from_utf8_lossy(&discover.stderr)
+    );
+
+    let conn = Connection::open(p.join(".graphlite/codegraph.db")).unwrap();
+    let edge: Option<(String, String)> = conn
+        .query_row(
+            "SELECT n1.name, n2.name FROM edges e JOIN nodes n1 ON n1.id = e.from_id JOIN nodes n2 ON n2.id = e.to_id WHERE e.edge_type = 'IMPL_TRAIT' AND n1.name = 'AppType' AND n2.name = 'Render'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    assert_eq!(
+        edge,
+        Some(("AppType".to_string(), "Render".to_string()))
+    );
+}
+
+#[test]
 fn workspace_violations_include_crate_level_output() {
     use tempfile::tempdir;
 

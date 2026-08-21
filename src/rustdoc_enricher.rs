@@ -66,7 +66,7 @@ pub fn enrich(root: &str, changed_files: &[PathBuf], conn: &Connection) -> Resul
             count = crates.len(),
             "rustdoc: enriching all crates (no affected filter matched)"
         );
-        return enrich_crates(root, &crates.iter().collect::<Vec<_>>(), conn, &abs_root);
+        return enrich_crates(root, &crates.iter().collect::<Vec<_>>(), &crates, conn, &abs_root);
     }
 
     info!(
@@ -74,7 +74,7 @@ pub fn enrich(root: &str, changed_files: &[PathBuf], conn: &Connection) -> Resul
         crates = %affected.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "),
         "rustdoc: enriching affected crates"
     );
-    enrich_crates(root, &affected, conn, &abs_root)
+    enrich_crates(root, &affected, &crates, conn, &abs_root)
 }
 
 // ── Crate discovery ─────────────────────────────────────────────────────────
@@ -145,19 +145,36 @@ fn discover_crates(root: &str) -> Result<Vec<CrateInfo>> {
 fn enrich_crates(
     root: &str,
     crates: &[&CrateInfo],
+    workspace_crates: &[CrateInfo],
     conn: &Connection,
     abs_root: &Path,
 ) -> Result<usize> {
     // This snapshot is deliberately taken before any rustdoc work. The compute
     // stage only reads it; all writes are committed below on this connection.
     let node_map = Arc::new(build_node_map(conn, abs_root)?);
-    let results: Vec<(&CrateInfo, Result<CrateEnrichment>)> = crates
+    let qualified_node_map = build_qualified_node_map(conn, workspace_crates, abs_root)?;
+    let mut results: Vec<(&CrateInfo, Result<CrateEnrichment>)> = crates
         .par_iter()
         .map(|ci| {
             let result = compute_crate_enrichment(root, ci, abs_root, &node_map);
             (*ci, result)
         })
         .collect();
+
+    // Cross-crate trait IDs are represented in rustdoc's `paths` table rather
+    // than the current crate's `index`. Resolve them only after every crate's
+    // pure parse stage has completed, using the single upfront graph snapshot.
+    for (_, result) in &mut results {
+        if let Ok(enrichment) = result {
+            enrichment.impl_trait_edges = collect_impl_trait_edges(
+                &enrichment.doc,
+                &node_map,
+                abs_root,
+                &enrichment.crate_abs_dir,
+                &qualified_node_map,
+            );
+        }
+    }
 
     let tx = conn.unchecked_transaction()?;
     let mut total = 0;
@@ -177,6 +194,8 @@ fn enrich_crates(
 }
 
 struct CrateEnrichment {
+    doc: Crate,
+    crate_abs_dir: PathBuf,
     node_updates: Vec<NodeUpdate>,
     impl_trait_edges: Vec<(i64, i64)>,
 }
@@ -356,10 +375,11 @@ fn parse_crate_enrichment(
         });
     }
 
-    let impl_trait_edges = collect_impl_trait_edges(&doc, node_map, abs_root, crate_abs_dir);
     Ok(CrateEnrichment {
+        doc,
+        crate_abs_dir: crate_abs_dir.to_path_buf(),
         node_updates,
-        impl_trait_edges,
+        impl_trait_edges: Vec::new(),
     })
 }
 
@@ -410,6 +430,45 @@ fn build_node_map(conn: &Connection, abs_root: &Path) -> Result<HashMap<(String,
         for key in node_file_match_keys(abs_root, &file) {
             map.entry((key, rs)).or_insert(id);
         }
+    }
+    Ok(map)
+}
+
+fn build_qualified_node_map(
+    conn: &Connection,
+    crates: &[CrateInfo],
+    abs_root: &Path,
+) -> Result<HashMap<(String, String), Vec<i64>>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, qualified_name, file FROM nodes WHERE qualified_name IS NOT NULL AND qualified_name != ''",
+    )?;
+    let mut map: HashMap<(String, String), Vec<i64>> = HashMap::new();
+    for row in stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (id, qualified_name, file) = match row {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let file_path = Path::new(&file);
+        let absolute_file = if file_path.is_absolute() {
+            file_path.to_path_buf()
+        } else {
+            abs_root.join(file_path.strip_prefix("./").unwrap_or(file_path))
+        };
+        let Some(crate_info) = crates
+            .iter()
+            .find(|ci| absolute_file.starts_with(&ci.abs_dir))
+        else {
+            continue;
+        };
+        map.entry((crate_info.name.replace('-', "_"), qualified_name))
+            .or_default()
+            .push(id);
     }
     Ok(map)
 }
@@ -547,6 +606,7 @@ fn collect_impl_trait_edges(
     node_map: &HashMap<(String, i64), i64>,
     abs_root: &Path,
     crate_abs_dir: &Path,
+    qualified_node_map: &HashMap<(String, String), Vec<i64>>,
 ) -> Vec<(i64, i64)> {
     let item_nodes: HashMap<Id, i64> = doc
         .index
@@ -578,10 +638,26 @@ fn collect_impl_trait_edges(
             };
             Some((
                 item_nodes.get(&type_id).copied()?,
-                item_nodes.get(&trait_id).copied()?,
+                resolve_rustdoc_node_id(doc, trait_id, &item_nodes, qualified_node_map)?,
             ))
         })
         .collect()
+}
+
+fn resolve_rustdoc_node_id(
+    doc: &Crate,
+    item_id: Id,
+    item_nodes: &HashMap<Id, i64>,
+    qualified_node_map: &HashMap<(String, String), Vec<i64>>,
+) -> Option<i64> {
+    if let Some(node_id) = item_nodes.get(&item_id) {
+        return Some(*node_id);
+    }
+    let path = doc.paths.get(&item_id)?;
+    let crate_name = path.path.first()?.replace('-', "_");
+    let qualified_name = path.path.get(1..)?.join("::");
+    let node_ids = qualified_node_map.get(&(crate_name, qualified_name))?;
+    (node_ids.len() == 1).then_some(node_ids[0])
 }
 
 #[cfg(test)]
