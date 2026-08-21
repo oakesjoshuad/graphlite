@@ -254,6 +254,75 @@ def graph_qualified_names(db: Path, root: Path) -> dict[tuple[str, int], set[str
     return result
 
 
+def graph_impl_edges(db: Path) -> set[tuple[str, str]]:
+    if not db.exists():
+        return set()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return set(
+            conn.execute(
+                "SELECT n1.qualified_name, n2.qualified_name "
+                "FROM edges e JOIN nodes n1 ON n1.id = e.from_id "
+                "JOIN nodes n2 ON n2.id = e.to_id "
+                "WHERE e.edge_type = 'IMPL_TRAIT'"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+
+def graph_impl_type_at(db: Path, root: Path, file: str, line: int) -> str | None:
+    if not db.exists():
+        return None
+    path = Path(file)
+    if not path.is_absolute():
+        path = (root / path).resolve()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT qualified_name FROM nodes "
+            "WHERE kind = 'impl' AND range_start <= ? AND range_end >= ? "
+            "AND (file = ? OR file = ? OR file = ?) "
+            "ORDER BY (range_end - range_start), id LIMIT 1",
+            (line, line, str(path), f"./{path.relative_to(root)}", str(path.relative_to(root))),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def graph_symbol_at(db: Path, root: Path, file: Path, line: int, name: str) -> str | None:
+    if not db.exists():
+        return None
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT qualified_name FROM nodes WHERE name = ? AND range_start = ? "
+            "AND (file = ? OR file = ? OR file = ?)",
+            (
+                name,
+                line,
+                str(file.resolve()),
+                f"./{file.resolve().relative_to(root)}",
+                str(file.resolve().relative_to(root)),
+            ),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def source_impl_type(file: Path, line: int) -> str | None:
+    try:
+        source = file.read_text(errors="replace").splitlines()[line - 1]
+    except (OSError, IndexError):
+        return None
+    match = re.search(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*(?:<[^>{}]+>)?)\s*\{", source)
+    if not match:
+        return None
+    return re.sub(r"<.*>$", "", match.group(1))
+
+
 def normalize_lsp_qualified_name(value: str) -> str:
     """Remove LSP-only impl-container labels before parity comparison."""
     parts = []
@@ -270,7 +339,9 @@ def equivalent_qualified_name(actual: str, expected: str) -> bool:
     )
 
 
-def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth) -> dict:
+def run_once(
+    root: Path, db: Path, args, files: list[Path], ground_truth, qualified_truth, impl_edges
+) -> dict:
     started = time.monotonic()
     rpc = None
     statuses = []
@@ -403,6 +474,16 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
                             "character": range_start.get("character", 0),
                         }
                     )
+            trait_qname = graph_symbol_at(db, root, path, line, name)
+            mapped_edges = []
+            for location in locations:
+                impl_qname = graph_impl_type_at(
+                    db, root, Path(location["uri"][7:]), location["line"]
+                )
+                if impl_qname is None:
+                    impl_qname = source_impl_type(Path(location["uri"][7:]), location["line"])
+                if impl_qname and trait_qname:
+                    mapped_edges.append((impl_qname, trait_qname))
             implementation_results.append(
                 {
                     "trait": name,
@@ -410,6 +491,8 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
                     "line": line,
                     "result_count": len(value) if isinstance(value, list) else (0 if value is None else 1),
                     "locations": locations,
+                    "mapped_edges": mapped_edges,
+                    "graph_edge_matches": sum(edge in impl_edges for edge in mapped_edges),
                 }
             )
 
@@ -422,6 +505,13 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
         normalized_qualified_name_matched = sum(
             row.get("normalized_qualified_name_matched", 0) for row in symbol_results
         )
+        mapped_edges = [
+            edge
+            for result in implementation_results
+            for edge in result.get("mapped_edges", [])
+        ]
+        graph_edge_matches = sum(edge in impl_edges for edge in mapped_edges)
+        mapped_edge_set = set(mapped_edges)
         return {
             "ok": True,
             "elapsed_s": round(time.monotonic() - started, 3),
@@ -445,7 +535,12 @@ def run_once(root: Path, args, files: list[Path], ground_truth, qualified_truth)
                 ),
                 "files": symbol_results,
             },
-            "implementation_probes": implementation_results,
+                "implementation_probes": implementation_results,
+                "mapped_impl_edges": mapped_edges,
+                "mapped_impl_edge_matches": graph_edge_matches,
+                "graph_impl_edge_count": len(impl_edges) if impl_edges else None,
+                "lsp_edges_missing_from_graph": sorted(mapped_edge_set - impl_edges),
+                "graph_edges_missing_from_lsp": sorted(impl_edges - mapped_edge_set),
         }
     except (LspError, TimeoutError, OSError, UnicodeError) as exc:
         return {
@@ -477,8 +572,9 @@ def main() -> int:
     db = (args.db or root / ".graphlite" / "codegraph.db").resolve()
     ground_truth = graph_symbols(db, root)
     qualified_truth = graph_qualified_names(db, root)
+    impl_edges = graph_impl_edges(db)
     runs = [
-        run_once(root, args, files, ground_truth, qualified_truth)
+        run_once(root, db, args, files, ground_truth, qualified_truth, impl_edges)
         for _ in range(max(1, args.runs))
     ]
     try:
