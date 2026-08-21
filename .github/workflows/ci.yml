@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [development, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install nightly toolchain
+        # rustdoc_enricher.rs shells out to `cargo +nightly rustdoc` for Rust
+        # semantic enrichment (qualified names, trait impls). Kept separate
+        # from the default stable toolchain above so `cargo build`/`clippy`
+        # still run on stable.
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+
+      - name: Bootstrap .graphlite workspace config
+        # .graphlite/config.toml is intentionally untracked in this repo (see
+        # git history: "chore: untrack .graphlite/config.toml"), and graphlite
+        # itself requires an explicit workspace-layer assignment before it
+        # will index (see src/init_cmd.rs). tests/e2e.rs's ensure_db() runs
+        # `graphlite init .` against this repo's own real tree -- not an
+        # isolated fixture -- so CI has to provision this file itself before
+        # the test binary's own init call runs, the same way a human
+        # developer would after a fresh clone.
+        run: |
+          mkdir -p .graphlite
+          cat > .graphlite/config.toml <<'CONFIG'
+          ignore = []
+          depth = 2
+
+          [workspace.layers]
+          graphlite = "composition"
+          CONFIG
+
+      - name: E2E tests
+        run: cargo test --release --test e2e

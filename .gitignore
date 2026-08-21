@@ -28,6 +28,7 @@ codegraph.db
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .graphlite/codegraph.db
+.graphlite/config.toml
 .graphlite/rustdoc-json/
 edits.json
 graph.xml
