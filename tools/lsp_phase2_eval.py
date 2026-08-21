@@ -240,10 +240,12 @@ def graph_qualified_names(db: Path, root: Path) -> dict[tuple[str, int], set[str
     result: dict[tuple[str, int], set[str]] = {}
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        for name, file, line in conn.execute(
-            "SELECT qualified_name, file, range_start FROM nodes "
+        for name, file, line, kind in conn.execute(
+            "SELECT qualified_name, file, range_start, kind FROM nodes "
             "WHERE qualified_name IS NOT NULL AND qualified_name != ''"
         ):
+            if kind == "crate":
+                continue
             path = Path(file)
             if not path.is_absolute():
                 path = (root / path).resolve()
@@ -441,6 +443,8 @@ def run_once(
 
         symbol_results = []
         selected_files = files[: args.max_files]
+        selected_file_keys = {str(path.resolve()) for path in selected_files}
+        observed_qualified_names: dict[tuple[str, int], list[str]] = {}
         ground_truth_names = {}
         for (truth_file, _), names in ground_truth.items():
             ground_truth_names.setdefault(truth_file, set()).update(names)
@@ -466,6 +470,7 @@ def run_once(
             )
             for name, line, qualified_name in rows:
                 key = (str(path.resolve()), line)
+                observed_qualified_names.setdefault(key, []).append(qualified_name)
                 if ground_truth:
                     symbol_results[-1].setdefault("matched", 0)
                     symbol_results[-1].setdefault("name_matched", 0)
@@ -538,6 +543,19 @@ def run_once(
         normalized_qualified_name_matched = sum(
             row.get("normalized_qualified_name_matched", 0) for row in symbol_results
         )
+        indexed_qname_total = 0
+        indexed_qname_covered = 0
+        for key, expected_qnames in qualified_truth.items():
+            if key[0] not in selected_file_keys:
+                continue
+            indexed_qname_total += len(expected_qnames)
+            indexed_qname_covered += sum(
+                any(
+                    equivalent_qualified_name(observed, expected)
+                    for observed in observed_qualified_names.get(key, [])
+                )
+                for expected in expected_qnames
+            )
         mapped_edges = [
             edge
             for result in implementation_results
@@ -565,6 +583,12 @@ def run_once(
                 ),
                 "ground_truth_normalized_qualified_name_matches": (
                     normalized_qualified_name_matched if qualified_truth else None
+                ),
+                "graph_indexed_qualified_name_total": (
+                    indexed_qname_total if qualified_truth else None
+                ),
+                "graph_indexed_qualified_name_covered": (
+                    indexed_qname_covered if qualified_truth else None
                 ),
                 "files": symbol_results,
             },
