@@ -199,6 +199,8 @@ def symbol_rows(result) -> list[tuple[str, int]]:
 
 
 def trait_probes(files: list[Path], limit: int) -> list[tuple[Path, int, int, str]]:
+    if limit <= 0:
+        return []
     probes = []
     pattern = re.compile(
         r"^\s*(?:(?:pub)(?:\([^)]*\))?\s+)?(?:unsafe\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)"
@@ -271,7 +273,11 @@ def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
                     "elapsed_s": round(time.monotonic() - started, 3),
                 }
                 statuses.append(status)
-                if params.get("quiescent") and ready_at is None:
+                if params.get("health") not in (None, "ok"):
+                    raise LspError(
+                        f"rust-analyzer reported unhealthy status: {params.get('health')}"
+                    )
+                if params.get("health") == "ok" and params.get("quiescent") and ready_at is None:
                     ready_at = time.monotonic()
                     break
             elif message.get("method") == "$/progress":
@@ -285,6 +291,11 @@ def run_once(root: Path, args, files: list[Path], ground_truth) -> dict:
                 rpc.reply(message, [] if message["method"] == "workspace/configuration" else None)
             elif message.get("method"):
                 rpc.notifications.append(message)
+
+        if ready_at is None:
+            raise LspError(
+                f"readiness timeout after {args.readiness_timeout:.3f}s without healthy quiescence"
+            )
 
         symbol_results = []
         selected_files = files[: args.max_files]
