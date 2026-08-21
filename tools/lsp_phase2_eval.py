@@ -675,7 +675,11 @@ def main() -> int:
         "ground_truth_qualified_names": sum(len(ranges) for ranges in qualified_truth.values()),
         "rustdoc_json_impl_edges": sorted(rustdoc_edges),
         "rustdoc_json_impl_edge_count": len(rustdoc_edges),
-        "options": vars(args) | {"root": str(root), "db": str(db), "output": str(args.output) if args.output else None},
+        "options": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        }
+        | {"root": str(root), "db": str(db), "output": str(args.output) if args.output else None},
         "runs": runs,
     }
     encoded = json.dumps(report, indent=2) + "\n"
