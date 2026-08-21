@@ -2,14 +2,18 @@
 id: "EDR-0002"
 title: "Cross-crate rustdoc path resolution for IMPL_TRAIT edges"
 record-type: edr
-status: proposed
-revision: 2
+status: accepted
+revision: 3
 date: 2026-08-21
 slug: cross-crate-rustdoc-path-resolution-for-impl-trait-edges
 tags: []
 relationships:
   derived-from:
     - "PDR-0002"
+    - "PDR-0003"
+  implements:
+    - "PDR-0002"
+  relates-to:
     - "PDR-0003"
 ---
 

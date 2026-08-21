@@ -10,6 +10,10 @@ tags: []
 relationships:
   derived-from:
     - "RFC-0002"
+  implemented-by:
+    - "EDR-0002"
+  produces:
+    - "EDR-0002"
 ---
 
 # PDR-0002: Rust enrichment redesign: parallel rustdoc, typed parsing, phased LSP evaluation
