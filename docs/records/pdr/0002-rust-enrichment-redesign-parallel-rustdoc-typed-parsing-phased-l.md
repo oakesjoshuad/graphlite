@@ -3,7 +3,7 @@ id: "PDR-0002"
 title: "Rust enrichment redesign: parallel rustdoc, typed parsing, phased LSP evaluation"
 record-type: pdr
 status: approved
-revision: 3
+revision: 4
 date: 2026-08-21
 slug: rust-enrichment-redesign-parallel-rustdoc-typed-parsing-phased-l
 tags: []
@@ -78,7 +78,7 @@ Phase 1's split of run_and_apply into pure-compute and serial-apply stages is a 
 
 ## Open Questions
 
-1. Cargo target-dir locking behavior under concurrent rustdoc invocations -- unresolved, needs experiment (see `experiments`) before Phase 1 lands. 2. Whether rustdoc-types' supported format_version range covers this project's pinned nightly toolchain's actual output -- needs verification before adoption. 3. The quiescent-signal reliability gap from RFC-0002-EV-001 -- needs investigation before Phase 2 can be considered at all. 4. Whether to retain rustdoc's finer-grained restricted::path visibility form as a secondary enrichment once tree-sitter's raw modifier text becomes the primary source, or drop rustdoc from the visibility signal entirely.
+ALL RESOLVED as of implementation (c1e5b96, 9e6dd67) and Phase 2 evaluation (PDR-0003/EDR-0003): 1. Cargo target-dir locking under concurrent rustdoc invocations -- confirmed serialized by cargo's own build lock (EDR-0001 evidence: alpha 0.67s, beta 1.15s blocked on the lock); Phase 1 switched to per-crate target dirs to get real parallelism, trading away shared compiled-dependency reuse. 2. rustdoc-types' format_version coverage -- confirmed rustdoc-types 0.57.x declares FORMAT_VERSION 57, matching this project's pinned nightly. 3. The quiescent-signal reliability gap -- investigated in full by PDR-0003; not solved, but its practical impact was bounded by the eventual decision (EDR-0003) to retain rustdoc as authoritative regardless, deferring further LSP work rather than needing the gap closed. 4. Visibility sourcing -- resolved by dropping rustdoc from the visibility signal entirely (commit 9e6dd67); tree-sitter's raw modifier text is the sole source, per EDR-0001-EV-002.
 
 ## Resulting Decisions
 

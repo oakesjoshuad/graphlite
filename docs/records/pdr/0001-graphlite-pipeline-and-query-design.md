@@ -3,7 +3,7 @@ id: "PDR-0001"
 title: "GraphLite pipeline and query design"
 record-type: pdr
 status: approved
-revision: 3
+revision: 4
 date: 2026-08-21
 slug: graphlite-pipeline-and-query-design
 tags: []
@@ -62,7 +62,7 @@ rustdoc enrichment requires the nightly toolchain and consumes unstable, only-lo
 
 ## Open Questions
 
-Should rustdoc-based enrichment continue to exist as a separate mechanism from the LSP client already present in this codebase, or should one subsume the other -- and does that decision depend on resolving the rename-deprecation inconsistency noted under `alternatives` first? Tracked forward in RFC-0002.
+RESOLVED: Should rustdoc-based enrichment continue to exist as a separate mechanism from the LSP client already present in this codebase, or should one subsume the other -- and does that decision depend on resolving the rename-deprecation inconsistency noted under `alternatives` first? The rename-deprecation inconsistency was resolved (rename is live, not deprecated; README.md's claim otherwise was stale documentation debt). RFC-0002 -> PDR-0002 (parallelized rustdoc, adopted rustdoc-types) and PDR-0003 (evaluation-only LSP investigation) -> EDR-0003 (accepted) settled the substantive question: rustdoc remains the authoritative production mechanism. LSP achieved full measured parity (19/19 qualified names, 4/4 trait edges) in PDR-0003's evaluation but was not adopted, because it measured 6-8x slower and production fallback/complete-inventory semantics were never proven at corpus scale. See EDR-0003 for the full decision record.
 
 ## Resulting Decisions
 
