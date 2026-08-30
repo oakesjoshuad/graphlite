@@ -70,10 +70,7 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
         symbols.retain(|s| seen.insert((s.file.clone(), s.range_start)));
     }
 
-    Ok(ParseResult {
-        symbols,
-        file_doc,
-    })
+    Ok(ParseResult { symbols, file_doc })
 }
 
 // Maps tree-sitter node kind strings to our kind vocabulary.
@@ -88,6 +85,8 @@ fn kind_from_node(node: &Node) -> &'static str {
         "union_item" => "union",
         "trait_item" => "trait",
         "type_item" => "type",
+        "const_item" => "const",
+        "static_item" => "static",
         "impl_item" => "impl",
         "mod_item" => "mod",
         "macro_definition" => "macro",
@@ -509,3 +508,54 @@ fn extract_svelte_script_symbols(
     Ok(all_symbols)
 }
 
+#[cfg(test)]
+mod const_static_tests {
+    use super::parse_file;
+    use std::io::Write;
+
+    fn parse_source(source: &str) -> super::ParseResult {
+        let mut file = tempfile::Builder::new()
+            .suffix(".rs")
+            .tempfile()
+            .expect("temp file");
+        file.write_all(source.as_bytes()).expect("write source");
+        parse_file(file.path()).expect("parse")
+    }
+
+    #[test]
+    fn indexes_top_level_const_with_visibility() {
+        let result =
+            parse_source("pub(crate) const PUBLISH_RENDERER_DEFAULT: &str = \"pandoc {input}\";\n");
+        let symbol = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "PUBLISH_RENDERER_DEFAULT")
+            .expect("const symbol indexed");
+        assert_eq!(symbol.kind, "const");
+        assert_eq!(symbol.visibility, "pub(crate)");
+    }
+
+    #[test]
+    fn indexes_top_level_static() {
+        let result = parse_source("static COUNTER: i32 = 0;\n");
+        let symbol = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "COUNTER")
+            .expect("static symbol indexed");
+        assert_eq!(symbol.kind, "static");
+        assert_eq!(symbol.visibility, "private");
+    }
+
+    #[test]
+    fn indexes_public_const() {
+        let result = parse_source("pub const MAX_RETRIES: u32 = 3;\n");
+        let symbol = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX_RETRIES")
+            .expect("const symbol indexed");
+        assert_eq!(symbol.kind, "const");
+        assert_eq!(symbol.visibility, "pub");
+    }
+}

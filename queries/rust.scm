@@ -14,6 +14,16 @@
 (type_item
     name: (type_identifier) @name) @definition.class
 
+; graphlite extension: top-level const/static items — not in canonical tags.scm;
+; without these, a plain `const FOO: T = ...;` is invisible to symbol search and
+; resolve, even though it is fully present (with real visibility) in rustdoc's
+; own JSON output. See graphlite issue: consts/statics indexed nowhere.
+(const_item
+    name: (identifier) @name) @definition.constant
+
+(static_item
+    name: (identifier) @name) @definition.constant
+
 ; method definitions — functions with a body inside impl or trait blocks
 ; canonical tags.scm pattern; dedup handles overlap with definition.function below
 (declaration_list
