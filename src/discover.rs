@@ -14,6 +14,14 @@ use crate::{
     workspace,
 };
 
+/// Bump whenever a change to queries/*.scm or parser::kind_from_node could
+/// change what symbols get extracted from file content that has NOT itself
+/// changed -- e.g. adding a new capture pattern or kind mapping. The
+/// content-hash reindex check below cannot see logic changes on its own;
+/// this is what forces a one-time full reprocess of every file the next
+/// time `discover` runs after such a change ships. See EDR-0004.
+pub(crate) const PARSER_VERSION: i64 = 1;
+
 const IGNORED_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -102,20 +110,27 @@ pub fn run(root: &str) -> Result<()> {
     let db_path = format!("{}/codegraph.db", graphlite_dir);
     let conn = open_or_init_db(&db_path)?;
 
-    // Determine which files need re-indexing by comparing file hashes
+    // Determine which files need re-indexing by comparing file hashes and the
+    // parser version that produced the stored symbols (EDR-0004) -- a file
+    // whose content is unchanged still needs reprocessing if PARSER_VERSION
+    // has moved past what was stored for it, since the extraction logic
+    // itself may now see it differently.
     let changed: Vec<PathBuf> = files
         .iter()
         .filter(|path| {
             let path_str = path.to_string_lossy();
             let new_hash = compute_file_hash(path);
-            let stored: Option<String> = conn
+            let stored: Option<(String, i64)> = conn
                 .query_row(
-                    "SELECT file_hash FROM files WHERE path = ?1",
+                    "SELECT file_hash, parser_version FROM files WHERE path = ?1",
                     rusqlite::params![path_str.as_ref()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .ok();
-            stored.as_deref() != Some(&new_hash)
+            match stored {
+                Some((hash, version)) => hash != new_hash || version != PARSER_VERSION,
+                None => true,
+            }
         })
         .cloned()
         .collect();
@@ -178,7 +193,7 @@ pub fn run(root: &str) -> Result<()> {
         let path_str = path.to_string_lossy();
         let hash = compute_file_hash(path);
         let doc = file_docs.get(path).copied().flatten();
-        upsert_file_hash(&conn, path_str.as_ref(), &hash, doc)?;
+        upsert_file_hash(&conn, path_str.as_ref(), &hash, doc, PARSER_VERSION)?;
     }
 
     // Sync workspace crate nodes and crate-level dependency edges from cargo metadata.
@@ -363,4 +378,84 @@ fn restore_annotations(conn: &rusqlite::Connection, saved: &[SavedAnnotation]) -
         ])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod parser_version_tests {
+    use super::{run, PARSER_VERSION};
+    use rusqlite::Connection;
+    use std::fs;
+
+    fn stored_parser_version(db_path: &str, path_suffix: &str) -> i64 {
+        let conn = Connection::open(db_path).expect("open db");
+        conn.query_row(
+            "SELECT parser_version FROM files WHERE path LIKE ?1",
+            [format!("%{path_suffix}")],
+            |r| r.get(0),
+        )
+        .expect("file row")
+    }
+
+    #[test]
+    fn stale_parser_version_forces_reprocess_of_unchanged_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub(crate) const EXAMPLE_DEFAULT: &str = \"x\";\n",
+        )
+        .expect("write source");
+
+        run(root.to_str().expect("utf8 path")).expect("first discover");
+        let db_path = root.join(".graphlite/codegraph.db");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        assert_eq!(stored_parser_version(db_path_str, "lib.rs"), PARSER_VERSION);
+
+        // Simulate a database indexed by an older graphlite build: same file
+        // content, but a stale parser_version on record.
+        {
+            let conn = Connection::open(db_path_str).expect("open db");
+            conn.execute(
+                "UPDATE files SET parser_version = 0 WHERE path LIKE '%lib.rs'",
+                [],
+            )
+            .expect("downgrade parser_version");
+        }
+
+        // Content is untouched -- a naive content-hash-only check would skip
+        // this file entirely. Re-running discover must still bring its
+        // parser_version back up to current, proving the file was reprocessed.
+        run(root.to_str().expect("utf8 path")).expect("second discover");
+        assert_eq!(stored_parser_version(db_path_str, "lib.rs"), PARSER_VERSION);
+    }
+
+    #[test]
+    fn matching_parser_version_and_unchanged_content_is_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub(crate) const EXAMPLE_DEFAULT: &str = \"x\";\n",
+        )
+        .expect("write source");
+
+        run(root.to_str().expect("utf8 path")).expect("first discover");
+        let db_path = root.join(".graphlite/codegraph.db");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        let symbol_count_before: i64 = Connection::open(db_path_str)
+            .expect("open db")
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .expect("count nodes");
+
+        run(root.to_str().expect("utf8 path")).expect("second discover, nothing changed");
+
+        let symbol_count_after: i64 = Connection::open(db_path_str)
+            .expect("open db")
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .expect("count nodes");
+
+        assert_eq!(symbol_count_before, symbol_count_after);
+    }
 }

@@ -42,7 +42,8 @@ CREATE TABLE files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT UNIQUE NOT NULL,
     file_hash TEXT NOT NULL,
-    doc TEXT
+    doc TEXT,
+    parser_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE annotations (
@@ -133,6 +134,10 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
         return init_db(path);
     }
     let _ = conn.execute("ALTER TABLE files ADD COLUMN doc TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE nodes ADD COLUMN role TEXT NOT NULL DEFAULT 'unknown'",
         [],

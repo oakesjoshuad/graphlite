@@ -54,11 +54,12 @@ pub fn upsert_file_hash(
     path: &str,
     hash: &str,
     doc: Option<&str>,
+    parser_version: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO files (path, file_hash, doc) VALUES (?1, ?2, ?3)
-         ON CONFLICT(path) DO UPDATE SET file_hash = excluded.file_hash, doc = excluded.doc",
-        rusqlite::params![path, hash, doc],
+        "INSERT INTO files (path, file_hash, doc, parser_version) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path) DO UPDATE SET file_hash = excluded.file_hash, doc = excluded.doc, parser_version = excluded.parser_version",
+        rusqlite::params![path, hash, doc, parser_version],
     )?;
     Ok(())
 }
