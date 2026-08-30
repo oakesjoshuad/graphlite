@@ -156,15 +156,9 @@ pub fn open_or_init_db(path: &str) -> Result<Connection> {
         [],
     );
     // Add trait_impl column if not present
-    let _ = conn.execute(
-        "ALTER TABLE nodes ADD COLUMN trait_impl TEXT",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE nodes ADD COLUMN trait_impl TEXT", []);
     // Add confidence_tier column to edges if not present
-    let _ = conn.execute(
-        "ALTER TABLE edges ADD COLUMN confidence_tier TEXT",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE edges ADD COLUMN confidence_tier TEXT", []);
     // Add node_diagnostics table if not present (cargo clippy enrichment)
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS node_diagnostics (

@@ -19,8 +19,8 @@ mod roles;
 mod rustdoc_enricher;
 mod schema;
 mod violations;
-mod workspace;
 mod watch;
+mod workspace;
 mod xml;
 
 use anyhow::Result;
@@ -486,7 +486,9 @@ fn main() -> Result<()> {
                 .add_directive("graphlite=info".parse().unwrap()),
         )
         .with_target(false)
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("%H:%M:%S".to_string()))
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%H:%M:%S".to_string(),
+        ))
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();

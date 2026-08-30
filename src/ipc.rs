@@ -54,7 +54,11 @@ pub fn send_msg(root: &str, msg: &WatchMsg) -> Result<WatchResponse> {
 
 /// Send a message with a custom read timeout.
 /// Use for operations that may block (e.g. rename, which warms rust-analyzer).
-pub fn send_msg_timeout(root: &str, msg: &WatchMsg, read_timeout: Duration) -> Result<WatchResponse> {
+pub fn send_msg_timeout(
+    root: &str,
+    msg: &WatchMsg,
+    read_timeout: Duration,
+) -> Result<WatchResponse> {
     let path = sock_path(root);
     let stream = UnixStream::connect(&path)?;
     stream.set_read_timeout(Some(read_timeout))?;

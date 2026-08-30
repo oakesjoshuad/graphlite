@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
-use tracing::info;
 use rusqlite::Connection;
+use tracing::info;
 
 use crate::{
     config,

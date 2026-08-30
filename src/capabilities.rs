@@ -40,7 +40,11 @@ pub fn run(json: bool) -> Result<()> {
                     flag("md", false),
                 ],
             ),
-            cmd("deps", "Show workspace crate dependency graph", &[flag("md", false), flag("modules", false)]),
+            cmd(
+                "deps",
+                "Show workspace crate dependency graph",
+                &[flag("md", false), flag("modules", false)],
+            ),
             cmd(
                 "resolve",
                 "Resolve ambiguous symbol selectors to deterministic top candidates",
@@ -108,11 +112,7 @@ pub fn run(json: bool) -> Result<()> {
                     flag("compact", false),
                 ],
             ),
-            cmd(
-                "watch",
-                "Watch source files and re-index on change",
-                &[],
-            ),
+            cmd("watch", "Watch source files and re-index on change", &[]),
             cmd(
                 "reclassify",
                 "Re-run role classification over the current graph",
@@ -200,10 +200,7 @@ pub fn run(json: bool) -> Result<()> {
             cmd(
                 "policy init-pack",
                 "Initialize a built-in policy pack in .graphlite/config.toml",
-                &[
-                    flag("root", true),
-                    flag("force", false),
-                ],
+                &[flag("root", true), flag("force", false)],
             ),
             cmd(
                 "policy lint",

@@ -8,12 +8,12 @@ use std::{
 };
 
 use anyhow::Result;
-use tracing::{error, info, warn};
 use crossbeam_channel::{select, unbounded, Sender};
 use notify::{
     event::{CreateKind, ModifyKind, RemoveKind},
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
+use tracing::{error, info, warn};
 
 use crate::{
     annotate::annotate_with_conn,
@@ -130,7 +130,11 @@ fn dispatch(
     msg: WatchMsg,
 ) -> WatchResponse {
     match msg {
-        WatchMsg::Ping => WatchResponse { ok: true, error: None, data: None },
+        WatchMsg::Ping => WatchResponse {
+            ok: true,
+            error: None,
+            data: None,
+        },
         WatchMsg::Annotate {
             symbol,
             intent,
@@ -150,15 +154,35 @@ fn dispatch(
                     confidence,
                 );
                 match result {
-                    Ok(()) => WatchResponse { ok: true, error: None, data: None },
-                    Err(e) => WatchResponse { ok: false, error: Some(e.to_string()), data: None },
+                    Ok(()) => WatchResponse {
+                        ok: true,
+                        error: None,
+                        data: None,
+                    },
+                    Err(e) => WatchResponse {
+                        ok: false,
+                        error: Some(e.to_string()),
+                        data: None,
+                    },
                 }
             }
-            Err(e) => WatchResponse { ok: false, error: Some(e.to_string()), data: None },
+            Err(e) => WatchResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                data: None,
+            },
         },
         WatchMsg::Reindex { file: _ } => match crate::discover::run(root) {
-            Ok(()) => WatchResponse { ok: true, error: None, data: None },
-            Err(e) => WatchResponse { ok: false, error: Some(e.to_string()), data: None },
+            Ok(()) => WatchResponse {
+                ok: true,
+                error: None,
+                data: None,
+            },
+            Err(e) => WatchResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                data: None,
+            },
         },
         WatchMsg::Rename { symbol, new_name } => {
             dispatch_rename(conn, lsp, root, &symbol, &new_name)
@@ -176,22 +200,42 @@ fn dispatch_rename(
     // 1. Look up symbol location from DB.
     let node = match conn.lock() {
         Ok(c) => resolve_node_for_rename(&c, symbol),
-        Err(e) => return WatchResponse { ok: false, error: Some(e.to_string()), data: None },
+        Err(e) => {
+            return WatchResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                data: None,
+            }
+        }
     };
     let (file, range_start, name) = match node {
         Ok(n) => n,
-        Err(e) => return WatchResponse { ok: false, error: Some(e.to_string()), data: None },
+        Err(e) => {
+            return WatchResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                data: None,
+            }
+        }
     };
 
     // 2. Get or lazily initialize the LSP client.
     let mut lsp_guard = match lsp.lock() {
         Ok(g) => g,
-        Err(e) => return WatchResponse { ok: false, error: Some(e.to_string()), data: None },
+        Err(e) => {
+            return WatchResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                data: None,
+            }
+        }
     };
     if lsp_guard.is_none() {
         info!("warming rust-analyzer for first rename");
         match LspClient::connect(root) {
-            Ok(client) => { *lsp_guard = Some(client); }
+            Ok(client) => {
+                *lsp_guard = Some(client);
+            }
             Err(e) => {
                 return WatchResponse {
                     ok: false,
@@ -205,16 +249,26 @@ fn dispatch_rename(
     // 3. Perform the rename.
     let client = lsp_guard.as_mut().unwrap();
     match client.rename(&file, range_start, &name, new_name) {
-        Ok(edit) => {
-            match serde_json::to_string(&edit) {
-                Ok(json) => WatchResponse { ok: true, error: None, data: Some(json) },
-                Err(e) => WatchResponse { ok: false, error: Some(e.to_string()), data: None },
-            }
-        }
+        Ok(edit) => match serde_json::to_string(&edit) {
+            Ok(json) => WatchResponse {
+                ok: true,
+                error: None,
+                data: Some(json),
+            },
+            Err(e) => WatchResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                data: None,
+            },
+        },
         Err(e) => {
             // Reset the client on error — it may be in an inconsistent state.
             *lsp_guard = None;
-            WatchResponse { ok: false, error: Some(e.to_string()), data: None }
+            WatchResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                data: None,
+            }
         }
     }
 }

@@ -30,7 +30,10 @@ struct Progress {
 
 impl Progress {
     fn new() -> Self {
-        Self { tty: std::io::stderr().is_terminal(), spin_idx: 0 }
+        Self {
+            tty: std::io::stderr().is_terminal(),
+            spin_idx: 0,
+        }
     }
 
     /// Overwrite the current line with a spinner frame + message.
@@ -189,8 +192,8 @@ impl LspClient {
     pub fn connect(root: &str) -> Result<Self> {
         ensure_rust_analyzer()?;
 
-        let abs_root = std::fs::canonicalize(root)
-            .unwrap_or_else(|_| std::path::PathBuf::from(root));
+        let abs_root =
+            std::fs::canonicalize(root).unwrap_or_else(|_| std::path::PathBuf::from(root));
 
         let mut child = Command::new("rust-analyzer")
             .current_dir(&abs_root)
@@ -250,25 +253,28 @@ impl LspClient {
         let line_0 = line_1indexed.saturating_sub(1);
         let character = char_offset_of_name(file, line_1indexed, name);
 
-        let abs_file = std::fs::canonicalize(file)
-            .unwrap_or_else(|_| std::path::PathBuf::from(file));
+        let abs_file =
+            std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
         let uri = format!("file://{}", abs_file.display());
 
         // rust-analyzer requires textDocument/didOpen before rename; without it
         // the server returns error -32801 "content modified".
         let text = std::fs::read_to_string(&abs_file).unwrap_or_default();
-        write_msg(&mut self.writer, &json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didOpen",
-            "params": {
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "rust",
-                    "version": 1,
-                    "text": text
+        write_msg(
+            &mut self.writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "rust",
+                        "version": 1,
+                        "text": text
+                    }
                 }
-            }
-        }))?;
+            }),
+        )?;
 
         // Retry on ContentModified (-32801): server may still be digesting didOpen.
         let mut attempts = 0u32;
@@ -282,16 +288,19 @@ impl LspClient {
                 rid
             };
 
-            write_msg(&mut self.writer, &json!({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "textDocument/rename",
-                "params": {
-                    "textDocument": {"uri": uri},
-                    "position": {"line": line_0, "character": character},
-                    "newName": new_name
-                }
-            }))?;
+            write_msg(
+                &mut self.writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "textDocument/rename",
+                    "params": {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": line_0, "character": character},
+                        "newName": new_name
+                    }
+                }),
+            )?;
 
             let response = self.wait_for_id(req_id, Duration::from_secs(30))?;
             if let Some(error) = response.get("error") {
@@ -316,32 +325,38 @@ impl LspClient {
         let root_uri = format!("file://{}", root_path);
         let pid = std::process::id();
 
-        write_msg(&mut self.writer, &json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "initialize",
-            "params": {
-                "processId": pid,
-                "rootUri": root_uri,
-                "capabilities": {
-                    "workspace": {},
-                    "textDocument": {
-                        "rename": {
-                            "dynamicRegistration": false,
-                            "prepareSupport": false
+        write_msg(
+            &mut self.writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {
+                    "processId": pid,
+                    "rootUri": root_uri,
+                    "capabilities": {
+                        "workspace": {},
+                        "textDocument": {
+                            "rename": {
+                                "dynamicRegistration": false,
+                                "prepareSupport": false
+                            }
                         }
-                    }
-                },
-                "workspaceFolders": [{"uri": root_uri, "name": "workspace"}]
-            }
-        }))?;
+                    },
+                    "workspaceFolders": [{"uri": root_uri, "name": "workspace"}]
+                }
+            }),
+        )?;
         self.wait_for_id(id, Duration::from_secs(60))?;
 
-        write_msg(&mut self.writer, &json!({
-            "jsonrpc": "2.0",
-            "method": "initialized",
-            "params": {}
-        }))?;
+        write_msg(
+            &mut self.writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": {}
+            }),
+        )?;
 
         Ok(())
     }
@@ -446,9 +461,9 @@ fn wait_for_ready(rx: &Receiver<Value>, timeout: Duration) -> Result<()> {
                     // Compose the progress line.
                     let display = match (message.is_empty(), pct) {
                         (false, Some(p)) => format!("{current_title}  {message} ({p}%)"),
-                        (false, None)    => format!("{current_title}  {message}"),
-                        (true,  Some(p)) => format!("{current_title} ({p}%)"),
-                        (true,  None)    => current_title.clone(),
+                        (false, None) => format!("{current_title}  {message}"),
+                        (true, Some(p)) => format!("{current_title} ({p}%)"),
+                        (true, None) => current_title.clone(),
                     };
                     prog.update(&display);
                 }
@@ -462,9 +477,13 @@ fn wait_for_ready(rx: &Receiver<Value>, timeout: Duration) -> Result<()> {
 /// Find the UTF-8 byte offset of `name` as a whole-identifier token on the
 /// given 1-indexed line of `file`.  Returns 0 as a safe fallback.
 fn char_offset_of_name(file: &str, line_1indexed: u32, name: &str) -> u32 {
-    let Ok(content) = std::fs::read_to_string(file) else { return 0; };
+    let Ok(content) = std::fs::read_to_string(file) else {
+        return 0;
+    };
     let line_0 = (line_1indexed as usize).saturating_sub(1);
-    let Some(line_text) = content.lines().nth(line_0) else { return 0; };
+    let Some(line_text) = content.lines().nth(line_0) else {
+        return 0;
+    };
 
     let bytes = line_text.as_bytes();
     let name_bytes = name.as_bytes();
@@ -472,8 +491,8 @@ fn char_offset_of_name(file: &str, line_1indexed: u32, name: &str) -> u32 {
     let mut i = 0usize;
     while i + name_bytes.len() <= bytes.len() {
         if &bytes[i..i + name_bytes.len()] == name_bytes {
-            let before_ok = i == 0
-                || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             let after_pos = i + name_bytes.len();
             let after_ok = after_pos >= bytes.len()
                 || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
@@ -487,8 +506,14 @@ fn char_offset_of_name(file: &str, line_1indexed: u32, name: &str) -> u32 {
 }
 
 fn send_shutdown(writer: &mut BufWriter<ChildStdin>, id: u64) -> Result<()> {
-    write_msg(writer, &json!({"jsonrpc":"2.0","id":id,"method":"shutdown","params":null}))?;
-    let _ = write_msg(writer, &json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    write_msg(
+        writer,
+        &json!({"jsonrpc":"2.0","id":id,"method":"shutdown","params":null}),
+    )?;
+    let _ = write_msg(
+        writer,
+        &json!({"jsonrpc":"2.0","method":"exit","params":null}),
+    );
     Ok(())
 }
 
@@ -504,14 +529,20 @@ fn read_msg(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
-        if n == 0 { bail!("LSP connection closed"); }
+        if n == 0 {
+            bail!("LSP connection closed");
+        }
         let trimmed = line.trim();
-        if trimmed.is_empty() { break; }
+        if trimmed.is_empty() {
+            break;
+        }
         if let Some(rest) = trimmed.strip_prefix("Content-Length: ") {
             content_length = rest.trim().parse()?;
         }
     }
-    if content_length == 0 { bail!("LSP message with zero content-length"); }
+    if content_length == 0 {
+        bail!("LSP message with zero content-length");
+    }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
     Ok(serde_json::from_slice(&body)?)

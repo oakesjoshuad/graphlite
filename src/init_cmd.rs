@@ -40,7 +40,10 @@ pub fn run(root: &str) -> Result<()> {
             info!(entry = db_entry, "updated .gitignore");
         }
     } else {
-        warn!(entry = db_entry, "no .gitignore found — add this entry manually");
+        warn!(
+            entry = db_entry,
+            "no .gitignore found — add this entry manually"
+        );
     }
 
     // 3. If workspace layers are still unassigned, print instructions and stop.

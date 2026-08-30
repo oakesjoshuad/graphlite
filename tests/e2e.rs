@@ -113,8 +113,14 @@ fn capabilities_json_exposes_surface_and_unavailable() {
     assert!(out.status.success(), "capabilities --json should succeed");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\"commands\""), "expected commands list");
-    assert!(text.contains("\"violations\""), "expected violations command");
-    assert!(text.contains("\"reclassify\""), "expected reclassify command");
+    assert!(
+        text.contains("\"violations\""),
+        "expected violations command"
+    );
+    assert!(
+        text.contains("\"reclassify\""),
+        "expected reclassify command"
+    );
     assert!(
         !text.contains("\"unavailable\""),
         "did not expect unavailable section for dropped features"
@@ -125,7 +131,13 @@ fn capabilities_json_exposes_surface_and_unavailable() {
 fn violations_zero_findings_still_emits_diagnostics() {
     ensure_db();
     let out = Command::new(bin())
-        .args(["violations", "--strict-policy", "--top", "1", "--no-snippets"])
+        .args([
+            "violations",
+            "--strict-policy",
+            "--top",
+            "1",
+            "--no-snippets",
+        ])
         .current_dir(root())
         .output()
         .unwrap();
@@ -229,7 +241,13 @@ fn rename_reports_external_lsp_requirement() {
     // Run from a tempdir with no watcher socket — rename must fail with guidance.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
-        .args(["rename", "sym:open_db", "open_db_new", "--root", tmp.path().to_str().unwrap()])
+        .args([
+            "rename",
+            "sym:open_db",
+            "open_db_new",
+            "--root",
+            tmp.path().to_str().unwrap(),
+        ])
         .current_dir(root())
         .output()
         .unwrap();
@@ -420,10 +438,7 @@ traits = "domain"
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
-    assert_eq!(
-        edge,
-        Some(("AppType".to_string(), "Render".to_string()))
-    );
+    assert_eq!(edge, Some(("AppType".to_string(), "Render".to_string())));
 }
 
 #[test]
@@ -455,7 +470,11 @@ domain = { path = "../domain" }
 "#,
     )
     .unwrap();
-    std::fs::write(p.join("adapter/src/lib.rs"), "pub fn adapter() { domain::domain(); }\n").unwrap();
+    std::fs::write(
+        p.join("adapter/src/lib.rs"),
+        "pub fn adapter() { domain::domain(); }\n",
+    )
+    .unwrap();
 
     std::fs::create_dir_all(p.join("domain/src")).unwrap();
     std::fs::write(
@@ -624,7 +643,11 @@ domain = { path = "../domain" }
 "#,
     )
     .unwrap();
-    std::fs::write(p.join("adapter/src/lib.rs"), "pub fn adapter() { domain::domain(); }\n").unwrap();
+    std::fs::write(
+        p.join("adapter/src/lib.rs"),
+        "pub fn adapter() { domain::domain(); }\n",
+    )
+    .unwrap();
 
     std::fs::create_dir_all(p.join("domain/src")).unwrap();
     std::fs::write(
@@ -667,13 +690,24 @@ reason = "adapter must not call domain directly"
     assert!(discover.status.success());
 
     let out = Command::new(bin())
-        .args(["violations", "--by-crate", "--edge", "from:adapter to:domain", "--top", "20", "--no-snippets"])
+        .args([
+            "violations",
+            "--by-crate",
+            "--edge",
+            "from:adapter to:domain",
+            "--top",
+            "20",
+            "--no-snippets",
+        ])
         .current_dir(p)
         .output()
         .unwrap();
     assert!(out.status.success(), "violations should succeed");
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("<crate_summary>"), "expected crate summary block");
+    assert!(
+        text.contains("<crate_summary>"),
+        "expected crate summary block"
+    );
     assert!(
         text.contains("from_crate=\"adapter\"") && text.contains("to_crate=\"domain\""),
         "expected adapter->domain crate edge in output: {text}"
@@ -717,11 +751,7 @@ edition = "2021"
     )
     .unwrap();
     std::fs::create_dir_all(p.join("src")).unwrap();
-    std::fs::write(
-        p.join("src/main.rs"),
-        "fn dead_fn() {}\nfn main() {}\n",
-    )
-    .unwrap();
+    std::fs::write(p.join("src/main.rs"), "fn dead_fn() {}\nfn main() {}\n").unwrap();
 
     let init = Command::new(bin())
         .args(["init", "."])
@@ -809,7 +839,11 @@ edition = "2021"
 "#,
     )
     .unwrap();
-    std::fs::write(p.join("domain/src/lib.rs"), "pub(crate) fn domain_api() {}\n").unwrap();
+    std::fs::write(
+        p.join("domain/src/lib.rs"),
+        "pub(crate) fn domain_api() {}\n",
+    )
+    .unwrap();
 
     let init = Command::new(bin())
         .args(["init", "."])
@@ -842,7 +876,14 @@ reason = "adapters should be crate-visible"
     assert!(discover.status.success(), "discover should succeed");
 
     let out = Command::new(bin())
-        .args(["violations", "--pattern", "adapter_api", "--top", "20", "--no-snippets"])
+        .args([
+            "violations",
+            "--pattern",
+            "adapter_api",
+            "--top",
+            "20",
+            "--no-snippets",
+        ])
         .current_dir(p)
         .output()
         .unwrap();
@@ -882,7 +923,14 @@ reason = "intentional export for integration boundary"
     .unwrap();
 
     let suppressed = Command::new(bin())
-        .args(["violations", "--pattern", "adapter_api", "--top", "20", "--no-snippets"])
+        .args([
+            "violations",
+            "--pattern",
+            "adapter_api",
+            "--top",
+            "20",
+            "--no-snippets",
+        ])
         .current_dir(p)
         .output()
         .unwrap();
@@ -1001,7 +1049,10 @@ fn symbols_namespace_query_uses_non_fts_fallback() {
         .current_dir(root())
         .output()
         .unwrap();
-    assert!(out.status.success(), "symbols namespace query should succeed");
+    assert!(
+        out.status.success(),
+        "symbols namespace query should succeed"
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("src/discover.rs::fn::run"),
@@ -1027,7 +1078,10 @@ fn symbols_infix_wildcard_and_scope_filters_work() {
         .current_dir(root())
         .output()
         .unwrap();
-    assert!(out.status.success(), "symbols infix wildcard should succeed");
+    assert!(
+        out.status.success(),
+        "symbols infix wildcard should succeed"
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("src/discover.rs"),
@@ -1068,7 +1122,10 @@ fn resolve_prefer_role_biases_selection() {
         .current_dir(root())
         .output()
         .unwrap();
-    assert!(out.status.success(), "resolve with prefer-role should succeed");
+    assert!(
+        out.status.success(),
+        "resolve with prefer-role should succeed"
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("role=\"orchestrator\""),
@@ -1123,7 +1180,10 @@ fn trace_path_accepts_read_write_direction_aliases() {
         .current_dir(root())
         .output()
         .unwrap();
-    assert!(write_out.status.success(), "trace-path write alias should succeed");
+    assert!(
+        write_out.status.success(),
+        "trace-path write alias should succeed"
+    );
     let write_text = String::from_utf8_lossy(&write_out.stdout);
     assert!(
         write_text.contains("direction=\"outgoing\""),
@@ -1144,7 +1204,10 @@ fn trace_path_accepts_read_write_direction_aliases() {
         .current_dir(root())
         .output()
         .unwrap();
-    assert!(read_out.status.success(), "trace-path read alias should succeed");
+    assert!(
+        read_out.status.success(),
+        "trace-path read alias should succeed"
+    );
     let read_text = String::from_utf8_lossy(&read_out.stdout);
     assert!(
         read_text.contains("direction=\"incoming\""),
@@ -1168,7 +1231,10 @@ fn trace_path_high_level_mode_marks_output() {
         .current_dir(root())
         .output()
         .unwrap();
-    assert!(out.status.success(), "trace-path --high-level should succeed");
+    assert!(
+        out.status.success(),
+        "trace-path --high-level should succeed"
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("high_level=\"true\""),
@@ -1333,7 +1399,10 @@ fn blast_radius_compact_mode_defers_heavy_payloads() {
         !text.contains("<snippet>"),
         "compact mode should defer snippets"
     );
-    assert!(!text.contains("<annotation"), "compact mode should defer annotations");
+    assert!(
+        !text.contains("<annotation"),
+        "compact mode should defer annotations"
+    );
 }
 
 #[test]
@@ -1423,7 +1492,13 @@ fn rename_no_watcher_gives_clear_error() {
     // Run from a temp dir with no watcher socket so the error path is exercised.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
-        .args(["rename", "sym:open_db", "open_database", "--root", tmp.path().to_str().unwrap()])
+        .args([
+            "rename",
+            "sym:open_db",
+            "open_database",
+            "--root",
+            tmp.path().to_str().unwrap(),
+        ])
         .current_dir(root())
         .output()
         .unwrap();
@@ -1431,7 +1506,8 @@ fn rename_no_watcher_gives_clear_error() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("watcher") || stderr.contains("watch"),
-        "error message should mention watcher, got: {}", stderr
+        "error message should mention watcher, got: {}",
+        stderr
     );
 }
 
@@ -1453,7 +1529,13 @@ fn rename_unknown_symbol_via_watcher_gives_clear_error() {
     wait_for_socket(fixture_root, Duration::from_secs(10));
 
     let out = Command::new(bin())
-        .args(["rename", "sym:does_not_exist_xyz", "whatever", "--root", "."])
+        .args([
+            "rename",
+            "sym:does_not_exist_xyz",
+            "whatever",
+            "--root",
+            ".",
+        ])
         .current_dir(fixture_root)
         .output()
         .unwrap();
@@ -1461,7 +1543,8 @@ fn rename_unknown_symbol_via_watcher_gives_clear_error() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("not found") || stderr.contains("error") || !out.status.success(),
-        "should report symbol not found, got: {}", stderr
+        "should report symbol not found, got: {}",
+        stderr
     );
 }
 
@@ -1501,8 +1584,8 @@ fn rename_via_watch_daemon_produces_correct_edits() {
 
     // edits.json must be valid JSON and reference the new name
     let edits_content = std::fs::read_to_string(&edits_path).unwrap();
-    let edits: serde_json::Value = serde_json::from_str(&edits_content)
-        .expect("edits.json must be valid JSON");
+    let edits: serde_json::Value =
+        serde_json::from_str(&edits_content).expect("edits.json must be valid JSON");
     let edits_text = serde_json::to_string(&edits).unwrap();
     assert!(
         edits_text.contains("bar_function"),
@@ -1519,7 +1602,8 @@ fn rename_via_watch_daemon_produces_correct_edits() {
     let diff_text = String::from_utf8_lossy(&diff.stdout);
     assert!(
         diff_text.contains("bar_function"),
-        "diff should show new name, got: {}", diff_text
+        "diff should show new name, got: {}",
+        diff_text
     );
 
     // apply-edits must succeed
@@ -1607,8 +1691,11 @@ fn rename_updates_all_call_sites() {
         .current_dir(fixture_root)
         .output()
         .unwrap();
-    assert!(out.status.success(), "rename of helper_fn failed:\nstderr: {}",
-        String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "rename of helper_fn failed:\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     Command::new(bin())
         .args(["apply-edits", "edits.json"])
@@ -1617,8 +1704,14 @@ fn rename_updates_all_call_sites() {
         .unwrap();
 
     let src = std::fs::read_to_string(fixture_root.join("src/lib.rs")).unwrap();
-    assert!(!src.contains("helper_fn"), "all occurrences of helper_fn should be renamed");
-    assert!(src.contains("helper_renamed"), "helper_renamed should appear in renamed file");
+    assert!(
+        !src.contains("helper_fn"),
+        "all occurrences of helper_fn should be renamed"
+    );
+    assert!(
+        src.contains("helper_renamed"),
+        "helper_renamed should appear in renamed file"
+    );
 }
 
 // ── Rename fixture helpers ────────────────────────────────────────────────────

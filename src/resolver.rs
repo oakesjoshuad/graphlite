@@ -14,9 +14,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 
 use anyhow::Result;
-use tracing::info;
 use rusqlite::Connection;
 use streaming_iterator::StreamingIterator;
+use tracing::info;
 use tree_sitter::{Parser, Query, QueryCursor};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -144,7 +144,11 @@ pub fn resolve(conn: &Connection) -> Result<usize> {
     }
     tx.commit()?;
 
-    info!(call_sites = site_count, edges = total, "CALLS_RESOLVED edges written");
+    info!(
+        call_sites = site_count,
+        edges = total,
+        "CALLS_RESOLVED edges written"
+    );
     Ok(total)
 }
 
@@ -165,7 +169,14 @@ fn build_scope_map(
     let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
-            collect_bindings(cap.node, "", source, module_prefix, &mut map, &mut wildcards);
+            collect_bindings(
+                cap.node,
+                "",
+                source,
+                module_prefix,
+                &mut map,
+                &mut wildcards,
+            );
         }
     }
     ScopeMap {
@@ -231,14 +242,7 @@ fn collect_bindings(
                 for child in list.children(&mut c) {
                     let k = child.kind();
                     if k != "," && k != "{" && k != "}" && k != "comment" {
-                        collect_bindings(
-                            child,
-                            &new_prefix,
-                            source,
-                            module_prefix,
-                            map,
-                            wildcards,
-                        );
+                        collect_bindings(child, &new_prefix, source, module_prefix, map, wildcards);
                     }
                 }
             }
@@ -252,18 +256,15 @@ fn collect_bindings(
                 }
             }
         }
-        "use_wildcard"
-            if !prefix.is_empty() => {
-                wildcards.insert(normalize_path(prefix, module_prefix));
-            }
+        "use_wildcard" if !prefix.is_empty() => {
+            wildcards.insert(normalize_path(prefix, module_prefix));
+        }
         _ => {}
     }
 }
 
 fn node_text(node: tree_sitter::Node, source: &str) -> String {
-    node.utf8_text(source.as_bytes())
-        .unwrap_or("")
-        .to_string()
+    node.utf8_text(source.as_bytes()).unwrap_or("").to_string()
 }
 
 fn normalize_path(path: &str, module_prefix: &str) -> String {
@@ -332,11 +333,7 @@ fn module_prefix_from_file(file: &str) -> String {
 // ── Call extraction ──────────────────────────────────────────────────────────
 
 /// Returns `(1-indexed line, call text)` for every call captured in the file.
-fn extract_calls(
-    tree: &tree_sitter::Tree,
-    source: &str,
-    query: &Query,
-) -> Vec<CallSite> {
+fn extract_calls(tree: &tree_sitter::Tree, source: &str, query: &Query) -> Vec<CallSite> {
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     let mut calls = Vec::new();
@@ -452,9 +449,7 @@ fn resolve_by_name(
     // MEDIUM — same file, unique
     let same_file: Vec<i64> = {
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT id FROM nodes WHERE name = ?1 AND kind = 'fn' AND file = ?2",
-            )
+            .prepare_cached("SELECT id FROM nodes WHERE name = ?1 AND kind = 'fn' AND file = ?2")
             .ok()?;
         let rows: Vec<i64> = stmt
             .query_map(rusqlite::params![name, file], |r| r.get(0))
@@ -534,7 +529,10 @@ mod tests {
 
     #[test]
     fn normalize_path_handles_crate_self_super_prefixes() {
-        assert_eq!(normalize_path("crate::query::open_db", "discover"), "query::open_db");
+        assert_eq!(
+            normalize_path("crate::query::open_db", "discover"),
+            "query::open_db"
+        );
         assert_eq!(
             normalize_path("self::resolve", "resolver"),
             "resolver::resolve"

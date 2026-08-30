@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use tracing::info;
 use serde_json::Value;
+use tracing::info;
 
 struct TextEdit {
     start_line: u32,
@@ -60,7 +60,12 @@ pub fn rename(symbol: &str, new_name: &str, root: &str) -> Result<()> {
 
     let edit: Value = serde_json::from_str(&edit_json)?;
     let file_count = count_affected_files(&edit);
-    info!(symbol, new_name, files = file_count, "rename complete — edits written to edits.json");
+    info!(
+        symbol,
+        new_name,
+        files = file_count,
+        "rename complete — edits written to edits.json"
+    );
     info!("review: graphlite diff-rename  |  apply: graphlite apply-edits");
 
     Ok(())

@@ -18,10 +18,7 @@ pub struct WorkspaceGraph {
 /// members are found.
 /// Only production (`kind: null`) dependencies are included in `deps`.
 pub fn detect(root: &str) -> Option<WorkspaceGraph> {
-    let manifest = format!(
-        "{}/Cargo.toml",
-        root.trim_end_matches('/')
-    );
+    let manifest = format!("{}/Cargo.toml", root.trim_end_matches('/'));
 
     let output = Command::new("cargo")
         .args([
@@ -47,8 +44,7 @@ pub fn detect(root: &str) -> Option<WorkspaceGraph> {
         .collect();
 
     let packages = meta["packages"].as_array()?;
-    let abs_root = std::fs::canonicalize(root)
-        .unwrap_or_else(|_| std::path::PathBuf::from(root));
+    let abs_root = std::fs::canonicalize(root).unwrap_or_else(|_| std::path::PathBuf::from(root));
 
     // Build members list from workspace packages only.
     let mut members: Vec<CrateMember> = packages
@@ -78,9 +74,9 @@ pub fn detect(root: &str) -> Option<WorkspaceGraph> {
                             t["kind"]
                                 .as_array()
                                 .map(|kinds| {
-                                    kinds.iter().any(|k| {
-                                        matches!(k.as_str(), Some("lib" | "bin"))
-                                    })
+                                    kinds
+                                        .iter()
+                                        .any(|k| matches!(k.as_str(), Some("lib" | "bin")))
                                 })
                                 .unwrap_or(false)
                         })
@@ -100,7 +96,11 @@ pub fn detect(root: &str) -> Option<WorkspaceGraph> {
                         format!("{}/src/lib.rs", rel)
                     }
                 });
-            Some(CrateMember { name, path: rel, entry_file })
+            Some(CrateMember {
+                name,
+                path: rel,
+                entry_file,
+            })
         })
         .collect();
 
@@ -171,7 +171,13 @@ pub fn detect(root: &str) -> Option<WorkspaceGraph> {
 pub fn crate_for_file(root: &str, abs_file: &std::path::Path) -> Option<String> {
     let manifest = format!("{}/Cargo.toml", root.trim_end_matches('/'));
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--manifest-path", &manifest])
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            &manifest,
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

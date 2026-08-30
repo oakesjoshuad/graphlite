@@ -12,8 +12,8 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
-use tracing::warn;
 use rusqlite::Connection;
+use tracing::warn;
 
 use crate::schema::open_or_init_db;
 
@@ -159,7 +159,10 @@ fn parse_diagnostics(reader: impl BufRead, root: &str) -> Vec<Diagnostic> {
             Some(s) => s,
             None => continue,
         };
-        let primary = match spans.iter().find(|s| s["is_primary"].as_bool() == Some(true)) {
+        let primary = match spans
+            .iter()
+            .find(|s| s["is_primary"].as_bool() == Some(true))
+        {
             Some(s) => s,
             None => continue,
         };
@@ -178,18 +181,16 @@ fn parse_diagnostics(reader: impl BufRead, root: &str) -> Vec<Diagnostic> {
         };
 
         // Collect the first suggested replacement, if any.
-        let suggestion = diag["children"]
-            .as_array()
-            .and_then(|children| {
-                children.iter().find_map(|c| {
-                    c["spans"]
-                        .as_array()
-                        .and_then(|ss| ss.first())
-                        .and_then(|s| s["suggested_replacement"].as_str())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                })
-            });
+        let suggestion = diag["children"].as_array().and_then(|children| {
+            children.iter().find_map(|c| {
+                c["spans"]
+                    .as_array()
+                    .and_then(|ss| ss.first())
+                    .and_then(|s| s["suggested_replacement"].as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        });
 
         result.push(Diagnostic {
             file: db_path,

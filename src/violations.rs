@@ -166,9 +166,10 @@ fn check_workspace_violations(
         };
         for rule in &ws_cfg.violations {
             if rule.from_layer == from_layer && rule.to_layer == to_layer {
-                let reason = rule.reason.clone().unwrap_or_else(|| {
-                    format!("{} must not depend on {}", from_layer, to_layer)
-                });
+                let reason = rule
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| format!("{} must not depend on {}", from_layer, to_layer));
                 result.push(WorkspaceViolation {
                     from_crate: from_crate.clone(),
                     from_layer: from_layer.to_string(),
@@ -271,15 +272,14 @@ pub fn run(params: &Params) -> Result<()> {
         "default-config".to_string()
     };
     let (workspace_layers_total, workspace_layers_assigned, workspace_rule_count) =
-        match &effective.workspace
-    {
-        Some(ws) => (
-            ws.layers.len(),
-            ws.layers.values().filter(|v| v.as_str() != "?").count(),
-            ws.violations.len(),
-        ),
-        None => (0, 0, 0),
-    };
+        match &effective.workspace {
+            Some(ws) => (
+                ws.layers.len(),
+                ws.layers.values().filter(|v| v.as_str() != "?").count(),
+                ws.violations.len(),
+            ),
+            None => (0, 0, 0),
+        };
 
     // Load all trusted edges (excluding test nodes) with enough metadata to
     // classify violations in Rust rather than SQL (keeps SQL simple).
@@ -362,11 +362,9 @@ pub fn run(params: &Params) -> Result<()> {
             *suppressed_counts.entry(exc_reason.to_string()).or_insert(0) += 1;
             continue;
         }
-        if let Some(exc_reason) = stable_id_exception_reason(
-            &e.from_stable_id,
-            &e.to_stable_id,
-            &effective.exceptions,
-        ) {
+        if let Some(exc_reason) =
+            stable_id_exception_reason(&e.from_stable_id, &e.to_stable_id, &effective.exceptions)
+        {
             *suppressed_counts.entry(exc_reason.to_string()).or_insert(0) += 1;
             continue;
         }
@@ -448,16 +446,20 @@ pub fn run(params: &Params) -> Result<()> {
     violations.sort_unstable_by_key(|v| std::cmp::Reverse(v.to_fan_in));
 
     let total = violations.len();
-    let mut visibility_violations = check_visibility_violations(
-        &effective,
-        ws_graph.as_ref(),
-        &conn,
-    )?;
+    let mut visibility_violations =
+        check_visibility_violations(&effective, ws_graph.as_ref(), &conn)?;
     if let Some(p) = params.pattern {
         visibility_violations.retain(|v| {
             matches_pattern(
                 p,
-                &[&v.symbol, &v.file, &v.layer, &v.actual_visibility, &v.max_visibility, &v.stable_id],
+                &[
+                    &v.symbol,
+                    &v.file,
+                    &v.layer,
+                    &v.actual_visibility,
+                    &v.max_visibility,
+                    &v.stable_id,
+                ],
             )
         });
     }
@@ -616,8 +618,7 @@ fn render_xml(
         vxml::open(w, "suppressed_summary").expect("xml");
         for (reason, count) in suppressed_counts {
             let count_s = count.to_string();
-            vxml::empty(w, "exception", &[("count", &count_s), ("reason", reason)])
-                .expect("xml");
+            vxml::empty(w, "exception", &[("count", &count_s), ("reason", reason)]).expect("xml");
         }
         vxml::close(w, "suppressed_summary").expect("xml");
 
@@ -626,8 +627,7 @@ fn render_xml(
         vxml::open(w, "top_suppressions").expect("xml");
         for (reason, count) in ranked.into_iter().take(10) {
             let count_s = count.to_string();
-            vxml::empty(w, "exception", &[("count", &count_s), ("reason", reason)])
-                .expect("xml");
+            vxml::empty(w, "exception", &[("count", &count_s), ("reason", reason)]).expect("xml");
         }
         vxml::close(w, "top_suppressions").expect("xml");
     }
@@ -679,15 +679,18 @@ fn render_xml(
     }
 
     for ((fc, tc), group) in &groups {
-        vxml::open_attrs(w, "group", &[("from_context", fc), ("to_context", tc)])
-            .expect("xml");
+        vxml::open_attrs(w, "group", &[("from_context", fc), ("to_context", tc)]).expect("xml");
         for v in group.iter() {
             let to_fi = v.to_fan_in.to_string();
             let from_fo = v.from_fan_out.to_string();
             vxml::open_attrs(
                 w,
                 "violation",
-                &[("kind", "coupling"), ("callee_fan_in", &to_fi), ("caller_fan_out", &from_fo)],
+                &[
+                    ("kind", "coupling"),
+                    ("callee_fan_in", &to_fi),
+                    ("caller_fan_out", &from_fo),
+                ],
             )
             .expect("xml");
 
@@ -769,8 +772,7 @@ fn render_xml(
     // Workspace layer violations (crate-level, from Cargo.toml dep graph).
     if !ws_violations.is_empty() {
         let ws_total_s = ws_total.to_string();
-        vxml::open_attrs(w, "workspace_violations", &[("total", &ws_total_s)])
-            .expect("xml");
+        vxml::open_attrs(w, "workspace_violations", &[("total", &ws_total_s)]).expect("xml");
 
         let mut ws_groups: BTreeMap<(&str, &str), Vec<&WorkspaceViolation>> = BTreeMap::new();
         for v in ws_violations {
@@ -784,11 +786,7 @@ fn render_xml(
             vxml::open_attrs(
                 w,
                 "layer_violation",
-                &[
-                    ("from_layer", fl),
-                    ("to_layer", tl),
-                    ("count", &count_s),
-                ],
+                &[("from_layer", fl), ("to_layer", tl), ("count", &count_s)],
             )
             .expect("xml");
             for v in group.iter() {
@@ -959,7 +957,8 @@ fn check_visibility_violations(
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, i64>(3)?,
-            r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "default".to_string()),
+            r.get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| "default".to_string()),
         ))
     })?;
 
@@ -1102,15 +1101,13 @@ mod tests {
             &[("core", "domain"), ("adapter_http", "adapter")],
             &[("adapter", "domain")],
         );
-        assert!(
-            validate_policy(
-                cfg.workspace.as_ref(),
-                &cfg.violations,
-                &cfg.visibility_rules,
-                true
-            )
-            .is_ok()
-        );
+        assert!(validate_policy(
+            cfg.workspace.as_ref(),
+            &cfg.violations,
+            &cfg.visibility_rules,
+            true
+        )
+        .is_ok());
     }
 
     #[test]

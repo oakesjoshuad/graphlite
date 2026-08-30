@@ -1,19 +1,15 @@
 use anyhow::Result;
-use tracing::{debug, info, warn};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    audit,
-    clippy_enricher,
-    config,
+    audit, clippy_enricher, config,
     insert::{bulk_insert_symbols, upsert_file_hash},
     language::detect_language,
     parser::{parse_file, ParseResult, Symbol},
-    resolver,
-    roles,
-    rustdoc_enricher,
+    resolver, roles, rustdoc_enricher,
     schema::open_or_init_db,
     workspace,
 };
@@ -244,8 +240,14 @@ fn sync_workspace_crate_graph(conn: &rusqlite::Connection, root: &str) -> Result
     };
 
     // Replace only workspace-derived crate topology on each run.
-    conn.execute("DELETE FROM edges WHERE source = 'cargo-metadata' AND edge_type = 'CRATE_DEP'", [])?;
-    conn.execute("DELETE FROM nodes WHERE kind = 'crate' AND language = 'workspace'", [])?;
+    conn.execute(
+        "DELETE FROM edges WHERE source = 'cargo-metadata' AND edge_type = 'CRATE_DEP'",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM nodes WHERE kind = 'crate' AND language = 'workspace'",
+        [],
+    )?;
     conn.execute("DELETE FROM fts_symbols WHERE language = 'workspace'", [])?;
 
     let tx = conn.unchecked_transaction()?;
@@ -271,7 +273,14 @@ fn sync_workspace_crate_graph(conn: &rusqlite::Connection, root: &str) -> Result
             let stable_id = format!("crate::{}", m.name);
             let qualified_name = m.name.clone();
             let doc = extract_crate_doc(root, &m.entry_file);
-            node_stmt.execute(rusqlite::params![file, m.name, sig, stable_id, qualified_name, doc])?;
+            node_stmt.execute(rusqlite::params![
+                file,
+                m.name,
+                sig,
+                stable_id,
+                qualified_name,
+                doc
+            ])?;
             let node_id = tx.last_insert_rowid();
             fts_stmt.execute(rusqlite::params![m.name, m.name, sig, file, node_id])?;
             name_to_id.insert(m.name.clone(), node_id);

@@ -66,7 +66,13 @@ pub fn enrich(root: &str, changed_files: &[PathBuf], conn: &Connection) -> Resul
             count = crates.len(),
             "rustdoc: enriching all crates (no affected filter matched)"
         );
-        return enrich_crates(root, &crates.iter().collect::<Vec<_>>(), &crates, conn, &abs_root);
+        return enrich_crates(
+            root,
+            &crates.iter().collect::<Vec<_>>(),
+            &crates,
+            conn,
+            &abs_root,
+        );
     }
 
     info!(
@@ -650,7 +656,8 @@ fn collect_impl_trait_edges(
                 );
                 return None;
             };
-            let Some(to_id) = resolve_rustdoc_node_id(doc, trait_id, &item_nodes, qualified_node_map)
+            let Some(to_id) =
+                resolve_rustdoc_node_id(doc, trait_id, &item_nodes, qualified_node_map)
             else {
                 if is_workspace_rustdoc_path(doc, trait_id, qualified_node_map) {
                     warn!(
@@ -669,9 +676,7 @@ fn collect_impl_trait_edges(
                 }
                 return None;
             };
-            Some((
-                from_id, to_id,
-            ))
+            Some((from_id, to_id))
         })
         .collect()
 }
@@ -688,11 +693,7 @@ fn is_workspace_rustdoc_path(
     item_id: Id,
     qualified_node_map: &HashMap<(String, String), Vec<i64>>,
 ) -> bool {
-    let Some(crate_name) = doc
-        .paths
-        .get(&item_id)
-        .and_then(|path| path.path.first())
-    else {
+    let Some(crate_name) = doc.paths.get(&item_id).and_then(|path| path.path.first()) else {
         return false;
     };
     qualified_node_map

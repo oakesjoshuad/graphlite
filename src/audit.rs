@@ -1,8 +1,8 @@
 use std::process::Command;
 
 use anyhow::Result;
-use tracing::debug;
 use rusqlite::Connection;
+use tracing::debug;
 
 use crate::schema::open_or_init_db;
 
@@ -25,9 +25,7 @@ pub fn enrich(root: &str, conn: &Connection) -> Result<usize> {
     {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(
-                "cargo audit is not installed. Install with: cargo install cargo-audit"
-            );
+            println!("cargo audit is not installed. Install with: cargo install cargo-audit");
             return Ok(0);
         }
         Err(e) => return Err(e.into()),
@@ -38,9 +36,7 @@ pub fn enrich(root: &str, conn: &Connection) -> Result<usize> {
     if output.stdout.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("no such command: `audit`") {
-            println!(
-                "cargo audit is not installed. Install with: cargo install cargo-audit"
-            );
+            println!("cargo audit is not installed. Install with: cargo install cargo-audit");
             return Ok(0);
         }
         if stderr.contains("advisory-db")
@@ -83,10 +79,19 @@ pub fn enrich(root: &str, conn: &Connection) -> Result<usize> {
     tx.commit()?;
 
     let total = advisories.len();
-    let vulnerabilities = advisories.iter().filter(|a| a.kind == "vulnerability").count();
-    let unmaintained = advisories.iter().filter(|a| a.kind == "unmaintained").count();
+    let vulnerabilities = advisories
+        .iter()
+        .filter(|a| a.kind == "vulnerability")
+        .count();
+    let unmaintained = advisories
+        .iter()
+        .filter(|a| a.kind == "unmaintained")
+        .count();
     let yanked = advisories.iter().filter(|a| a.kind == "yanked").count();
-    debug!(total, vulnerabilities, unmaintained, yanked, "audit complete");
+    debug!(
+        total,
+        vulnerabilities, unmaintained, yanked, "audit complete"
+    );
 
     Ok(total)
 }

@@ -56,8 +56,7 @@ pub fn effective_policy(cfg: &Config) -> Result<EffectivePolicy> {
     let mut workspace_violations = Vec::new();
 
     if let Some(name) = &pack_name {
-        let pack = pack_for(name)
-            .ok_or_else(|| anyhow!("unknown policy pack '{}'", name))?;
+        let pack = pack_for(name).ok_or_else(|| anyhow!("unknown policy pack '{}'", name))?;
         violations.extend(pack.violations);
         visibility_rules.extend(pack.visibility_rules);
         workspace_violations.extend(pack.workspace_violations);
@@ -154,7 +153,12 @@ pub fn lint(root: &str, opts: LintOptions) -> Result<()> {
     lint_context_rules(&effective.violations, &mut findings);
     lint_visibility_rules(&effective.visibility_rules, &mut findings);
     lint_workspace_rules(effective.workspace.as_ref(), &mut findings);
-    lint_exceptions(root, &effective.exceptions, opts.broad_threshold, &mut findings)?;
+    lint_exceptions(
+        root,
+        &effective.exceptions,
+        opts.broad_threshold,
+        &mut findings,
+    )?;
     lint_dead_rules_against_repo(root, &effective, &mut findings)?;
     if opts.stale_only {
         findings.retain(|f| f.code.starts_with("dead_exception_"));
@@ -252,10 +256,7 @@ fn lint_context_rules(rules: &[ViolationRule], findings: &mut Vec<Finding>) {
                 findings.push(Finding {
                     severity: "warning",
                     code: "dead_context_duplicate_rule",
-                    message: format!(
-                        "duplicate context rule {} -> {}",
-                        key.0, key.1
-                    ),
+                    message: format!("duplicate context rule {} -> {}", key.0, key.1),
                 });
             } else {
                 findings.push(Finding {
@@ -312,10 +313,7 @@ fn lint_workspace_rules(workspace: Option<&WorkspaceConfig>, findings: &mut Vec<
                 findings.push(Finding {
                     severity: "warning",
                     code: "dead_workspace_duplicate_rule",
-                    message: format!(
-                        "duplicate workspace layer rule {} -> {}",
-                        key.0, key.1
-                    ),
+                    message: format!("duplicate workspace layer rule {} -> {}", key.0, key.1),
                 });
             } else {
                 findings.push(Finding {
@@ -392,7 +390,9 @@ fn lint_exceptions(
         for (from_file, to_file, from_role, to_role, from_sid, to_sid) in &edges {
             let from_ctx = arch::file_to_context(from_file);
             let to_ctx = arch::file_to_context(to_file);
-            if exception_matches(exc, &from_ctx, &to_ctx, from_role, to_role, from_sid, to_sid) {
+            if exception_matches(
+                exc, &from_ctx, &to_ctx, from_role, to_role, from_sid, to_sid,
+            ) {
                 hits += 1;
                 ctx_pairs.insert((from_ctx, to_ctx));
             }
@@ -451,7 +451,11 @@ fn exception_matches(
     fc && tc && fr && tr && sid
 }
 
-fn lint_dead_rules_against_repo(root: &str, effective: &EffectivePolicy, findings: &mut Vec<Finding>) -> Result<()> {
+fn lint_dead_rules_against_repo(
+    root: &str,
+    effective: &EffectivePolicy,
+    findings: &mut Vec<Finding>,
+) -> Result<()> {
     let db = Path::new(root).join(".graphlite/codegraph.db");
     if !db.exists() {
         return Ok(());
@@ -521,38 +525,98 @@ fn pack_for(name: &str) -> Option<PolicyPack> {
     match name {
         PACK_DDD => Some(PolicyPack {
             violations: vec![
-                rule_ctx("adapter", "infra", "adapter should call application ports/use-cases, not infra directly"),
-                rule_ctx("adapter", "domain", "adapter should enter through application boundary"),
-                rule_ctx("infra", "adapter", "infra should not depend on driving adapters"),
+                rule_ctx(
+                    "adapter",
+                    "infra",
+                    "adapter should call application ports/use-cases, not infra directly",
+                ),
+                rule_ctx(
+                    "adapter",
+                    "domain",
+                    "adapter should enter through application boundary",
+                ),
+                rule_ctx(
+                    "infra",
+                    "adapter",
+                    "infra should not depend on driving adapters",
+                ),
                 rule_ctx("domain", "infra", "domain must remain persistence-agnostic"),
                 rule_ctx("domain", "adapter", "domain must remain transport-agnostic"),
             ],
             visibility_rules: vec![
-                rule_vis("domain", "crate", "domain symbols should remain crate-internal"),
-                rule_vis("infra", "crate", "infra implementation details should remain internal"),
+                rule_vis(
+                    "domain",
+                    "crate",
+                    "domain symbols should remain crate-internal",
+                ),
+                rule_vis(
+                    "infra",
+                    "crate",
+                    "infra implementation details should remain internal",
+                ),
             ],
             workspace_violations: vec![
                 rule_ws("domain", "infra", "domain must not depend on infra"),
                 rule_ws("domain", "adapter", "domain must not depend on adapter"),
-                rule_ws("port", "infra", "ports define contracts; infra implements them"),
+                rule_ws(
+                    "port",
+                    "infra",
+                    "ports define contracts; infra implements them",
+                ),
                 rule_ws("port", "adapter", "ports should not depend on adapters"),
-                rule_ws("application", "adapter", "application should not depend on adapters"),
+                rule_ws(
+                    "application",
+                    "adapter",
+                    "application should not depend on adapters",
+                ),
             ],
         }),
         PACK_CQRS => Some(PolicyPack {
             violations: vec![
-                rule_ctx("query", "command", "read side must not depend on write side"),
-                rule_ctx("command", "query", "write side should not couple to read projections"),
-                rule_ctx("projection", "command", "projections should not drive command execution"),
-                rule_ctx("infra", "adapter", "infra should not depend on delivery adapters"),
+                rule_ctx(
+                    "query",
+                    "command",
+                    "read side must not depend on write side",
+                ),
+                rule_ctx(
+                    "command",
+                    "query",
+                    "write side should not couple to read projections",
+                ),
+                rule_ctx(
+                    "projection",
+                    "command",
+                    "projections should not drive command execution",
+                ),
+                rule_ctx(
+                    "infra",
+                    "adapter",
+                    "infra should not depend on delivery adapters",
+                ),
             ],
             visibility_rules: vec![
-                rule_vis("domain", "crate", "domain internals should not leak via public API"),
-                rule_vis("application", "crate", "use-case internals should be crate scoped"),
+                rule_vis(
+                    "domain",
+                    "crate",
+                    "domain internals should not leak via public API",
+                ),
+                rule_vis(
+                    "application",
+                    "crate",
+                    "use-case internals should be crate scoped",
+                ),
             ],
             workspace_violations: vec![
-                rule_ws("query", "command", "query crates must not depend on command crates"),
-                rule_ws("projection", "command", "projection crates must not depend on command crates"),
+                rule_ws(
+                    "query",
+                    "command",
+                    "query crates must not depend on command crates",
+                ),
+                rule_ws(
+                    "projection",
+                    "command",
+                    "projection crates must not depend on command crates",
+                ),
                 rule_ws("domain", "infra", "domain must not depend on infra"),
             ],
         }),

@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use anyhow::{anyhow, Result};
-use tracing::info;
 use rusqlite::Connection;
+use tracing::info;
 
 use crate::xml as vxml;
 
@@ -227,7 +227,11 @@ pub fn deps(md: bool, modules: bool) -> Result<()> {
     )?;
     let crates: Vec<(String, Option<String>, String)> = crates_stmt
         .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
@@ -267,12 +271,14 @@ pub fn deps(md: bool, modules: bool) -> Result<()> {
             for (name, doc, _file) in &crates {
                 let layer = layers.get(name.as_str()).copied().unwrap_or("-");
                 let fi = fan_in.get(name.as_str()).copied().unwrap_or(0);
-                let doc_cell = doc
-                    .as_deref()
-                    .and_then(|d| d.lines().next())
-                    .unwrap_or("-");
-                println!("| {} | {} | {} | {} |",
-                    name.replace('|', "\\|"), layer, fi, doc_cell.replace('|', "\\|"));
+                let doc_cell = doc.as_deref().and_then(|d| d.lines().next()).unwrap_or("-");
+                println!(
+                    "| {} | {} | {} | {} |",
+                    name.replace('|', "\\|"),
+                    layer,
+                    fi,
+                    doc_cell.replace('|', "\\|")
+                );
             }
         }
         if modules {
@@ -282,7 +288,8 @@ pub fn deps(md: bool, modules: bool) -> Result<()> {
             for (name, _, _) in &crates {
                 if let Some(mods) = crate_modules.get(name.as_str()) {
                     for m in mods {
-                        println!("| {} | {} | {} | {} | {} | {} |",
+                        println!(
+                            "| {} | {} | {} | {} | {} | {} |",
                             name.replace('|', "\\|"),
                             m.module.replace('|', "\\|"),
                             m.symbols,
@@ -299,7 +306,11 @@ pub fn deps(md: bool, modules: bool) -> Result<()> {
             println!("| from_crate | to_crate |");
             println!("|---|---|");
             for (from, to) in &edges {
-                println!("| {} | {} |", from.replace('|', "\\|"), to.replace('|', "\\|"));
+                println!(
+                    "| {} | {} |",
+                    from.replace('|', "\\|"),
+                    to.replace('|', "\\|")
+                );
             }
         }
         return Ok(());
@@ -311,7 +322,11 @@ pub fn deps(md: bool, modules: bool) -> Result<()> {
     vxml::open_attrs(
         &mut w,
         "deps",
-        &[("crates", &crates_s), ("edges", &edges_s), ("tokens", "streaming")],
+        &[
+            ("crates", &crates_s),
+            ("edges", &edges_s),
+            ("tokens", "streaming"),
+        ],
     )?;
     if !crates.is_empty() {
         vxml::open(&mut w, "crates")?;
@@ -320,29 +335,63 @@ pub fn deps(md: bool, modules: bool) -> Result<()> {
             let fi = fan_in.get(name.as_str()).copied().unwrap_or(0);
             let fi_s = fi.to_string();
             let doc_first = doc.as_deref().and_then(|d| d.lines().next()).unwrap_or("");
-            let mods = if modules { crate_modules.get(name.as_str()) } else { None };
+            let mods = if modules {
+                crate_modules.get(name.as_str())
+            } else {
+                None
+            };
             if mods.is_none_or(|v| v.is_empty()) {
                 if doc_first.is_empty() {
-                    vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s)])?;
+                    vxml::empty(
+                        &mut w,
+                        "crate",
+                        &[("name", name), ("layer", layer), ("fan_in", &fi_s)],
+                    )?;
                 } else {
-                    vxml::empty(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s), ("doc", doc_first)])?;
+                    vxml::empty(
+                        &mut w,
+                        "crate",
+                        &[
+                            ("name", name),
+                            ("layer", layer),
+                            ("fan_in", &fi_s),
+                            ("doc", doc_first),
+                        ],
+                    )?;
                 }
             } else {
                 if doc_first.is_empty() {
-                    vxml::open_attrs(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s)])?;
+                    vxml::open_attrs(
+                        &mut w,
+                        "crate",
+                        &[("name", name), ("layer", layer), ("fan_in", &fi_s)],
+                    )?;
                 } else {
-                    vxml::open_attrs(&mut w, "crate", &[("name", name), ("layer", layer), ("fan_in", &fi_s), ("doc", doc_first)])?;
+                    vxml::open_attrs(
+                        &mut w,
+                        "crate",
+                        &[
+                            ("name", name),
+                            ("layer", layer),
+                            ("fan_in", &fi_s),
+                            ("doc", doc_first),
+                        ],
+                    )?;
                 }
                 for m in mods.unwrap() {
                     let sym_s = m.symbols.to_string();
                     let hfi_s = m.hotspot_fan_in.to_string();
-                    vxml::empty(&mut w, "module", &[
-                        ("name", m.module.as_str()),
-                        ("symbols", &sym_s),
-                        ("role", m.role.as_str()),
-                        ("hotspot", m.hotspot.as_str()),
-                        ("hotspot_fan_in", &hfi_s),
-                    ])?;
+                    vxml::empty(
+                        &mut w,
+                        "module",
+                        &[
+                            ("name", m.module.as_str()),
+                            ("symbols", &sym_s),
+                            ("role", m.role.as_str()),
+                            ("hotspot", m.hotspot.as_str()),
+                            ("hotspot_fan_in", &hfi_s),
+                        ],
+                    )?;
                 }
                 vxml::close(&mut w, "crate")?;
             }
@@ -418,13 +467,18 @@ fn build_crate_modules(
          ORDER BY n.file, fan_in DESC",
     )?;
 
-    struct SymRow { file: String, name: String, role: String, fan_in: usize }
+    struct SymRow {
+        file: String,
+        name: String,
+        role: String,
+        fan_in: usize,
+    }
     let syms: Vec<SymRow> = sym_stmt
         .query_map([], |r| {
             Ok(SymRow {
-                file:   r.get::<_, String>(0)?,
-                name:   r.get::<_, String>(1)?,
-                role:   r.get::<_, String>(2)?,
+                file: r.get::<_, String>(0)?,
+                name: r.get::<_, String>(1)?,
+                role: r.get::<_, String>(2)?,
                 fan_in: r.get::<_, i64>(3)? as usize,
             })
         })?
@@ -438,14 +492,21 @@ fn build_crate_modules(
         // module -> (symbol_count, role_counts, hotspot_name, hotspot_fan_in)
         let mut modules: std::collections::HashMap<
             String,
-            (usize, std::collections::HashMap<String, usize>, String, usize),
+            (
+                usize,
+                std::collections::HashMap<String, usize>,
+                String,
+                usize,
+            ),
         > = std::collections::HashMap::new();
 
         for sym in &syms {
-            let Some(module) = top_level_module(&sym.file, &prefix) else { continue };
-            let entry = modules.entry(module).or_insert_with(|| {
-                (0, std::collections::HashMap::new(), String::new(), 0)
-            });
+            let Some(module) = top_level_module(&sym.file, &prefix) else {
+                continue;
+            };
+            let entry = modules
+                .entry(module)
+                .or_insert_with(|| (0, std::collections::HashMap::new(), String::new(), 0));
             entry.0 += 1;
             *entry.1.entry(sym.role.clone()).or_insert(0) += 1;
             // First symbol encountered per module (ordered by fan_in desc) is the hotspot.
@@ -457,14 +518,22 @@ fn build_crate_modules(
 
         let mut rows: Vec<ModuleRow> = modules
             .into_iter()
-            .map(|(module, (symbols, role_counts, hotspot, hotspot_fan_in))| {
-                let role = role_counts
-                    .into_iter()
-                    .max_by_key(|(_, c)| *c)
-                    .map(|(r, _)| r)
-                    .unwrap_or_else(|| "unknown".to_string());
-                ModuleRow { module, symbols, role, hotspot, hotspot_fan_in }
-            })
+            .map(
+                |(module, (symbols, role_counts, hotspot, hotspot_fan_in))| {
+                    let role = role_counts
+                        .into_iter()
+                        .max_by_key(|(_, c)| *c)
+                        .map(|(r, _)| r)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    ModuleRow {
+                        module,
+                        symbols,
+                        role,
+                        hotspot,
+                        hotspot_fan_in,
+                    }
+                },
+            )
             .collect();
 
         // Sort by symbol count descending, then module name for stability.
@@ -618,11 +687,8 @@ pub fn symbols(
 ) -> Result<()> {
     let conn = open_db()?;
     let key = fts_query.strip_prefix("sym:").unwrap_or(fts_query);
-    let wildcard_infix = fts_query.starts_with('*')
-        || fts_query
-            .trim_end_matches('*')
-            .chars()
-            .any(|c| c == '*');
+    let wildcard_infix =
+        fts_query.starts_with('*') || fts_query.trim_end_matches('*').chars().any(|c| c == '*');
     let use_namespace_fallback = key.contains("::") || fts_query.starts_with("sym:");
     let use_like_wildcard = wildcard_infix && !fts_query.contains(' ');
 
@@ -744,8 +810,7 @@ pub fn symbols(
         .into_iter()
         .filter(|(_, _, _, _, role, file, _, _)| {
             file_filter.is_none_or(|f| file.contains(f))
-                && context_filter
-                    .is_none_or(|ctx| crate::arch::file_to_context(file) == ctx)
+                && context_filter.is_none_or(|ctx| crate::arch::file_to_context(file) == ctx)
                 && crate_filter.is_none_or(|want| {
                     ws_graph.as_ref().is_some_and(|ws| {
                         symbol_crate_for_file(ws, file).is_some_and(|c| c == want)
@@ -1284,7 +1349,14 @@ pub fn graph(
         let count_s = symbols.len().to_string();
         write_wrapper_start("graphs", &[("count", &count_s)])?;
         for symbol in symbols {
-            graph_one(symbol, depth, show_trust, snippets, max_snippet_lines, control)?;
+            graph_one(
+                symbol,
+                depth,
+                show_trust,
+                snippets,
+                max_snippet_lines,
+                control,
+            )?;
         }
         write_wrapper_end("graphs")?;
         return Ok(());
@@ -1632,7 +1704,11 @@ fn write_graph_xml<W: std::io::Write>(
             } else {
                 None
             };
-            let neighbor_annotation = if compact { None } else { annotations.get(&n.id) };
+            let neighbor_annotation = if compact {
+                None
+            } else {
+                annotations.get(&n.id)
+            };
             if has_doc || neighbor_snippet.is_some() || neighbor_annotation.is_some() {
                 vxml::open_attrs(w, "node", &attrs).expect("xml");
                 if let Some(doc) = &n.doc {
@@ -1665,7 +1741,10 @@ fn print_xml_trust_split(focus: &NodeRow, edges: &[EdgeInfo]) -> Result<()> {
         .iter()
         .filter(|e| is_trusted_source(&e.source))
         .collect();
-    let syntax: Vec<&EdgeInfo> = edges.iter().filter(|e| !is_trusted_source(&e.source)).collect();
+    let syntax: Vec<&EdgeInfo> = edges
+        .iter()
+        .filter(|e| !is_trusted_source(&e.source))
+        .collect();
 
     let mut w = vxml::new_stream_writer();
     let root_id_s = focus.id.to_string();
@@ -1872,26 +1951,26 @@ fn blast_radius_one(
         .query_map(
             rusqlite::params![root_id, depth_limit, focus.name, include_type_users],
             |r| {
-            Ok((
-                NodeRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    kind: r.get(2)?,
-                    file: r.get(3)?,
-                    range_start: r.get(4)?,
-                    range_end: r.get(5)?,
-                    signature: r.get(6)?,
-                    visibility: r.get(8)?,
-                    doc: r.get(9)?,
-                    fan_in: r.get(10)?,
-                    fan_out: r.get(11)?,
-                    role: r.get(12)?,
-                    role_confidence: r.get(13)?,
-                    stable_id: r.get(14)?,
-                },
-                r.get::<_, i64>(7)?,
-            ))
-        },
+                Ok((
+                    NodeRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        kind: r.get(2)?,
+                        file: r.get(3)?,
+                        range_start: r.get(4)?,
+                        range_end: r.get(5)?,
+                        signature: r.get(6)?,
+                        visibility: r.get(8)?,
+                        doc: r.get(9)?,
+                        fan_in: r.get(10)?,
+                        fan_out: r.get(11)?,
+                        role: r.get(12)?,
+                        role_confidence: r.get(13)?,
+                        stable_id: r.get(14)?,
+                    },
+                    r.get::<_, i64>(7)?,
+                ))
+            },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -2336,7 +2415,11 @@ fn write_blast_radius_xml<W: std::io::Write>(
             } else {
                 None
             };
-            let dep_annotation = if compact { None } else { annotations.get(&n.id) };
+            let dep_annotation = if compact {
+                None
+            } else {
+                annotations.get(&n.id)
+            };
             if has_doc || call_snippet.is_some() || dep_annotation.is_some() {
                 vxml::open_attrs(w, "node", &attrs)?;
                 if let Some(doc) = &n.doc {
@@ -2370,7 +2453,10 @@ fn file_to_module(path: &str) -> String {
         .to_string()
 }
 
-fn symbol_crate_for_file<'a>(ws: &'a crate::workspace::WorkspaceGraph, file: &str) -> Option<&'a str> {
+fn symbol_crate_for_file<'a>(
+    ws: &'a crate::workspace::WorkspaceGraph,
+    file: &str,
+) -> Option<&'a str> {
     let file_norm = file.trim_start_matches("./");
     let mut members: Vec<&crate::workspace::CrateMember> = ws.members.iter().collect();
     members.sort_by_key(|m| std::cmp::Reverse(m.path.len()));
@@ -2537,7 +2623,11 @@ pub fn map(
     vxml::open_attrs(
         &mut w,
         "map",
-        &[("files", &files_s), ("symbols", &symbols_s), ("tokens", "streaming")],
+        &[
+            ("files", &files_s),
+            ("symbols", &symbols_s),
+            ("tokens", "streaming"),
+        ],
     )?;
 
     let hotspot_source = if all_edges { "all" } else { "trusted" };
@@ -2583,7 +2673,11 @@ pub fn map(
             vxml::open_attrs(
                 &mut w,
                 "module",
-                &[("name", &module_name), ("path", file), ("symbols", &symbols_count_s)],
+                &[
+                    ("name", &module_name),
+                    ("path", file),
+                    ("symbols", &symbols_count_s),
+                ],
             )?;
         }
 
@@ -2859,7 +2953,11 @@ pub fn trace_path(
             vxml::empty(
                 &mut w,
                 "target",
-                &[("id", &tid.to_string()), ("name", &tnode.name), ("stable_id", &tnode.stable_id)],
+                &[
+                    ("id", &tid.to_string()),
+                    ("name", &tnode.name),
+                    ("stable_id", &tnode.stable_id),
+                ],
             )?;
         }
     }
@@ -2910,8 +3008,14 @@ pub fn trace_path(
             vxml::open_attrs(&mut w, "hop", &pairs)?;
 
             if with_async_boundaries
-                && (from.signature.as_deref().is_some_and(|s| s.contains("async "))
-                    || to_node.signature.as_deref().is_some_and(|s| s.contains("async ")))
+                && (from
+                    .signature
+                    .as_deref()
+                    .is_some_and(|s| s.contains("async "))
+                    || to_node
+                        .signature
+                        .as_deref()
+                        .is_some_and(|s| s.contains("async ")))
             {
                 vxml::empty(&mut w, "boundary", &[("type", "async")])?;
             }
@@ -2940,6 +3044,13 @@ pub fn trace_path(
 fn is_channelish(name: &str, signature: Option<&str>) -> bool {
     let name = name.to_ascii_lowercase();
     let sig = signature.unwrap_or("").to_ascii_lowercase();
-    let keys = ["channel", "mpsc", "broadcast", "oneshot", "actor", "mailbox"];
+    let keys = [
+        "channel",
+        "mpsc",
+        "broadcast",
+        "oneshot",
+        "actor",
+        "mailbox",
+    ];
     keys.iter().any(|k| name.contains(k) || sig.contains(k))
 }
