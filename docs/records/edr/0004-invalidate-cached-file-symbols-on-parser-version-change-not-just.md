@@ -2,8 +2,8 @@
 id: "EDR-0004"
 title: "Invalidate cached file symbols on parser-version change, not just content-hash change"
 record-type: edr
-status: draft
-revision: 1
+status: accepted
+revision: 3
 date: 2026-08-30
 slug: invalidate-cached-file-symbols-on-parser-version-change-not-just
 tags: []
