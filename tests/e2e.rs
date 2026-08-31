@@ -442,6 +442,131 @@ traits = "domain"
 }
 
 #[test]
+fn discover_indexes_macro_generated_type_and_its_trait_edge() {
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    let td = tempdir().unwrap();
+    let p = td.path();
+    std::fs::write(
+        p.join("Cargo.toml"),
+        r#"[package]
+name = "macro_symbol_fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(
+        p.join("src/lib.rs"),
+        r#"pub mod other;
+
+pub trait StatusLabel {}
+
+macro_rules! sql_enum {
+    () => {
+        pub enum RequirementStatus { Planned, Verified }
+        impl StatusLabel for RequirementStatus {}
+    };
+}
+
+sql_enum!();
+"#,
+    )
+    .unwrap();
+    // A qualified duplicate keeps bare-name ambiguity realistic while the
+    // preferred source file must still select the macro-generated enum.
+    std::fs::write(p.join("src/other.rs"), "pub struct RequirementStatus;\n").unwrap();
+
+    let init = Command::new(bin())
+        .args(["init", "."])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "init should succeed");
+    std::fs::write(
+        p.join(".graphlite/config.toml"),
+        r#"depth = 1
+
+[workspace.layers]
+macro_symbol_fixture = "domain"
+"#,
+    )
+    .unwrap();
+
+    let discover = Command::new(bin())
+        .args(["discover", "."])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(
+        discover.status.success(),
+        "discover should succeed: {}",
+        String::from_utf8_lossy(&discover.stderr)
+    );
+
+    let resolve = Command::new(bin())
+        .args([
+            "resolve",
+            "RequirementStatus",
+            "--prefer-file",
+            "src/lib.rs",
+        ])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(
+        resolve.status.success(),
+        "macro-generated type should resolve: {}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+    let resolved = String::from_utf8_lossy(&resolve.stdout);
+    assert!(resolved.contains("file=\"./src/lib.rs\""), "{resolved}");
+
+    let graph = Command::new(bin())
+        .args([
+            "graph",
+            "sym:src/lib.rs::enum::RequirementStatus",
+            "--depth",
+            "1",
+            "--no-snippets",
+        ])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(
+        graph.status.success(),
+        "trait traversal should succeed: {}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    let graph_output = String::from_utf8_lossy(&graph.stdout);
+    assert!(graph_output.contains("StatusLabel"), "{graph_output}");
+    assert!(graph_output.contains("IMPL_TRAIT"), "{graph_output}");
+
+    let conn = Connection::open(p.join(".graphlite/codegraph.db")).unwrap();
+    let generated: Option<(String, String)> = conn
+        .query_row(
+            "SELECT kind, visibility FROM nodes WHERE name = 'RequirementStatus' AND file = './src/lib.rs'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    assert_eq!(generated, Some(("enum".to_string(), "pub".to_string(),)));
+    let edge: Option<(String, String)> = conn
+        .query_row(
+            "SELECT n1.name, n2.name FROM edges e JOIN nodes n1 ON n1.id = e.from_id JOIN nodes n2 ON n2.id = e.to_id WHERE e.edge_type = 'IMPL_TRAIT' AND e.source = 'rustdoc' AND n1.name = 'RequirementStatus' AND n1.file = './src/lib.rs' AND n2.name = 'StatusLabel'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    assert_eq!(
+        edge,
+        Some(("RequirementStatus".to_string(), "StatusLabel".to_string()))
+    );
+}
+
+#[test]
 fn workspace_violations_include_crate_level_output() {
     use tempfile::tempdir;
 

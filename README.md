@@ -2,6 +2,10 @@
 
 Token-metered, role-annotated code context for LLMs — a SQLite-backed graph that serves focused XML/Markdown snapshots instead of raw source files.
 
+## Unreleased
+
+- Rustdoc-enriched named types emitted by macro invocations are now indexed at their invocation source span, so they can be resolved by their source-level name. Their local trait implementations can now produce `IMPL_TRAIT` edges after the generated type is stored. When rustdoc provides no source span, discovery now emits an actionable warning instead of silently omitting the type.
+
 ---
 
 ## Pipeline

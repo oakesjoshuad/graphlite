@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use rusqlite::Connection;
-use rustdoc_types::{Crate, Id, ItemEnum, Type};
+use rustdoc_types::{Crate, Id, ItemEnum, Type, Visibility};
 use tracing::{debug, info, warn};
 
 const EXPECTED_FORMAT_VERSION: u32 = 57;
@@ -158,44 +158,57 @@ fn enrich_crates(
     // This snapshot is deliberately taken before any rustdoc work. The compute
     // stage only reads it; all writes are committed below on this connection.
     let node_map = Arc::new(build_node_map(conn, abs_root)?);
-    let qualified_node_map = build_qualified_node_map(conn, workspace_crates, abs_root)?;
-    let mut results: Vec<(&CrateInfo, Result<CrateEnrichment>)> = crates
+    let file_map = Arc::new(build_file_map(conn, abs_root)?);
+    let results: Vec<(&CrateInfo, Result<CrateEnrichment>)> = crates
         .par_iter()
         .map(|ci| {
-            let result = compute_crate_enrichment(root, ci, abs_root, &node_map);
+            let result = compute_crate_enrichment(root, ci, abs_root, &node_map, &file_map);
             (*ci, result)
         })
         .collect();
 
-    // Cross-crate trait IDs are represented in rustdoc's `paths` table rather
-    // than the current crate's `index`. Resolve them only after every crate's
-    // pure parse stage has completed, using the single upfront graph snapshot.
-    for (_, result) in &mut results {
-        if let Ok(enrichment) = result {
-            enrichment.impl_trait_edges = collect_impl_trait_edges(
-                &enrichment.doc,
-                &node_map,
-                abs_root,
-                &enrichment.crate_abs_dir,
-                &qualified_node_map,
-            );
-        }
-    }
-
     let tx = conn.unchecked_transaction()?;
     let mut total = 0;
-    for (ci, result) in results {
+    for (ci, result) in &results {
         match result {
             Ok(enrichment) => {
-                let count = apply_enrichment(&tx, &enrichment)?;
+                let count = apply_enrichment(&tx, enrichment)?;
                 debug!(crate_name = %ci.name, count, "rustdoc nodes enriched");
                 total += count;
             }
-            Err(e) if e.to_string().contains("rustdoc JSON format_version=") => return Err(e),
+            Err(e) if e.to_string().contains("rustdoc JSON format_version=") => {
+                return Err(anyhow!(e.to_string()));
+            }
             Err(e) => warn!(crate_name = %ci.name, error = %e, "rustdoc enrichment skipped"),
         }
     }
     tx.commit()?;
+
+    // Macro-expanded items have a source span in rustdoc but no tree-sitter
+    // node. Resolve impl edges only after those span-backed nodes are stored.
+    let node_map = build_node_map(conn, abs_root)?;
+    let qualified_node_map = build_qualified_node_map(conn, workspace_crates, abs_root)?;
+    let qualified_name_map = build_qualified_name_map(conn)?;
+    let edge_tx = conn.unchecked_transaction()?;
+    for (_, result) in &results {
+        let Ok(enrichment) = result else {
+            continue;
+        };
+        for (from_id, to_id) in collect_impl_trait_edges(
+            &enrichment.doc,
+            &node_map,
+            abs_root,
+            &enrichment.crate_abs_dir,
+            &qualified_node_map,
+            &qualified_name_map,
+        ) {
+            edge_tx.execute(
+                "INSERT OR IGNORE INTO edges (from_id, to_id, edge_type, source, confidence) VALUES (?1, ?2, 'IMPL_TRAIT', 'rustdoc', 1.0)",
+                rusqlite::params![from_id, to_id],
+            )?;
+        }
+    }
+    edge_tx.commit()?;
     Ok(total)
 }
 
@@ -203,7 +216,7 @@ struct CrateEnrichment {
     doc: Crate,
     crate_abs_dir: PathBuf,
     node_updates: Vec<NodeUpdate>,
-    impl_trait_edges: Vec<(i64, i64)>,
+    generated_symbols: Vec<GeneratedSymbol>,
 }
 
 struct NodeUpdate {
@@ -212,14 +225,29 @@ struct NodeUpdate {
     trait_impl: Option<String>,
 }
 
+/// A named rustdoc type with a source span but no tree-sitter node, typically
+/// because it was emitted from a macro invocation token tree.
+struct GeneratedSymbol {
+    file: String,
+    name: String,
+    kind: String,
+    range_start: i64,
+    range_end: i64,
+    visibility: String,
+    doc: Option<String>,
+    stable_id: String,
+    qualified_name: String,
+}
+
 fn compute_crate_enrichment(
     root: &str,
     ci: &CrateInfo,
     abs_root: &Path,
     node_map: &HashMap<(String, i64), i64>,
+    file_map: &HashMap<String, String>,
 ) -> Result<CrateEnrichment> {
     let json_path = run_cargo_rustdoc(root, &ci.manifest_path, &ci.name)?;
-    parse_crate_enrichment(&json_path, abs_root, &ci.abs_dir, node_map)
+    parse_crate_enrichment(&json_path, abs_root, &ci.abs_dir, node_map, file_map)
 }
 
 // ── cargo rustdoc invocation ─────────────────────────────────────────────────
@@ -335,6 +363,7 @@ fn parse_crate_enrichment(
     abs_root: &Path,
     crate_abs_dir: &Path,
     node_map: &HashMap<(String, i64), i64>,
+    file_map: &HashMap<String, String>,
 ) -> Result<CrateEnrichment> {
     let text = std::fs::read_to_string(json_path)?;
     let doc: Crate = serde_json::from_str(&text)?;
@@ -351,6 +380,7 @@ fn parse_crate_enrichment(
     let method_to_trait = build_method_to_trait(&doc);
     let item_to_qname = build_qualified_names(&doc);
     let mut node_updates = Vec::new();
+    let mut generated_symbols = Vec::new();
 
     for (item_id, item) in &doc.index {
         // Only items from our own crate (crate_id == 0).
@@ -359,37 +389,82 @@ fn parse_crate_enrichment(
         }
         let span = match item.span.as_ref() {
             Some(s) => s,
-            None => continue,
+            None => {
+                if let Some(kind) = rustdoc_named_type_kind(&item.inner) {
+                    if let Some(name) = &item.name {
+                        warn!(
+                            type_name = %name,
+                            type_kind = kind,
+                            "rustdoc named type has no source span; it may be macro-generated and cannot be indexed — expose a source-level declaration or a macro span"
+                        );
+                    }
+                }
+                continue;
+            }
         };
         let range_start = span.begin.0 as i64;
 
-        let node_id = match lookup_node_id(
-            node_map,
-            &span_file_match_keys(abs_root, crate_abs_dir, &span.filename.to_string_lossy()),
-            range_start,
-        ) {
-            Some(id) => id,
-            None => continue,
-        };
-
+        let file_keys =
+            span_file_match_keys(abs_root, crate_abs_dir, &span.filename.to_string_lossy());
+        let node_id = lookup_node_id(node_map, &file_keys, range_start);
         let qname = item_to_qname.get(item_id).cloned();
         let trait_impl = method_to_trait.get(item_id).cloned();
-        node_updates.push(NodeUpdate {
-            node_id,
-            qualified_name: qname,
-            trait_impl,
-        });
+        if let Some(node_id) = node_id {
+            node_updates.push(NodeUpdate {
+                node_id,
+                qualified_name: qname,
+                trait_impl,
+            });
+        } else if let Some(symbol) =
+            generated_symbol(item, &file_keys, file_map, range_start, qname)
+        {
+            generated_symbols.push(symbol);
+        }
     }
 
     Ok(CrateEnrichment {
         doc,
         crate_abs_dir: crate_abs_dir.to_path_buf(),
         node_updates,
-        impl_trait_edges: Vec::new(),
+        generated_symbols,
     })
 }
 
 fn apply_enrichment(tx: &rusqlite::Transaction<'_>, enrichment: &CrateEnrichment) -> Result<usize> {
+    for symbol in &enrichment.generated_symbols {
+        // Older indexes have no stable-id uniqueness constraint. Keep repeated
+        // incremental rustdoc enrichment idempotent explicitly.
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE stable_id = ?1)",
+            rusqlite::params![symbol.stable_id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO nodes (file, language, kind, name, range_start, range_end, signature, content_hash, visibility, doc, stable_id, qualified_name, role, role_confidence)
+             VALUES (?1, 'rust', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, 'unknown', 0.0)",
+            rusqlite::params![
+                symbol.file,
+                symbol.kind,
+                symbol.name,
+                symbol.range_start,
+                symbol.range_end,
+                format!("rustdoc-generated:{}:{}", symbol.qualified_name, symbol.range_start),
+                symbol.visibility,
+                symbol.doc,
+                symbol.stable_id,
+                symbol.qualified_name,
+            ],
+        )?;
+        let node_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO fts_symbols (name, qualified_name, signature, file, language, node_id)
+             VALUES (?1, ?2, NULL, ?3, 'rust', ?4)",
+            rusqlite::params![symbol.name, symbol.qualified_name, symbol.file, node_id],
+        )?;
+    }
     for update in &enrichment.node_updates {
         if let Some(qname) = &update.qualified_name {
             tx.execute(
@@ -408,13 +483,7 @@ fn apply_enrichment(tx: &rusqlite::Transaction<'_>, enrichment: &CrateEnrichment
             )?;
         }
     }
-    for (from_id, to_id) in &enrichment.impl_trait_edges {
-        tx.execute(
-            "INSERT OR IGNORE INTO edges (from_id, to_id, edge_type, source, confidence) VALUES (?1, ?2, 'IMPL_TRAIT', 'rustdoc', 1.0)",
-            rusqlite::params![from_id, to_id],
-        )?;
-    }
-    Ok(enrichment.node_updates.len())
+    Ok(enrichment.node_updates.len() + enrichment.generated_symbols.len())
 }
 
 // ── Helper: build (db_file, range_start) -> node_id lookup ──────────────────
@@ -438,6 +507,73 @@ fn build_node_map(conn: &Connection, abs_root: &Path) -> Result<HashMap<(String,
         }
     }
     Ok(map)
+}
+
+/// Map every path spelling rustdoc may use for a span back to Graphlite's
+/// stored source-file spelling. Unlike `nodes`, `files` also covers a source
+/// file that contains only a macro invocation.
+fn build_file_map(conn: &Connection, abs_root: &Path) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare_cached("SELECT path FROM files")?;
+    let mut map = HashMap::new();
+    for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        let file = match row {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        for key in node_file_match_keys(abs_root, &file) {
+            map.entry(key).or_insert_with(|| file.clone());
+        }
+    }
+    Ok(map)
+}
+
+fn generated_symbol(
+    item: &rustdoc_types::Item,
+    file_keys: &[String],
+    file_map: &HashMap<String, String>,
+    range_start: i64,
+    qualified_name: Option<String>,
+) -> Option<GeneratedSymbol> {
+    let kind = rustdoc_named_type_kind(&item.inner)?;
+    let name = item.name.clone()?;
+    let file = file_keys
+        .iter()
+        .find_map(|key| file_map.get(key))
+        .cloned()?;
+    let span = item.span.as_ref()?;
+    let qualified_name = qualified_name.unwrap_or_else(|| name.clone());
+    let stable_id = format!("{}::{}::{}", file.trim_start_matches("./"), kind, name);
+    Some(GeneratedSymbol {
+        file,
+        name,
+        kind: kind.to_string(),
+        range_start,
+        range_end: span.end.0 as i64,
+        visibility: rustdoc_visibility(&item.visibility),
+        doc: item.docs.clone(),
+        stable_id,
+        qualified_name,
+    })
+}
+
+fn rustdoc_named_type_kind(item: &ItemEnum) -> Option<&'static str> {
+    match item {
+        ItemEnum::Struct(_) => Some("struct"),
+        ItemEnum::Enum(_) => Some("enum"),
+        ItemEnum::Union(_) => Some("union"),
+        ItemEnum::Trait(_) | ItemEnum::TraitAlias(_) => Some("trait"),
+        ItemEnum::TypeAlias(_) => Some("type"),
+        _ => None,
+    }
+}
+
+fn rustdoc_visibility(visibility: &Visibility) -> String {
+    match visibility {
+        Visibility::Public => "pub".to_string(),
+        Visibility::Default => "private".to_string(),
+        Visibility::Crate => "pub(crate)".to_string(),
+        Visibility::Restricted { path, .. } => format!("pub(in {path})"),
+    }
 }
 
 fn build_qualified_node_map(
@@ -475,6 +611,25 @@ fn build_qualified_node_map(
         map.entry((crate_info.name.replace('-', "_"), qualified_name))
             .or_default()
             .push(id);
+    }
+    Ok(map)
+}
+
+/// A conservative final fallback for rustdoc paths whose source crate cannot
+/// be inferred from their stored file path (for example a re-export observed
+/// while documenting a binary crate). A match is usable only when the
+/// qualified name is unique across the whole indexed workspace.
+fn build_qualified_name_map(conn: &Connection) -> Result<HashMap<String, Vec<i64>>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, qualified_name FROM nodes WHERE qualified_name IS NOT NULL AND qualified_name != ''",
+    )?;
+    let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, qualified_name) = match row {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        map.entry(qualified_name).or_default().push(id);
     }
     Ok(map)
 }
@@ -613,6 +768,7 @@ fn collect_impl_trait_edges(
     abs_root: &Path,
     crate_abs_dir: &Path,
     qualified_node_map: &HashMap<(String, String), Vec<i64>>,
+    qualified_name_map: &HashMap<String, Vec<i64>>,
 ) -> Vec<(i64, i64)> {
     let item_nodes: HashMap<Id, i64> = doc
         .index
@@ -647,17 +803,29 @@ fn collect_impl_trait_edges(
             };
             let type_label = rustdoc_path_label(doc, type_id);
             let trait_label = rustdoc_path_label(doc, trait_id);
-            let Some(from_id) = item_nodes.get(&type_id).copied() else {
+            let Some(from_id) = resolve_rustdoc_node_id(
+                doc,
+                type_id,
+                &item_nodes,
+                qualified_node_map,
+                qualified_name_map,
+            ) else {
                 warn!(
                     crate_dir = %crate_abs_dir.display(),
                     type_name = %type_label,
                     trait_name = %trait_label,
-                    "rustdoc IMPL_TRAIT target could not be mapped; edge skipped"
+                    "rustdoc IMPL_TRAIT implementing type could not be mapped from source span or a unique qualified name; edge skipped"
                 );
                 return None;
             };
             let Some(to_id) =
-                resolve_rustdoc_node_id(doc, trait_id, &item_nodes, qualified_node_map)
+                resolve_rustdoc_node_id(
+                    doc,
+                    trait_id,
+                    &item_nodes,
+                    qualified_node_map,
+                    qualified_name_map,
+                )
             else {
                 if is_workspace_rustdoc_path(doc, trait_id, qualified_node_map) {
                     warn!(
@@ -706,6 +874,7 @@ fn resolve_rustdoc_node_id(
     item_id: Id,
     item_nodes: &HashMap<Id, i64>,
     qualified_node_map: &HashMap<(String, String), Vec<i64>>,
+    qualified_name_map: &HashMap<String, Vec<i64>>,
 ) -> Option<i64> {
     if let Some(node_id) = item_nodes.get(&item_id) {
         return Some(*node_id);
@@ -713,8 +882,28 @@ fn resolve_rustdoc_node_id(
     let path = doc.paths.get(&item_id)?;
     let crate_name = path.path.first()?.replace('-', "_");
     let qualified_name = path.path.get(1..)?.join("::");
-    let node_ids = qualified_node_map.get(&(crate_name, qualified_name))?;
-    (node_ids.len() == 1).then_some(node_ids[0])
+    if let Some(node_ids) = qualified_node_map.get(&(crate_name.clone(), qualified_name.clone())) {
+        if node_ids.len() == 1 {
+            return Some(node_ids[0]);
+        }
+    }
+    let workspace_candidates = qualified_node_map
+        .get(&(crate_name.clone(), qualified_name.clone()))
+        .map_or(0, Vec::len);
+    let global_candidates = qualified_name_map.get(&qualified_name).map_or(0, Vec::len);
+    if global_candidates == 1 {
+        return qualified_name_map
+            .get(&qualified_name)
+            .and_then(|node_ids| node_ids.first().copied());
+    }
+    debug!(
+        rustdoc_crate = %crate_name,
+        rustdoc_qualified_name = %qualified_name,
+        workspace_candidates,
+        global_candidates,
+        "rustdoc node could not be mapped by qualified name"
+    );
+    None
 }
 
 #[cfg(test)]
